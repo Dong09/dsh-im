@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { chunkMarkdownText } from '../shared/markdown-chunks.mjs';
 import QRCode from 'qrcode';
 import { waitForFeishuOperation } from './feishu-channel.mjs';
+import { startNewConversation } from '../shared/new-command.mjs';
 import {
   conversationKey,
   conversationScope,
@@ -143,7 +144,7 @@ const WATCH_COMMAND = /^\/watch(?:\s+([^\s]+))?$/i;
 const UNWATCH_COMMAND = /^\/unwatch(?:\s+([^\s]+))?$/i;
 const WATCHLIST_COMMAND = /^\/watchlist$/i;
 const SESSION_LIST_PREFIX = /^\/(?:sessionlist|sessions)(?:\s|$)/i;
-const WORKSPACE_LIST_COMMAND = /^\/(?:workspacelist|workspaces|wsl)$/i;
+const WORKSPACE_LIST_COMMAND = /^\/(?:workspacelist|workspaces|wsl)(?:\s+all)?$/i;
 const NUMBER_REPLY = /^\d{1,2}$/;
 /** A displayed menu stays number-tappable for this long. */
 const MENU_TTL_MS = 10 * 60_000;
@@ -1829,8 +1830,9 @@ export class FeishuHarnessBridge {
         );
         return;
       }
-      await this.#state.clearSession(key);
-      await this.#send(event.message.chat_id, t('已开启全新 Harness 会话。'), { replyTo: event.message.message_id });
+      await this.#send(event.message.chat_id, await startNewConversation({
+        state: this.#state, harness: this.#harness, key,
+      }), { replyTo: event.message.message_id });
       await this.#sendMenuCard(key, event.message.chat_id, { replyTo: event.message.message_id });
       return;
     }
@@ -1874,7 +1876,9 @@ export class FeishuHarnessBridge {
       return;
     }
     if (WORKSPACE_LIST_COMMAND.test(commandText)) {
-      await this.#showWorkspaces({ chatId: event.message.chat_id, key, replyTo: event.message.message_id });
+      await this.#showWorkspaces({ chatId: event.message.chat_id, key, replyTo: event.message.message_id }, {
+        includeConversationDirectories: /\s+all$/iu.test(commandText),
+      });
       return;
     }
     if (WATCH_COMMAND.test(commandText)) {
@@ -2818,8 +2822,7 @@ export class FeishuHarnessBridge {
         await reply(t('当前任务仍在运行，请先停止任务或等待任务完成后再开启新会话。'));
         return;
       }
-      await this.#state.clearSession(key);
-      await reply(t('已开启全新 Harness 会话。'));
+      await reply(await startNewConversation({ state: this.#state, harness: this.#harness, key }));
       await this.#sendMenuCard(key, chatId, { updateMessageId: messageId, replyTo: messageId });
       return;
     }
@@ -2993,8 +2996,9 @@ export class FeishuHarnessBridge {
       await this.#send(chatId, message, { replyTo: messageId });
       return;
     }
+    let receipt;
     try {
-      await this.#state.clearSession(key);
+      receipt = await startNewConversation({ state: this.#state, harness: this.#harness, key });
     } catch (error) {
       // A persistence error can still leave the in-memory binding cleared.
       await finish('failed', safeErrorText(error));
@@ -3002,7 +3006,7 @@ export class FeishuHarnessBridge {
     }
     await finish('success');
     // A receipt delivery failure must not turn a completed reset into a retry.
-    await this.#send(chatId, t('已开启全新 Harness 会话。'), { replyTo: messageId })
+    await this.#send(chatId, receipt, { replyTo: messageId })
       .catch((error) => this.#logger.warn?.('[dsh-feishu] new session receipt failed:', error?.message));
   }
 
@@ -3155,11 +3159,11 @@ export class FeishuHarnessBridge {
     }
   }
 
-  async #showWorkspaces({ chatId, key, replyTo = null }, { updateMessageId = null } = {}) {
+  async #showWorkspaces({ chatId, key, replyTo = null }, { updateMessageId = null, includeConversationDirectories = false } = {}) {
     try {
       const { current, paths, titles } = await workspacePathSnapshot(
         this.#harness,
-        { signal: this.#cardDataSignal(), includeTitles: true },
+        { signal: this.#cardDataSignal(), includeTitles: true, includeConversationDirectories },
       );
       this.#rememberMenu(key, { kind: 'workspaces', paths });
       await this.#sendCard(

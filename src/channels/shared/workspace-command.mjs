@@ -111,7 +111,7 @@ async function selectedWorkspacePath(value) {
   }
 }
 
-export async function workspacePathSnapshot(harness, { includeTitles = false, ...options } = {}) {
+export async function workspacePathSnapshot(harness, { includeTitles = false, includeConversationDirectories = false, ...options } = {}) {
   const withEntries = includeTitles && typeof harness.listWorkspaceEntries === 'function';
   const listed = await (withEntries ? harness.listWorkspaceEntries(options) : harness.listWorkspaces(options));
   const currentValue = typeof harness?.currentWorkspace === 'function'
@@ -122,7 +122,10 @@ export async function workspacePathSnapshot(harness, { includeTitles = false, ..
     path: await existingWorkspacePath(withEntries ? item?.path : item),
     title: withEntries ? safeDisplayText(item?.title) : '',
   })));
-  const paths = [...new Set([...(current ? [current] : []), ...entries.map((item) => item.path).filter(Boolean)])];
+  const directoryConfig = harness.conversationDirectoryConfig?.() ?? null;
+  const prefix = directoryConfig?.prefix ?? 'conv-';
+  const paths = [...new Set([...(current ? [current] : []), ...entries.map((item) => item.path).filter(Boolean)])]
+    .filter((path) => includeConversationDirectories || !path.split(/[\\/]/u).pop().startsWith(prefix));
   const titles = {};
   if (includeTitles) {
     for (const item of entries) {
@@ -156,12 +159,13 @@ export function splitWorkspaceCommandMessage(message) {
 }
 
 async function runWorkspaceListCommand(match, harness) {
-  if (match[1]?.trim()) return commandResult(t('用法：/workspacelist'));
+  const includeConversationDirectories = match[1]?.trim().toLowerCase() === 'all';
+  if (match[1]?.trim() && !includeConversationDirectories) return commandResult(t('用法：/workspacelist'));
   if (typeof harness?.listWorkspaces !== 'function') {
     return commandResult(t('当前机器人暂不支持列出工作区。'));
   }
   try {
-    const { current, paths } = await workspacePathSnapshot(harness);
+    const { current, paths } = await workspacePathSnapshot(harness, { includeConversationDirectories });
     if (paths.length === 0) {
       return commandResult(t('当前 Harness Host 上没有仍然存在的已登记工作区。'));
     }
@@ -485,6 +489,10 @@ async function runConversationWorkspaceCommand(command, harness, conversationKey
 
 export async function runWorkspaceCommand(text, harness, conversationKey) {
   if (!isWorkspaceCommand(text)) return null;
+  const config = harness.conversationDirectoryConfig?.();
+  if (config?.enabled === true && /^(?:\/(?:workspace|ws|conv|conversation|thread))(?:\s|$)/iu.test(text.trim())) {
+    return { message: '', messages: [] };
+  }
   const command = text.trim();
   const threadMatch = THREAD_WORKSPACE_COMMAND.exec(command);
   if (threadMatch) {

@@ -37,6 +37,13 @@ import {
 } from './model-setting.mjs';
 import { WORKSPACE_SESSION_STALE } from './workspace-session.mjs';
 import { configValidationError, withConfigResource } from './config-read-error.mjs';
+import {
+  DEFAULT_CONVERSATION_DIRECTORY,
+  normalizeConversationDirectory,
+  validateConversationDirectory,
+  workspaceManualEditDisabled,
+} from './conversation-directory.mjs';
+import { conversationDirectoryName, prepareDirectoryPath } from './conversation-directory-ensure.mjs';
 
 const DELIVERY_DOCUMENT_VERSION = 2;
 export const CURRENT_DOCUMENT_VERSION = 3;
@@ -129,6 +136,34 @@ function normalizeConversationWorkspaces(value) {
     if (Object.keys(normalized).length > 0) conversationWorkspaces[botId] = normalized;
   }
   return conversationWorkspaces;
+}
+
+function normalizeConversationDirectoryOverrides(value) {
+  const result = Object.create(null);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
+  for (const [botId, config] of Object.entries(value)) {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(botId)) continue;
+    const normalized = normalizeConversationDirectory(config);
+    if (normalized) result[botId] = normalized;
+  }
+  return result;
+}
+
+function normalizeSessionDirectories(value) {
+  const result = Object.create(null);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
+  for (const [botId, entries] of Object.entries(value)) {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(botId) || !entries || typeof entries !== 'object') continue;
+    const normalized = Object.create(null);
+    for (const [key, record] of Object.entries(entries)) {
+      if (!record || typeof record !== 'object' || typeof record.base !== 'string'
+        || typeof record.workspace !== 'string' || !isAbsolute(record.base) || !isAbsolute(record.workspace)) continue;
+      const config = normalizeConversationDirectory({ enabled: true, strategy: record.strategy, prefix: record.prefix });
+      if (config) normalized[key] = { base: resolve(record.base), workspace: resolve(record.workspace), ...config };
+    }
+    if (Object.keys(normalized).length) result[botId] = normalized;
+  }
+  return result;
 }
 
 function normalizeDeliveryTarget(value, { targetId, allowSessionSync = false } = {}) {
@@ -316,6 +351,9 @@ function normalizeDocument(value) {
     }
   }
   const accessPolicies = normalizeAccessPolicies(value.accessPolicies, workspaces);
+  const conversationDirectory = normalizeConversationDirectory(value.conversationDirectory);
+  const conversationDirectories = normalizeConversationDirectoryOverrides(value.conversationDirectories);
+  const sessionDirectories = normalizeSessionDirectories(value.sessionDirectories);
   const version = Math.max(
     value.version,
     value.accessPolicies === undefined ? 1 : DELIVERY_DOCUMENT_VERSION,
@@ -326,6 +364,9 @@ function normalizeDocument(value) {
     version,
     workspaces,
     conversationWorkspaces,
+    conversationDirectory,
+    conversationDirectories,
+    sessionDirectories,
     agentPresets,
     models,
     contextEnhancement,
@@ -340,6 +381,9 @@ function storedDocument({
   version,
   workspaces,
   conversationWorkspaces,
+  conversationDirectory,
+  conversationDirectories,
+  sessionDirectories,
   agentPresets,
   models,
   contextEnhancement,
@@ -349,6 +393,9 @@ function storedDocument({
   busyMessageModes,
 }) {
   const document = { version, workspaces };
+  if (conversationDirectory) document.conversationDirectory = conversationDirectory;
+  if (Object.keys(conversationDirectories).length) document.conversationDirectories = conversationDirectories;
+  if (Object.keys(sessionDirectories).length) document.sessionDirectories = sessionDirectories;
   if (Object.keys(busyMessageModes).length > 0) document.busyMessageModes = busyMessageModes;
   if (Object.keys(aliases).length > 0) document.aliases = aliases;
   if (Object.keys(conversationWorkspaces).length > 0) {
@@ -416,6 +463,9 @@ export class BotWorkspaceStore {
   #deliveryTargets = Object.create(null);
   #accessPolicies = Object.create(null);
   #conversationWorkspaces = Object.create(null);
+  #conversationDirectory = null;
+  #conversationDirectories = Object.create(null);
+  #sessionDirectories = Object.create(null);
   #generations = new Map();
   #nextGeneration = 1;
   #conversationGenerations = new Map();
@@ -448,6 +498,9 @@ export class BotWorkspaceStore {
       this.#deliveryTargets = normalized.deliveryTargets;
       this.#accessPolicies = normalized.accessPolicies;
       this.#conversationWorkspaces = normalized.conversationWorkspaces;
+      this.#conversationDirectory = normalized.conversationDirectory;
+      this.#conversationDirectories = normalized.conversationDirectories;
+      this.#sessionDirectories = normalized.sessionDirectories;
     } catch (error) {
       if (error?.code !== 'ENOENT') throw withConfigResource(error, 'workspace-config');
       this.#version = 1;
@@ -460,6 +513,9 @@ export class BotWorkspaceStore {
       this.#deliveryTargets = Object.create(null);
       this.#accessPolicies = Object.create(null);
       this.#conversationWorkspaces = Object.create(null);
+      this.#conversationDirectory = null;
+      this.#conversationDirectories = Object.create(null);
+      this.#sessionDirectories = Object.create(null);
     }
     this.#generations.clear();
     this.#nextGeneration = 1;
@@ -493,6 +549,89 @@ export class BotWorkspaceStore {
 
   workspaceFor(botId) {
     return this.#workspaces[botIdOf(botId)] ?? this.#defaultWorkspace;
+  }
+
+  conversationDirectoryFor(botId) {
+    const id = botIdOf(botId);
+    return { ...(Object.hasOwn(this.#conversationDirectories, id)
+      ? this.#conversationDirectories[id]
+      : this.#conversationDirectory ?? DEFAULT_CONVERSATION_DIRECTORY) };
+  }
+
+  conversationDirectoryOverrideFor(botId) {
+    const id = botIdOf(botId);
+    return Object.hasOwn(this.#conversationDirectories, id)
+      ? { ...this.#conversationDirectories[id] } : null;
+  }
+
+  async setConversationDirectory(botId, config, { incarnation } = {}) {
+    const id = botId === null ? null : botIdOf(botId);
+    const normalized = config === null ? null : validateConversationDirectory(config);
+    return this.#enqueue(id ?? '__channel__', async () => {
+      if (id !== null && (!this.has(id)
+        || (incarnation !== undefined && incarnation !== this.incarnationFor(id)))) {
+        const error = new Error('找不到要修改的机器人。');
+        error.code = 'workspace-bot-not-found';
+        throw error;
+      }
+      const previousDefault = this.#conversationDirectory;
+      const previousOverrides = { ...this.#conversationDirectories };
+      if (id === null) this.#conversationDirectory = normalized;
+      else if (normalized === null) delete this.#conversationDirectories[id];
+      else this.#conversationDirectories[id] = normalized;
+      try { await this.#persist(); }
+      catch (error) {
+        this.#conversationDirectory = previousDefault;
+        this.#conversationDirectories = previousOverrides;
+        throw error;
+      }
+    });
+  }
+
+  async prepareConversationDirectory(botId, conversationKey, { explicitNew = false, incarnation } = {}) {
+    const id = botIdOf(botId);
+    if (!this.has(id) || (incarnation !== undefined && incarnation !== this.incarnationFor(id))) {
+      const error = new Error('找不到要修改的机器人。');
+      error.code = 'workspace-bot-not-found';
+      throw error;
+    }
+    const config = this.conversationDirectoryFor(id);
+    if (!config.enabled) return null;
+    return this.#enqueue(id, async () => {
+      const existing = this.#sessionDirectories[id]?.[conversationKey];
+      const current = this.conversationWorkspaceFor(id, conversationKey);
+      const base = existing?.base ?? current;
+      const sameConfig = existing?.workspace === current
+        && existing?.strategy === config.strategy && existing?.prefix === config.prefix;
+      const reuse = sameConfig && (config.strategy === 'per-conversation'
+        || (!explicitNew && existing?.pending));
+      const timestamp = reuse ? existing.timestamp : Date.now();
+      const workspace = reuse ? existing.workspace : resolve(base, conversationDirectoryName(conversationKey, config, timestamp));
+      try { await prepareDirectoryPath(base, workspace); }
+      catch (error) {
+        console.warn('[dsh-im] conversation directory preparation failed:', error?.message ?? error);
+        return { warning: '会话目录未生效：无法创建目录（权限或磁盘空间不足）；本次仍在原工作区运行。' };
+      }
+      const entries = { ...(this.#sessionDirectories[id] ?? {}), [conversationKey]: {
+        base, workspace, ...config, timestamp, pending: explicitNew,
+      } };
+      const previousRecords = this.#sessionDirectories[id];
+      const previousOverrides = this.#conversationWorkspaces[id];
+      this.#sessionDirectories[id] = entries;
+      const overrides = { ...(this.#conversationWorkspaces[id] ?? {}), [conversationKey]: workspace };
+      this.#conversationWorkspaces[id] = overrides;
+      if (workspace !== current) this.publishConversationWorkspaceSwitch(id, conversationKey);
+      try { await this.#persist(); }
+      catch (error) {
+        if (previousRecords) this.#sessionDirectories[id] = previousRecords;
+        else delete this.#sessionDirectories[id];
+        if (previousOverrides) this.#conversationWorkspaces[id] = previousOverrides;
+        else delete this.#conversationWorkspaces[id];
+        console.warn('[dsh-im] conversation directory switch failed:', error?.message ?? error);
+        return { warning: '会话目录未生效：无法切换目录；本次仍在原工作区运行。' };
+      }
+      return { workspace };
+    });
   }
 
   /**
@@ -769,6 +908,7 @@ export class BotWorkspaceStore {
 
   async setWorkspace(botId, value, { clearSessions, incarnation } = {}) {
     const id = botIdOf(botId);
+    if (this.conversationDirectoryFor(id).enabled) throw workspaceManualEditDisabled();
     if (!this.has(id)
       || (incarnation !== undefined && incarnation !== this.incarnationFor(id))) {
       const error = new Error('找不到要修改的机器人。');
@@ -808,6 +948,7 @@ export class BotWorkspaceStore {
     incarnation,
   } = {}) {
     const id = botIdOf(botId);
+    if (this.conversationDirectoryFor(id).enabled) throw workspaceManualEditDisabled();
     if (typeof conversationKey !== 'string' || !conversationKey
       || conversationKey.length > 1_024 || conversationKey.trim() !== conversationKey
       || /[\u0000-\u001f\u007f]/u.test(conversationKey)) {
@@ -1126,6 +1267,10 @@ export class BotWorkspaceStore {
     const workspace = await canonicalWorkspacePath(await validateWorkspacePath(value, {
       ungroupedWorkspace: this.#ungroupedWorkspace,
     }));
+    if (this.conversationDirectoryFor(id).enabled
+      && !(await sameWorkspacePath(workspace, this.conversationWorkspaceFor(id, conversationKey)))) {
+      throw workspaceManualEditDisabled();
+    }
     return this.#enqueue(id, async () => {
       if (!this.has(id)
         || (incarnation !== undefined && incarnation !== this.incarnationFor(id))) {
@@ -1298,6 +1443,8 @@ export class BotWorkspaceStore {
       ...Object.keys(this.#deliveryTargets),
       ...Object.keys(this.#accessPolicies),
       ...Object.keys(this.#conversationWorkspaces),
+      ...Object.keys(this.#conversationDirectories),
+      ...Object.keys(this.#sessionDirectories),
       ...this.#dirtyRemovals,
     ]);
     for (const botId of candidates) {
@@ -1309,11 +1456,14 @@ export class BotWorkspaceStore {
     if (!status || typeof status !== 'object' || !Array.isArray(status.bots)) return status;
     return {
       ...status,
+      conversationDirectory: this.#conversationDirectory ? { ...this.#conversationDirectory } : null,
       bots: status.bots.map((bot) => bot?.botId
         ? {
           ...bot,
           ...(this.aliasFor(bot.botId) ? { bot: withBotAlias(bot.bot, this.aliasFor(bot.botId)) } : {}),
           workspace: this.workspaceFor(bot.botId),
+          conversationDirectory: this.conversationDirectoryFor(bot.botId),
+          conversationDirectoryOverride: this.conversationDirectoryOverrideFor(bot.botId),
           agentPreset: this.agentPresetFor(bot.botId),
           model: this.modelFor(bot.botId),
           contextEnhancement: this.contextEnhancementFor(bot.botId),
@@ -1361,8 +1511,10 @@ export class BotWorkspaceStore {
     const hadDeliveryTargets = Object.hasOwn(this.#deliveryTargets, id);
     const hadAccessPolicy = Object.hasOwn(this.#accessPolicies, id);
     const hadConversationWorkspaces = Object.hasOwn(this.#conversationWorkspaces, id);
+    const hadDirectoryRecords = Object.hasOwn(this.#conversationDirectories, id) || Object.hasOwn(this.#sessionDirectories, id);
     const needsCleanup = hadWorkspace || hadPreset || hadModel || hadAlias || hadContextEnhancement
       || hadDeliveryTargets || hadAccessPolicy || hadConversationWorkspaces || hadMessageMode
+      || hadDirectoryRecords
       || this.#dirtyRemovals.has(id);
     delete this.#workspaces[id];
     delete this.#agentPresets[id];
@@ -1373,6 +1525,8 @@ export class BotWorkspaceStore {
     delete this.#deliveryTargets[id];
     delete this.#accessPolicies[id];
     delete this.#conversationWorkspaces[id];
+    delete this.#conversationDirectories[id];
+    delete this.#sessionDirectories[id];
     this.#generations.delete(id);
     this.#incarnations.delete(id);
     if (!needsCleanup) return {
@@ -1410,6 +1564,9 @@ export class BotWorkspaceStore {
     aliases = this.#aliases,
     conversationWorkspaces = this.#conversationWorkspaces,
     busyMessageModes = this.#busyMessageModes,
+    conversationDirectory = this.#conversationDirectory,
+    conversationDirectories = this.#conversationDirectories,
+    sessionDirectories = this.#sessionDirectories,
   ) {
     await writeStoredDocument(this.#path, storedDocument({
       version,
@@ -1422,6 +1579,9 @@ export class BotWorkspaceStore {
       accessPolicies,
       aliases,
       busyMessageModes,
+      conversationDirectory,
+      conversationDirectories,
+      sessionDirectories,
     }));
     this.#dirtyRemovals.clear();
   }
@@ -1780,6 +1940,9 @@ export function createBotWorkspaceScope(
       }
       if (property === 'switchWorkspace') {
         return (workspace) => {
+          if (workspaces.conversationDirectoryFor(botId).enabled) {
+            return Promise.reject(workspaceManualEditDisabled());
+          }
           if (!isCurrentScope()) {
             const error = new Error('找不到要修改的机器人。');
             error.code = 'workspace-bot-not-found';
@@ -1818,8 +1981,14 @@ export function createBotWorkspaceScope(
         // bind and the send so a late switch cannot be outrun.
         return (conversationKey) => currentConversationGeneration(conversationKey);
       }
+      if (property === 'conversationDirectoryConfig') {
+        return () => workspaces.conversationDirectoryFor(botId);
+      }
       if (property === 'switchConversationWorkspace') {
         return (conversationKey, workspace) => {
+          if (workspaces.conversationDirectoryFor(botId).enabled) {
+            return Promise.reject(workspaceManualEditDisabled());
+          }
           if (!isCurrentScope()) {
             const error = new Error('找不到要修改的机器人。');
             error.code = 'workspace-bot-not-found';
@@ -1841,6 +2010,9 @@ export function createBotWorkspaceScope(
       }
       if (property === 'clearConversationWorkspace') {
         return (conversationKey) => {
+          if (workspaces.conversationDirectoryFor(botId).enabled) {
+            return Promise.reject(workspaceManualEditDisabled());
+          }
           if (!isCurrentScope()) {
             const error = new Error('找不到要修改的机器人。');
             error.code = 'workspace-bot-not-found';
@@ -1934,6 +2106,10 @@ export function createBotWorkspaceScope(
       if (property === 'createSession') {
         return async (options = {}) => {
           const { inheritBotModel = true, conversationKey, ...createOptions } = options;
+          if (conversationKey) {
+            const prepared = await workspaces.prepareConversationDirectory(botId, conversationKey, { incarnation });
+            if (prepared?.workspace) createOptions.workspace = prepared.workspace;
+          }
           // /conv publishes its generation before path validation enters the
           // bot queue. Wait for both phases before pairing a workspace with its
           // generation; otherwise a new session can carry a new fence but old cwd.
@@ -2432,6 +2608,16 @@ export function createWorkspaceAwareController(controller, {
 
   return new Proxy(controller, {
     get(target, property) {
+      if (property === 'updateConversationDirectory') {
+        return async (botId, config) => {
+          await workspaces.setConversationDirectory(
+            botId,
+            config,
+            botId === null ? {} : { incarnation: workspaces.incarnationFor(botId) },
+          );
+          return decorate(await controller.status());
+        };
+      }
       if (property === 'updateWorkspace') return updateWorkspace;
       if (property === 'updateAgentPreset') return updateAgentPreset;
       if (property === 'updateModel') return updateModel;

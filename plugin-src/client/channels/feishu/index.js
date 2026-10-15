@@ -641,6 +641,7 @@ export function BotCard({
       },
         h(WorkspaceEditor, {
           workspace: connection.workspace,
+          locked: connection.conversationDirectory?.enabled === true,
           disabled: Boolean(busy),
           onSave: onWorkspaceSave,
         }),

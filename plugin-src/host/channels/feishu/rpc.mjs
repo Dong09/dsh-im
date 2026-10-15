@@ -16,6 +16,7 @@ import {
   normalizeModelSelection,
 } from '../../../../src/channels/shared/model-setting.mjs';
 import { normalizeAccessPolicy } from '../../../../src/channels/shared/access-policy.mjs';
+import { normalizeConversationDirectory, validateConversationDirectory } from '../../../../src/channels/shared/conversation-directory.mjs';
 import { resolveRpcAuthority } from '../../rpc-authority.mjs';
 import { publicWorkspaceError, validWorkspacePayload } from '../shared/workspace-rpc.mjs';
 import { validAgentPresetPayload } from '../shared/agent-preset-rpc.mjs';
@@ -48,6 +49,8 @@ export const FEISHU_ENDPOINTS = Object.freeze({
   setBusyMessageMode: SET_MESSAGE_MODE_ENDPOINT,
   setAccessPolicy: SET_ACCESS_POLICY_ENDPOINT,
   setAlias: SET_ALIAS_ENDPOINT,
+  setConversationDirectory: FEISHU_CLIENT_ENDPOINTS.setConversationDirectory,
+  setConversationDirectoryDefault: FEISHU_CLIENT_ENDPOINTS.setConversationDirectoryDefault,
 });
 export { FEISHU_RPC_CHANNEL };
 export const FEISHU_MULTI_ENDPOINTS = Object.freeze({
@@ -313,6 +316,8 @@ function publicBotEntry(entry) {
     contextEnhancement: normalizeContextEnhancementConfig(source.contextEnhancement),
     busyMessageMode: normalizeBusyMessageMode(source.busyMessageMode),
     accessPolicy: normalizeAccessPolicy(source.accessPolicy),
+    conversationDirectory: normalizeConversationDirectory(source.conversationDirectory),
+    conversationDirectoryOverride: normalizeConversationDirectory(source.conversationDirectoryOverride),
     groupResponseMode: normalizeFeishuGroupResponseMode(source.groupResponseMode),
     mentionTopicReply: source.mentionTopicReply !== false,
     stepPush: source.stepPush === true,
@@ -364,6 +369,7 @@ export async function toPublicFeishuStatus(status, { encodeQr = qrCodeDataUrl } 
     bot: publicBot(source.bot),
     health: publicHealth(source, connected),
     bots,
+    conversationDirectory: normalizeConversationDirectory(source.conversationDirectory),
     agentPresetCatalog: normalizeAgentPresetCatalog(source.agentPresetCatalog),
     modelCatalog: normalizeModelCatalog(source.modelCatalog),
     totals: {
@@ -455,6 +461,18 @@ function validPayload(endpoint, payload) {
   if (endpoint === FEISHU_ENDPOINTS.setWorkspace) {
     return validWorkspacePayload(payload)
       ? null : '请输入工作区绝对路径。';
+  }
+  if (endpoint === FEISHU_ENDPOINTS.setConversationDirectory
+    || endpoint === FEISHU_ENDPOINTS.setConversationDirectoryDefault) {
+    const isDefault = endpoint === FEISHU_ENDPOINTS.setConversationDirectoryDefault;
+    const allowed = isDefault ? new Set(['config']) : new Set(['botId', 'config']);
+    if (!hasOnlyKeys(payload, allowed) || (!isDefault && !safeOpaqueId(payload.botId))) {
+      return '请提交有效的会话目录设置。';
+    }
+    if (payload.config !== null) {
+      try { validateConversationDirectory(payload.config); } catch (error) { return error.message; }
+    }
+    return null;
   }
   if (endpoint === FEISHU_ENDPOINTS.setModel) {
     return validModelPayload(payload) ? null : '请选择有效模型。';
@@ -771,6 +789,13 @@ export function createFeishuRpcHandler(controller, { encodeQr = qrCodeDataUrl } 
       } else if (endpoint === FEISHU_MULTI_ENDPOINTS.disconnectBot) {
         if (typeof controller.disconnectBot !== 'function') throw new Error('Multi-bot disconnect is unavailable');
         value = await toPublicFeishuStatus(await controller.disconnectBot(payload.botId), { encodeQr: cachedEncodeQr });
+      } else if (endpoint === FEISHU_ENDPOINTS.setConversationDirectory
+        || endpoint === FEISHU_ENDPOINTS.setConversationDirectoryDefault) {
+        if (typeof controller.updateConversationDirectory !== 'function') throw new Error('Conversation directory update is unavailable');
+        value = await toPublicFeishuStatus(await controller.updateConversationDirectory(
+          endpoint === FEISHU_ENDPOINTS.setConversationDirectoryDefault ? null : payload.botId,
+          payload.config,
+        ), { encodeQr: cachedEncodeQr });
       } else if (endpoint === FEISHU_ENDPOINTS.setWorkspace) {
         if (typeof controller.updateWorkspace !== 'function') throw new Error('Workspace update is unavailable');
         value = await toPublicFeishuStatus(

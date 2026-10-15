@@ -1,6 +1,12 @@
 export const IM_STYLE_ID = 'xmanrui-dsh-im-settings';
 
 const CSS = String.raw`
+.dim-conversationDirectorySettings { max-width: 720px; }
+.dim-conversationDirectoryForm { margin: 18px 0; padding: 16px; border: 1px solid var(--dsw-alias-border-l2, #dfe1e5); border-radius: 8px; }
+.dim-conversationDirectoryForm h3 { margin: 0 0 12px; font-size: 15px; }
+.dim-conversationDirectoryField { display: flex; align-items: center; gap: 12px; margin: 12px 0; font-size: 13px; }
+.dim-conversationDirectoryField > span { min-width: 72px; }
+.dim-conversationDirectoryField input, .dim-conversationDirectoryField select { max-width: 100%; min-width: 0; padding: 7px 9px; border: 1px solid var(--dsw-alias-border-l2, #dfe1e5); border-radius: 6px; font: inherit; color: inherit; background: var(--dsw-alias-bg-layer-1, #fff); }
 .dim-pluginOpen { display: inline-flex; align-items: center; justify-content: center; min-height: 36px; padding: 7px 14px; border: 1px solid var(--dsw-alias-border-l2, #dfe1e5); border-radius: 8px; color: var(--dsw-alias-label-primary, #1f2329); background: var(--dsw-alias-bg-layer-1, #fff); font: inherit; font-size: 13px; line-height: 20px; cursor: pointer; }
 .dim-pluginOpen:hover { background: var(--dsw-alias-interactive-bg-hover, #f7f8fa); }
 .dim-pluginOpen:focus-visible, .dim-pluginBack:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary, #3370ff); outline-offset: 3px; }

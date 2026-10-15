@@ -16,6 +16,8 @@ export function validWorkspacePayload(payload) {
 
 export function publicWorkspaceError(error) {
   if (![
+    'workspace-manual-edit-disabled',
+    'conversation-directory-invalid',
     'workspace-not-absolute',
     'workspace-not-found',
     'workspace-not-directory',
