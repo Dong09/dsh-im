@@ -6,6 +6,11 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 ## [Unreleased]
 
+### Fixed / 修复
+
+- `session.prompt` 提交超时（30 秒窗口到期）不再直接判定消息失败：客户端会按本次请求的 RPC ID 回查 `session.history` 持久账本，确认消息已入库则继续等待回复；仅当确认不到时才上报失败，并把「提交请求超时、是否送达未知」与「已提交、结果未知」的提示文案区分开。修复 Host 繁忙时每条消息先收到「已尝试提交，但任务结果尚未确认」误报、正常回复随后照达的问题。
+  A `session.prompt` submission timeout no longer fails the message outright: the client re-checks the durable `session.history` ledger by this request's RPC ID and keeps waiting for the reply once the message is confirmed as recorded; a failure is reported only when the message cannot be confirmed, with distinct wording for "submission request timed out, delivery unknown" versus "submitted, outcome unconfirmed". This fixes the false "submission attempted but unconfirmed" notice that appeared before every normal reply while the Host was busy.
+
 ## [5.1.0] - 2026-10-18
 
 ### Added / 新增

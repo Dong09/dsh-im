@@ -7,6 +7,7 @@ import {
   HarnessClient,
   HarnessReplyTracker,
 } from '../../../src/channels/feishu/harness-client.mjs';
+import { HarnessTransportError } from '../../../src/channels/shared/harness-client.mjs';
 import { imSourceGuidance } from '../../../src/channels/shared/im-source-guidance.mjs';
 import { extractConnectionEvidence } from '../../../src/channels/shared/connection-error.mjs';
 import {
@@ -674,6 +675,51 @@ test('HarnessClient asks do not control file-return tool availability', async ()
   assert.equal(await client.ask('session-artifact-availability', 'create a file', {
     onArtifact: async () => undefined,
   }), 'done');
+});
+
+test('HarnessClient confirms a timed-out prompt submit via session.history instead of failing', async () => {
+  const client = new HarnessClient({
+    baseUrl: 'http://127.0.0.1:3080',
+    workspace: '/tmp/dsh-feishu-workspace',
+  });
+  client.ensureRunning = async () => undefined;
+  let promptRpcId;
+  let promptTimeouts = 0;
+  client.rpc = async (method, _payload, _timeoutMs, options) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
+    if (method === 'session.history' && !promptRpcId) return { events: [] };
+    if (method === 'session.prompt') {
+      promptRpcId = options.rpcId;
+      promptTimeouts += 1;
+      // 提交窗口到期瞬间消息其实已经落账本：Host 忙，只是应答迟到。
+      throw new HarnessTransportError('harness-timeout', 'session.prompt');
+    }
+    return {
+      events: [
+        { event: { type: 'turn/start', seq: 1, data: { turn: 1 } } },
+        {
+          event: {
+            type: 'user/message',
+            seq: 2,
+            data: { turn: 1, source: { rpcId: promptRpcId } },
+          },
+        },
+        {
+          event: {
+            type: 'assistant/message',
+            seq: 3,
+            data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'done' }] } },
+          },
+        },
+        { event: { type: 'turn/end', seq: 4, data: { turn: 1, reason: { kind: 'completed' } } } },
+      ],
+    };
+  };
+
+  assert.equal(await client.ask('session-submit-timeout-confirm', 'hello', {
+    onArtifact: async () => undefined,
+  }), 'done');
+  assert.equal(promptTimeouts, 1);
 });
 
 test('HarnessClient stages inbound files, appends a neutral manifest, and cleans after turn end', async () => {
