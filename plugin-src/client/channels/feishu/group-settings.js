@@ -107,11 +107,11 @@ export function GroupResponseModeEditor({
   };
 
   const authorize = async () => {
-    if (current !== 'all' || saving || authorizing || disabled || authorizationDisabled) return;
+    if (saving || authorizing || disabled || authorizationDisabled) return;
     setAuthorizing(true);
     setError(null);
     try {
-      await onAuthorize?.();
+      await onAuthorize?.({ preserveResponseMode: current !== 'all' });
     } catch (cause) {
       setError(cause?.message ?? '群消息权限授权失败，请重试。');
     } finally {
@@ -142,11 +142,11 @@ export function GroupResponseModeEditor({
     current === 'mention'
       ? permissionGranted
         ? '私聊始终响应；群聊仅处理明确 @当前机器人的消息。群消息权限已开通，再次切换无需授权。'
-        : '私聊始终响应；群聊仅处理明确 @当前机器人的消息。选择全部消息后会打开飞书官方授权流程。'
+        : '私聊始终响应；群聊仅处理明确 @当前机器人的消息。也可单独授权采集群消息，保持仅 @ 时回复。'
       : permissionGranted
         ? '已开通“获取群组中所有消息”权限（im:message.group_msg）；机器人会处理群聊中的所有可见消息。'
         : '尚未确认“获取群组中所有消息”权限，请完成飞书授权。'),
-  current === 'all'
+  (current === 'all' || !permissionGranted)
     ? h('div', { className: 'dim-feishuGroupPermissionAction' },
         h(SettingsButton, {
           disabled: disabled || authorizationDisabled || saving || authorizing,
@@ -278,11 +278,11 @@ function PermissionFlow({ provision, now, busy, botName, onRetry, onCancel, onCl
       `正在为「${botName}」开通群消息权限`),
     h('h3', null, expired ? '刷新二维码后继续' : '使用飞书确认群消息权限'),
     h('p', null,
-      '扫码会更新现有飞书应用，只增量开通“获取群组中所有消息”权限；不会创建新应用。确认后会自动启用“响应所有群消息”，其他机器人不受影响。'),
+      '扫码会更新现有飞书应用，只增量开通“获取群组中所有消息”权限，不会创建新应用。单独授权采集时保留原来的回复方式；选择响应所有消息时才切换。'),
     h('ol', null,
       h('li', null, '打开飞书移动端，使用扫一扫读取二维码'),
       h('li', null, '核对现有应用，并确认“获取群组中所有消息”权限'),
-      h('li', null, '保持本页打开，等待权限生效并自动切换响应方式')),
+      h('li', null, '保持本页打开，等待权限生效')),
     h('div', { className: 'dim-feishuGroupAuthorizationActions' },
       expired
         ? h(SettingsButton, { kind: 'primary', onClick: onRetry, disabled: busy },
@@ -377,7 +377,7 @@ export function FeishuGroupSettingsPage({ account, rpcCall }) {
     applySnapshot(value);
   }, [account.botId, applySnapshot, invoke]);
 
-  const startAuthorization = React.useCallback(async ({ replace = false } = {}) => {
+  const startAuthorization = React.useCallback(async ({ replace = false, preserveResponseMode = provision?.preserveResponseMode === true } = {}) => {
     if (provisionBusy) return;
     const previousAttemptId = provision?.attemptId;
     setProvisionBusy(true);
@@ -393,7 +393,7 @@ export function FeishuGroupSettingsPage({ account, rpcCall }) {
       }
       const normalized = normalizeProvisioning(await invoke(
         FEISHU_ENDPOINTS.beginGroupMessagePermission,
-        { botId: account.botId },
+        { botId: account.botId, ...(preserveResponseMode ? { preserveResponseMode: true } : {}) },
       ));
       if (normalized.operation !== GROUP_MESSAGE_PERMISSION_OPERATION
         || normalized.botId !== account.botId) {
@@ -405,6 +405,7 @@ export function FeishuGroupSettingsPage({ account, rpcCall }) {
       setProvision({
         phase: normalized.submitted ? 'connecting' : 'qr',
         ...normalized,
+        preserveResponseMode,
         durationMs: Math.max(1, normalized.expiresAt - timestamp),
         expired: false,
       });
@@ -556,7 +557,7 @@ export function FeishuGroupSettingsPage({ account, rpcCall }) {
         }
         await saveSetting(FEISHU_ENDPOINTS.setGroupResponseMode, { groupResponseMode });
       },
-      onAuthorize: () => startAuthorization(),
+      onAuthorize: (options) => startAuthorization(options),
     }),
     h(MentionTopicReplyEditor, {
       value: settings.mentionTopicReply,

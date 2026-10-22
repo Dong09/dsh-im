@@ -1,3 +1,4 @@
+import { groupHistoryAccess } from './group-history-access.mjs';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
@@ -23,6 +24,7 @@ import { outboundArtifactRegistry } from './semantic/artifact.mjs';
 import { t } from './i18n.mjs';
 import { watchHarnessMux } from './harness-mux.mjs';
 import { extractConnectionEvidence, messageDiagnosticError } from './connection-error.mjs';
+import { PromptFailureTracker } from './prompt-failure-tracker.mjs';
 
 // Every channel plugin runs in the same Host process. Sharing ownership by
 // Host identity (or an explicitly configured HTTP origin) prevents clients
@@ -582,6 +584,7 @@ export function harnessToolCallFromEvent(event) {
 
 export class HarnessReplyTracker {
   #promptRpcId;
+  #promptFailure;
   #lastSeq;
   #openTurn = null;
   #targetTurn = null;
@@ -599,6 +602,7 @@ export class HarnessReplyTracker {
 
   constructor({ promptRpcId, afterSeq = -1, reasoning = false, finalAnswerOnly = false }) {
     this.#promptRpcId = promptRpcId;
+    this.#promptFailure = new PromptFailureTracker(promptRpcId, afterSeq);
     this.#lastSeq = afterSeq;
     // Reasoning updates are opt-in per consumer: only channels that surface
     // thinking traces (Telegram thinking mode) subscribe; every other channel
@@ -697,6 +701,7 @@ export class HarnessReplyTracker {
       // The mux is lossy across reconnects. Only history may advance the
       // durable cursor or finish the reply; the mux supplements reasoning.
       if (fromMux && !isReasoning) continue;
+      const failedTurn = fromMux ? null : this.#promptFailure.consume(event);
       if (isReasoning) {
         if (!live || !Number.isFinite(seq)) continue;
         if (this.#targetTurn === null) this.#bufferReasoning(event);
@@ -720,8 +725,12 @@ export class HarnessReplyTracker {
               this.#emitReasoning(pending, pushUpdate);
             }
           }
+          continue;
         }
-        continue;
+        // Model resolution or pre-step hooks can fail after the inbox claim
+        // but before user/message. Only a proved claim may close this wait.
+        if (event.type !== 'turn/end' || failedTurn === null || failedTurn !== event.data?.turn) continue;
+        this.#targetTurn = failedTurn;
       }
       if (seq <= this.#lastSeq) continue;
       this.#lastSeq = seq;
@@ -1312,7 +1321,10 @@ export class HarnessClient {
   }
 
   async adoptWorkspaceSession(value, options = {}) {
-    return adoptRegisteredWorkspaceSession(this, value, options);
+    // Modern Hosts separate observing an existing Session from creating one.
+    // Keep the legacy transport contract for Hosts without this adapter seam.
+    const method = typeof this.#apiProxy?.sessions?.adopt === 'function' ? 'session.adopt' : 'session.create';
+    return adoptRegisteredWorkspaceSession(this, value, options, 30_000, method);
   }
 
   async isUngroupedWorkspace(workspace) {
@@ -1853,10 +1865,15 @@ export class HarnessClient {
         progressTail = progressTail
           .then(() => onUpdate(update))
           .catch((error) => {
+            // The WeCom SDK rejects with the raw ack frame (no .message), so
+            // surface errcode/errmsg explicitly instead of printing undefined.
+            const detail = error instanceof Error
+              ? error.message
+              : `${error?.errmsg ?? error?.body?.errmsg ?? '(no message)'} (errcode=${error?.errcode ?? error?.body?.errcode ?? 'unknown'})`;
             console.warn(
               '[dsh-im] ignored a progress update failure:',
               this.#logPrefix,
-              error.message,
+              detail,
             );
           });
       }
@@ -1924,6 +1941,7 @@ export class HarnessClient {
       this.#registerControlOwnership(ownership);
     }
     // Advertise delivery only when this request can actually claim its files.
+    const closeGroupHistoryAccess = groupHistoryAccess.open(sessionId, promptRpcId, options.groupHistory);
     const closeArtifactConsumer = typeof onArtifact === 'function'
       ? outboundArtifactRegistry.openConsumer(sessionId, promptRpcId)
       : null;
@@ -2174,6 +2192,7 @@ export class HarnessClient {
         }
       }
       closeArtifactConsumer?.();
+      closeGroupHistoryAccess();
       if (ownership) {
         this.#unregisterControlOwnership(ownership);
         this.#unregisterInteractionOwnership(sessionId, ownership);

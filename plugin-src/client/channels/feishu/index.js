@@ -312,10 +312,10 @@ function QrPane({ provision, now, onRefresh, onCancel, busy }) {
               ? "使用飞书确认群消息权限"
               : "使用飞书扫码创建机器人"),
         h("p", null, repairing
-          ? "扫码会更新现有飞书应用，增量补充当前缺少的卡片按钮回调、读取用户消息内图片或文件所需的 im:message:readonly（飞书显示为“获取单聊、群组消息”）、上传机器人图片或文件所需的 im:resource、接收群内其他机器人 @ 当前机器人所需的 im:message.group_at_msg.include_bot:readonly，以及原生命令面板所需的 application:app_slash_command:read / write；不会创建新应用。确认页只显示当前缺少项，完成后此机器人会短暂重连，其他机器人不受影响。"
+          ? "扫码会更新现有飞书应用，增量补充当前缺少的卡片按钮回调、接收未 @ 群消息所需的 im:message.group_msg、读取用户消息内图片或文件所需的 im:message:readonly（飞书显示为“获取单聊、群组消息”）、上传机器人图片或文件所需的 im:resource、接收群内其他机器人 @ 当前机器人所需的 im:message.group_at_msg.include_bot:readonly，以及原生命令面板所需的 application:app_slash_command:read / write；不会创建新应用，群回复方式保持不变，实际收到的群消息和文件会自动保存。确认页只显示当前缺少项，完成后此机器人会短暂重连，其他机器人不受影响。"
           : grantingGroupMessages
             ? "扫码会更新现有飞书应用，只增量开通“获取群组中所有消息”权限；不会创建新应用。确认后会自动启用“响应所有群消息”，其他机器人不受影响。"
-            : "扫码只会新增一个机器人，已接入的机器人会继续正常收发消息。"),
+            : "扫码会新增一个机器人，并申请 im:message.group_msg（接收未 @ 的群消息）、im:message:readonly（读取消息中的图片或文件）等所需权限。新机器人默认仅 @ 时回复，实际收到的群消息和文件会自动保存；已接入的机器人继续正常收发消息。"),
         h("ol", { className: "bxf-steps dim-steps" },
           h("li", null, "打开飞书移动端，使用扫一扫读取二维码"),
           h("li", null, repairing
@@ -699,7 +699,7 @@ export function BotCard({
                 role: "tooltip",
               },
                 h("strong", null, "补全范围"),
-                h("span", null, "增量添加当前缺少的卡片回调 card.action.trigger、读取消息内图片或文件所需的 im:message:readonly（飞书显示为“获取单聊、群组消息”）、上传机器人图片或文件所需的 im:resource，以及原生命令面板所需的 application:app_slash_command:read / write；确认页只显示当前缺少项，不会创建新应用。"))),
+                h("span", null, "增量添加当前缺少的卡片回调 card.action.trigger、接收未 @ 群消息所需的 im:message.group_msg、读取消息内图片或文件所需的 im:message:readonly（飞书显示为“获取单聊、群组消息”）、上传机器人图片或文件所需的 im:resource，以及原生命令面板所需的 application:app_slash_command:read / write；确认页只显示当前缺少项，不会创建新应用，群回复方式保持不变，实际收到的群消息和文件会自动保存。"))),
             h(Button, {
               className: "dim-cardAction", kind: "danger", onClick: onRequestRemove,
               disabled: Boolean(busy), ref: removeButtonRef,

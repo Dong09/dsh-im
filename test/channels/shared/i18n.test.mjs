@@ -127,6 +127,11 @@ test('t() translates known keys and fills placeholders in English mode', () => {
     t('工具调用「{name}」未成功，请检查工具配置或稍后重试。', { name: 'search' }),
     'Tool call "search" did not succeed. Check the tool configuration or try again later.',
   );
+  assert.equal(
+    t('排队中的消息在服务重启时被中断。为避免重复执行，未自动重放；如果该消息尚未处理，请重新发送。'),
+    'A queued message was interrupted when the service restarted. It was not replayed automatically'
+    + ' to avoid running it twice; if it was not processed, please send it again.',
+  );
   assert.equal(t(42), 42);
 });
 

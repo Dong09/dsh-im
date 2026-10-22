@@ -15,5 +15,7 @@ export function createProductionController(ctx, config = {}, internals = {}) {
     HarnessClient: TelegramHarnessClient,
     Controller: TelegramController,
     Runtime: TelegramRuntime,
+    // The per-group reply rules list chats from the shared group archive.
+    controllerGroupHistory: true,
   });
 }

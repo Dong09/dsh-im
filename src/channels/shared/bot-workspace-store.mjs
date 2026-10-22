@@ -23,6 +23,7 @@ import {
   validateAccessPolicy,
 } from './access-policy.mjs';
 import { CONNECTION_TEST_STATE_IDENTITY } from './connection-test.mjs';
+import { SESSION_BINDING_STATE_IDENTITY } from './session-binding-lock.mjs';
 import {
   DEFAULT_CONTEXT_ENHANCEMENT_CONFIG,
   normalizeContextEnhancementConfig,
@@ -46,7 +47,9 @@ import {
 import { conversationDirectoryName, prepareDirectoryPath } from './conversation-directory-ensure.mjs';
 
 const DELIVERY_DOCUMENT_VERSION = 2;
-export const CURRENT_DOCUMENT_VERSION = 3;
+const SESSION_SYNC_DOCUMENT_VERSION = 3;
+const DS_BOT_DOCUMENT_VERSION = 4;
+export const CURRENT_DOCUMENT_VERSION = 5;
 const EMPTY_DOCUMENT = Object.freeze({ version: 1, workspaces: Object.freeze({}) });
 
 function invalidWorkspaceConfig(field, issue) {
@@ -254,7 +257,7 @@ function normalizeDeliveryTargets(value, { version } = {}) {
         }
         const normalized = normalizeDeliveryTarget(candidate, {
           targetId,
-          allowSessionSync: version >= CURRENT_DOCUMENT_VERSION,
+          allowSessionSync: version >= SESSION_SYNC_DOCUMENT_VERSION,
         });
         const { targetId: _targetId, ...stored } = normalized;
         normalizedTargets[targetId] = stored;
@@ -287,9 +290,29 @@ function normalizeAccessPolicies(value, workspaces) {
   return accessPolicies;
 }
 
+function normalizeDsBotBindings(value) {
+  const bindings = Object.create(null);
+  if (value === undefined) return bindings;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return invalidWorkspaceConfig('dsBotBindings', 'expected-object');
+  }
+  try {
+    for (const [botId, conversations] of Object.entries(value)) {
+      botIdOf(botId);
+      if (!conversations || typeof conversations !== 'object' || Array.isArray(conversations)) throw new TypeError();
+      bindings[botId] = Object.fromEntries(Object.entries(conversations).map(([key, dsBotId]) => (
+        [conversationKeyOf(key), dsBotId === null ? null : botIdOf(dsBotId)]
+      )));
+    }
+  } catch {
+    return invalidWorkspaceConfig('dsBotBindings', 'invalid-binding');
+  }
+  return bindings;
+}
+
 function normalizeDocument(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return invalidWorkspaceConfig('$', 'expected-object');
-  if (![1, DELIVERY_DOCUMENT_VERSION, CURRENT_DOCUMENT_VERSION].includes(value.version)) return invalidWorkspaceConfig('version', 'unsupported-version');
+  if (![1, DELIVERY_DOCUMENT_VERSION, SESSION_SYNC_DOCUMENT_VERSION, DS_BOT_DOCUMENT_VERSION, CURRENT_DOCUMENT_VERSION].includes(value.version)) return invalidWorkspaceConfig('version', 'unsupported-version');
   if (!value.workspaces || typeof value.workspaces !== 'object' || Array.isArray(value.workspaces)) return invalidWorkspaceConfig('workspaces', 'expected-object');
   const workspaces = {};
   for (const [index, [botId, workspace]] of Object.entries(value.workspaces).entries()) {
@@ -341,6 +364,7 @@ function normalizeDocument(value) {
   }
   if (value.version === 1 && value.deliveryTargets !== undefined) return invalidWorkspaceConfig('deliveryTargets', 'unexpected-field');
   const deliveryTargets = normalizeDeliveryTargets(value.deliveryTargets, { version: value.version });
+  const dsBotBindings = normalizeDsBotBindings(value.dsBotBindings);
   const aliases = Object.create(null);
   if (value.aliases && typeof value.aliases === 'object' && !Array.isArray(value.aliases)) {
     for (const [botId, alias] of Object.entries(value.aliases)) {
@@ -379,6 +403,7 @@ function normalizeDocument(value) {
     models,
     contextEnhancement,
     deliveryTargets,
+    dsBotBindings,
     accessPolicies,
     aliases,
     busyMessageModes,
@@ -396,6 +421,7 @@ function storedDocument({
   models,
   contextEnhancement,
   deliveryTargets,
+  dsBotBindings,
   accessPolicies,
   aliases,
   busyMessageModes,
@@ -404,6 +430,7 @@ function storedDocument({
   if (conversationDirectory) document.conversationDirectory = conversationDirectory;
   if (Object.keys(conversationDirectories).length) document.conversationDirectories = conversationDirectories;
   if (Object.keys(sessionDirectories).length) document.sessionDirectories = sessionDirectories;
+  if (Object.keys(dsBotBindings).length > 0) document.dsBotBindings = dsBotBindings;
   if (Object.keys(busyMessageModes).length > 0) document.busyMessageModes = busyMessageModes;
   if (Object.keys(aliases).length > 0) document.aliases = aliases;
   if (Object.keys(conversationWorkspaces).length > 0) {
@@ -469,6 +496,7 @@ export class BotWorkspaceStore {
   #busyMessageModes = Object.create(null);
   #contextEnhancement = {};
   #deliveryTargets = Object.create(null);
+  #dsBotBindings = Object.create(null);
   #accessPolicies = Object.create(null);
   #conversationWorkspaces = Object.create(null);
   #conversationDirectory = null;
@@ -504,6 +532,7 @@ export class BotWorkspaceStore {
       this.#busyMessageModes = normalized.busyMessageModes;
       this.#contextEnhancement = normalized.contextEnhancement;
       this.#deliveryTargets = normalized.deliveryTargets;
+      this.#dsBotBindings = normalized.dsBotBindings;
       this.#accessPolicies = normalized.accessPolicies;
       this.#conversationWorkspaces = normalized.conversationWorkspaces;
       this.#conversationDirectory = normalized.conversationDirectory;
@@ -519,6 +548,7 @@ export class BotWorkspaceStore {
       this.#busyMessageModes = Object.create(null);
       this.#contextEnhancement = {};
       this.#deliveryTargets = Object.create(null);
+      this.#dsBotBindings = Object.create(null);
       this.#accessPolicies = Object.create(null);
       this.#conversationWorkspaces = Object.create(null);
       this.#conversationDirectory = null;
@@ -847,6 +877,49 @@ export class BotWorkspaceStore {
 
   generationFor(botId) {
     return this.#generations.get(botIdOf(botId)) ?? null;
+  }
+
+  dsBotBindingFor(botId, conversationKey) {
+    const dsBotId = this.#dsBotBindings[botId]?.[conversationKey];
+    return this.has(botId) && dsBotId ? { botId, conversationKey, dsBotId } : null;
+  }
+
+  listDsBotBindings(botId) {
+    return Object.entries(this.#dsBotBindings).flatMap(([id, conversations]) => (
+      this.has(id) && (botId === undefined || botId === id)
+        ? Object.entries(conversations).filter(([, dsBotId]) => dsBotId !== null)
+          .map(([conversationKey, dsBotId]) => ({ botId: id, conversationKey, dsBotId }))
+        : []
+    ));
+  }
+
+  dsBotConversationKeys(botId) {
+    return this.has(botId) ? Object.keys(this.#dsBotBindings[botId] ?? {}) : [];
+  }
+
+  async setDsBotBinding(botId, conversationKey, dsBotId) {
+    const id = botIdOf(botId);
+    const key = conversationKeyOf(conversationKey);
+    const selected = dsBotId === null ? null : botIdOf(dsBotId);
+    return this.#enqueue(id, async () => {
+      if (!this.has(id)) throw deliveryTargetError('unknown-bot', 'Unknown bot');
+      const conversations = { ...this.#dsBotBindings[id] };
+      if (selected !== null && (conversations[key] || Object.values(conversations).includes(selected))) {
+        throw deliveryTargetError('ds-bot-binding-conflict', 'DS Bot or private chat is already bound');
+      }
+      // Keep a confirmed private-chat key after unbinding so it can be selected
+      // again without keeping its old DS Bot session mapping alive.
+      conversations[key] = selected;
+      const next = { ...this.#dsBotBindings, [id]: conversations };
+      if (!Object.keys(conversations).length) delete next[id];
+      await this.#persist(
+        this.#contextEnhancement, this.#deliveryTargets, CURRENT_DOCUMENT_VERSION,
+        this.#accessPolicies, this.#aliases, this.#conversationWorkspaces, this.#busyMessageModes, next,
+      );
+      this.#dsBotBindings = next;
+      this.#version = CURRENT_DOCUMENT_VERSION;
+      return this.dsBotBindingFor(id, key);
+    });
   }
 
   async whenIdle() {
@@ -1544,11 +1617,12 @@ export class BotWorkspaceStore {
     const hadMessageMode = Object.hasOwn(this.#busyMessageModes, id);
     const hadContextEnhancement = Object.hasOwn(this.#contextEnhancement, id);
     const hadDeliveryTargets = Object.hasOwn(this.#deliveryTargets, id);
+    const hadDsBotBindings = Object.hasOwn(this.#dsBotBindings, id);
     const hadAccessPolicy = Object.hasOwn(this.#accessPolicies, id);
     const hadConversationWorkspaces = Object.hasOwn(this.#conversationWorkspaces, id);
     const hadDirectoryRecords = Object.hasOwn(this.#conversationDirectories, id) || Object.hasOwn(this.#sessionDirectories, id);
     const needsCleanup = hadWorkspace || hadPreset || hadModel || hadAlias || hadContextEnhancement
-      || hadDeliveryTargets || hadAccessPolicy || hadConversationWorkspaces || hadMessageMode
+      || hadDeliveryTargets || hadDsBotBindings || hadAccessPolicy || hadConversationWorkspaces || hadMessageMode
       || hadDirectoryRecords
       || this.#dirtyRemovals.has(id);
     delete this.#workspaces[id];
@@ -1558,6 +1632,7 @@ export class BotWorkspaceStore {
     delete this.#busyMessageModes[id];
     delete this.#contextEnhancement[id];
     delete this.#deliveryTargets[id];
+    delete this.#dsBotBindings[id];
     delete this.#accessPolicies[id];
     delete this.#conversationWorkspaces[id];
     delete this.#conversationDirectories[id];
@@ -1599,6 +1674,7 @@ export class BotWorkspaceStore {
     aliases = this.#aliases,
     conversationWorkspaces = this.#conversationWorkspaces,
     busyMessageModes = this.#busyMessageModes,
+    dsBotBindings = this.#dsBotBindings,
     conversationDirectory = this.#conversationDirectory,
     conversationDirectories = this.#conversationDirectories,
     sessionDirectories = this.#sessionDirectories,
@@ -1611,6 +1687,7 @@ export class BotWorkspaceStore {
       models: this.#models,
       contextEnhancement,
       deliveryTargets,
+      dsBotBindings,
       accessPolicies,
       aliases,
       busyMessageModes,
@@ -1629,6 +1706,7 @@ export class BotWorkspaceStore {
       || Object.keys(this.#busyMessageModes).length > 0
       || Object.keys(this.#contextEnhancement).length > 0
       || Object.keys(this.#deliveryTargets).length > 0
+      || Object.keys(this.#dsBotBindings).length > 0
       || Object.keys(this.#accessPolicies).length > 0
       || Object.keys(this.#conversationWorkspaces).length > 0) {
       await this.#persist();
@@ -1759,12 +1837,18 @@ export function observeBotWorkspaceRemovals(
 
 export function createBotWorkspaceScope(
   harness,
-  { botId, workspaces, state, agentPresetCatalog } = {},
+  { botId, workspaces, state, agentPresetCatalog, dsBot } = {},
 ) {
   if (!harness || !workspaces || !state) throw new TypeError('harness, workspaces, and state are required');
   const incarnation = workspaces.incarnationFor(botId);
   const isCurrentScope = () => workspaces.has(botId)
     && workspaces.incarnationFor(botId) === incarnation;
+  const dsBinding = (key) => workspaces.dsBotBindingFor?.(botId, key);
+  const assertNoDsBinding = (key) => {
+    if (dsBinding(key)) {
+      throw deliveryTargetError('ds-bot-bound', '请先在“绑定bot”中解除绑定，再切换会话或工作目录。');
+    }
+  };
   const presetSettings = async (catalog = agentPresetCatalog) => {
     let normalizedCatalog;
     try {
@@ -1889,6 +1973,27 @@ export function createBotWorkspaceScope(
 
   const scopedHarness = new Proxy(harness, {
     get(target, property) {
+      if (property === 'resolveDsBotSession') {
+        return async (key) => {
+          assertCurrentBotScope(isCurrentScope);
+          const binding = dsBinding(key);
+          if (!binding) return null;
+          if (!dsBot) throw deliveryTargetError('ds-bot-unavailable', 'DS Bot 当前不可用，请检查插件状态。');
+          const bot = await dsBot.resolve(binding.dsBotId);
+          if (!(await target.sessionExists(bot.sessionId))) {
+            throw deliveryTargetError('ds-bot-not-found', 'DS Bot 的当前会话不可用。');
+          }
+          assertCurrentBotScope(isCurrentScope);
+          if (dsBinding(key)?.dsBotId !== binding.dsBotId) throw workspaceSessionStale('DS Bot binding changed');
+          if (state.sessionFor(key) !== bot.sessionId) await state.setSession(key, bot.sessionId);
+          sessionGenerations.set(bot.sessionId, {
+            generation: workspaces.generationFor(botId),
+            conversationKey: key,
+            conversationGeneration: currentConversationGeneration(key),
+          });
+          return bot.sessionId;
+        };
+      }
       if (property === 'agentPresetSettings') {
         return async (options = {}) => {
           options?.signal?.throwIfAborted();
@@ -1978,6 +2083,9 @@ export function createBotWorkspaceScope(
           if (workspaces.conversationDirectoryFor(botId).enabled) {
             return Promise.reject(workspaceManualEditDisabled());
           }
+          if (workspaces.listDsBotBindings(botId).length > 0) {
+            throw deliveryTargetError('ds-bot-bound', '请先解除 DS Bot 绑定，再切换机器人工作目录。');
+          }
           if (!isCurrentScope()) {
             const error = new Error('找不到要修改的机器人。');
             error.code = 'workspace-bot-not-found';
@@ -2025,6 +2133,7 @@ export function createBotWorkspaceScope(
       if (property === 'prepareConversationDirectory') {
         return async (conversationKey, options = {}) => {
           assertCurrentBotScope(isCurrentScope);
+          assertNoDsBinding(conversationKey);
           const pending = pendingConversationSwitches.get(conversationKey);
           if (pending) await pending;
           assertCurrentBotScope(isCurrentScope);
@@ -2041,6 +2150,7 @@ export function createBotWorkspaceScope(
           if (workspaces.conversationDirectoryFor(botId).enabled) {
             return Promise.reject(workspaceManualEditDisabled());
           }
+          assertNoDsBinding(conversationKey);
           if (!isCurrentScope()) {
             const error = new Error('找不到要修改的机器人。');
             error.code = 'workspace-bot-not-found';
@@ -2065,6 +2175,7 @@ export function createBotWorkspaceScope(
           if (workspaces.conversationDirectoryFor(botId).enabled) {
             return Promise.reject(workspaceManualEditDisabled());
           }
+          assertNoDsBinding(conversationKey);
           if (!isCurrentScope()) {
             const error = new Error('找不到要修改的机器人。');
             error.code = 'workspace-bot-not-found';
@@ -2084,6 +2195,7 @@ export function createBotWorkspaceScope(
       }
       if (property === 'bindWorkspaceSession') {
         return async (conversationKey, sessionId) => {
+          assertNoDsBinding(conversationKey);
           if (typeof conversationKey !== 'string' || !conversationKey
             || typeof sessionId !== 'string' || !sessionId) {
             throw new TypeError('conversationKey and sessionId are required');
@@ -2158,6 +2270,7 @@ export function createBotWorkspaceScope(
       if (property === 'createSession') {
         return async (options = {}) => {
           const { inheritBotModel = true, conversationKey, ...createOptions } = options;
+          assertNoDsBinding(conversationKey);
           if (conversationKey) {
             const prepared = await scopedHarness.prepareConversationDirectory(conversationKey);
             if (prepared?.workspace) createOptions.workspace = prepared.workspace;
@@ -2244,7 +2357,9 @@ export function createBotWorkspaceScope(
             : null;
           // Copy provenance into the immutable handle, but retain it for a later
           // setSession (notably /model, which binds after asynchronous selection).
+          const dsBotId = dsBinding(conversationKey)?.dsBotId;
           const isCurrentSession = () => isCurrentScope()
+            && dsBinding(conversationKey)?.dsBotId === dsBotId
             && generation === workspaces.generationFor(botId)
             && !conversationGenerationIsStale(conversationKey, conversationGeneration);
           const invokeCurrentSession = async (method, args, action) => {
@@ -2295,6 +2410,7 @@ export function createBotWorkspaceScope(
               },
             } : {}),
             selectModel(...args) {
+              if (dsBotId) throw deliveryTargetError('ds-bot-bound', '请在 DS Bot 中修改模型。');
               return invokeCurrentSession('selectSessionModel', args, 'model selection');
             },
             isRunning(...args) {
@@ -2317,11 +2433,18 @@ export function createBotWorkspaceScope(
                 return invokeStartedSessionMutation('executeCommand', args, 'command execution');
               },
             } : {}),
-            ask(...args) {
+            async ask(...args) {
               if (!isCurrentSession()) {
                 throw workspaceSessionStale(
                   'The bot workspace changed before this prompt started.',
                 );
+              }
+              if (dsBotId) {
+                const bot = await dsBot?.resolve(dsBotId);
+                if (!bot) throw deliveryTargetError('ds-bot-unavailable', 'DS Bot 当前不可用。');
+                if (bot.sessionId !== sessionId || !isCurrentSession()) {
+                  throw workspaceSessionStale('DS Bot changed before this prompt started.');
+                }
               }
               return target.ask(sessionId, ...args);
             },
@@ -2366,7 +2489,7 @@ export function createBotWorkspaceScope(
   });
   const scopedState = new Proxy(state, {
     get(target, property) {
-      if (property === CONNECTION_TEST_STATE_IDENTITY) return target;
+      if (property === CONNECTION_TEST_STATE_IDENTITY || property === SESSION_BINDING_STATE_IDENTITY) return target;
       if (property === 'sessionFor') {
         return (key, ...args) => {
           if (!isCurrentScope()) return null;
@@ -2392,11 +2515,18 @@ export function createBotWorkspaceScope(
       }
       if (property === 'setSession') {
         return (key, sessionId, ...args) => {
+          if (dsBinding(key) && target.sessionFor(key) !== sessionId) assertNoDsBinding(key);
           const entry = sessionGenerations.get(sessionId);
           if (!isCurrentScope() || generationIsStale(entry, key)) {
             return false;
           }
           return target.setSession(key, sessionId, ...args);
+        };
+      }
+      if (property === 'clearSession') {
+        return (key, ...args) => {
+          assertNoDsBinding(key);
+          return target.clearSession(key, ...args);
         };
       }
       const value = Reflect.get(target, property, target);

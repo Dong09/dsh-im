@@ -1,8 +1,10 @@
+import { captureGroupHistory, groupHistoryEntry } from '../shared/group-history.mjs';
 import { extractConnectionEvidence, createConnectionDiagnostics, atConnectionStage } from '../shared/connection-error.mjs';
 
 import { createEditableMessageStream } from '../shared/editable-message-stream.mjs';
 import { createTextDeliveryBlock } from '../shared/semantic/delivery.mjs';
 import { t } from '../shared/i18n.mjs';
+import { groupTriggerAddressed, normalizeGroupTriggers } from './group-triggers.mjs';
 import { captureContextEnhancement } from '../shared/context-enhancement.mjs';
 import { recoverAssistantTextByTimestamp } from '../shared/session-reply-recovery.mjs';
 import { SHARED_COMMAND_CATALOG, commandsForChannel } from '../shared/command-catalog.mjs';
@@ -277,6 +279,7 @@ export function normalizeTelegramCallback(update, { botId } = {}) {
 export function normalizeTelegramUpdate(update, {
   botId,
   username,
+  groupTriggers,
   loadFile = async () => { throw new Error('Telegram file downloader is unavailable'); },
   loadFileStream = loadFile,
   loadReplyContent,
@@ -289,9 +292,15 @@ export function normalizeTelegramUpdate(update, {
     || !Number.isSafeInteger(messageId)) return null;
   if (!['private', 'group', 'supergroup'].includes(message.chat?.type)) return null;
   const direct = message.chat.type === 'private';
-  const addressed = direct
-    || String(message.reply_to_message?.from?.id ?? '') === String(botId)
+  // A reply to the bot or an @username mention is the legacy "tagged" signal;
+  // the per-group rule decides whether it is enough (or unnecessary).
+  const tagged = String(message.reply_to_message?.from?.id ?? '') === String(botId)
     || mentionedUsername(message, username);
+  const addressed = direct || groupTriggerAddressed(groupTriggers, {
+    chatId: String(chatId),
+    senderId: String(senderId),
+    tagged,
+  });
   const messageThreadId = Number.isSafeInteger(message.message_thread_id)
     ? message.message_thread_id : undefined;
   const image = telegramImageSource(message, loadFile);
@@ -1107,6 +1116,8 @@ export class TelegramRuntime {
   #harness;
   #state;
   #contextEnhancement;
+  #groupHistory;
+  #groupTriggers;
   #accessPolicy;
   #logger;
   #diagnostics;
@@ -1136,6 +1147,7 @@ export class TelegramRuntime {
     harness,
     state,
     contextEnhancement,
+    groupHistory,
     accessPolicy,
     logger = console,
     replyTimeoutMs = 600_000,
@@ -1151,6 +1163,10 @@ export class TelegramRuntime {
     this.#harness = harness;
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
+    this.#groupHistory = groupHistory;
+    // Rules change through the controller, which restarts the runtime, so the
+    // normalized snapshot is read once per start.
+    this.#groupTriggers = normalizeGroupTriggers(config.groupTriggers);
     this.#accessPolicy = accessPolicy;
     this.#logger = logger; this.#diagnostics = createConnectionDiagnostics({ channel: 'telegram', logger });
     this.#replyTimeoutMs = replyTimeoutMs;
@@ -1419,11 +1435,15 @@ export class TelegramRuntime {
         const message = normalizeTelegramUpdate(update, {
           botId: this.#config.platformId,
           username: this.#config.username,
+          groupTriggers: this.#groupTriggers,
           loadFile: (fileId, options) => this.#api.downloadFile({ fileId, ...options }),
           loadFileStream: (fileId, options) => this.#api.downloadFileStream({ fileId, ...options }),
           loadReplyContent: (reference, options) => this.#loadReplyContent(reference, options),
         });
         if (message) {
+          await captureGroupHistory(this.#groupHistory, message, groupHistoryEntry('telegram', update, message), {
+            logger: this.#logger,
+          });
           void this.#bridge.accept(message, { contextSnapshot }).catch((error) => {
             if (signal.aborted) return;
             this.#logger.error?.(

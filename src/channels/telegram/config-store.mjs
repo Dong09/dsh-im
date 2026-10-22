@@ -4,6 +4,7 @@ import {
   maskPlatformId,
   TokenBotConfigStore,
 } from '../shared/token-config-store.mjs';
+import { normalizeGroupTriggers } from './group-triggers.mjs';
 
 const IDENTITY_OPTIONS = Object.freeze({
   botPrefix: 'telegram',
@@ -51,7 +52,8 @@ function normalizeTelegramBotExtension(value) {
   const hasAccessMode = Object.hasOwn(value, 'accessMode');
   const hasAllowedUsers = Object.hasOwn(value, 'allowedUsers');
   const hasThinkingTraces = Object.hasOwn(value, 'thinkingTraces');
-  if (!hasAccessMode && !hasAllowedUsers && !hasThinkingTraces) return {};
+  const hasGroupTriggers = Object.hasOwn(value, 'groupTriggers');
+  if (!hasAccessMode && !hasAllowedUsers && !hasThinkingTraces && !hasGroupTriggers) return {};
   try {
     const policy = normalizeTelegramAccessPolicy(value);
     return {
@@ -59,6 +61,8 @@ function normalizeTelegramBotExtension(value) {
       ...(hasAllowedUsers || hasAccessMode ? { allowedUsers: policy.allowedUsers } : {}),
       // Explicit field is kept; an absent field stays absent.
       ...(hasThinkingTraces ? { thinkingTraces: value.thinkingTraces === true } : {}),
+      // Per-group reply triggers; absent means "no rule configured".
+      ...(hasGroupTriggers ? { groupTriggers: normalizeGroupTriggers(value.groupTriggers) } : {}),
     };
   } catch {
     return null;

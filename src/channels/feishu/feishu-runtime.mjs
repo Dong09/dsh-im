@@ -126,6 +126,7 @@ export class FeishuRuntime {
   #harness;
   #state;
   #contextEnhancement;
+  #groupHistory;
   #accessPolicy;
   #replyTimeoutMs;
   #connectTimeoutMs;
@@ -180,6 +181,7 @@ export class FeishuRuntime {
     harness,
     state,
     contextEnhancement,
+    groupHistory,
     accessPolicy,
     repair,
     replyTimeoutMs = 600000,
@@ -229,6 +231,7 @@ export class FeishuRuntime {
     this.#harness = harness;
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
+    this.#groupHistory = groupHistory;
     this.#accessPolicy = accessPolicy;
     this.#repair = repair ?? null;
     this.#replyTimeoutMs = replyTimeoutMs;
@@ -369,6 +372,8 @@ export class FeishuRuntime {
         harness: this.#harness,
         state: this.#state,
         contextEnhancement: this.#contextEnhancement,
+      groupHistory: this.#groupHistory,
+        groupHistoryScope: this.#domain,
         accessPolicy: this.#accessPolicy,
         status: this.#status,
         allowedSenderOpenIds: new Set(this.#ownerOpenIds),

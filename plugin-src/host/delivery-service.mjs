@@ -20,6 +20,11 @@ const ADAPTER_METHODS = Object.freeze([
 ]);
 
 const DELIVERY_ERROR_CODES = new Set([
+  'ds-bot-unavailable',
+  'ds-bot-not-found',
+  'ds-bot-bound',
+  'ds-bot-private-required',
+  'ds-bot-binding-conflict',
   'bad-request',
   'account-unverified',
   'account-changed',
@@ -70,6 +75,14 @@ function botIdOf(value) {
 function targetIdOf(value) {
   if (typeof value !== 'string' || !TARGET_ID_PATTERN.test(value)) {
     throw deliveryError('bad-request', 'Invalid target id');
+  }
+  return value;
+}
+
+function conversationKeyOf(value) {
+  if (typeof value !== 'string' || !value || value.length > 1_024
+    || value.trim() !== value || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw deliveryError('bad-request', 'Invalid private conversation');
   }
   return value;
 }
@@ -132,8 +145,9 @@ function sessionSyncState(value, available) {
 export class DeliveryService {
   #adapters = new Map();
   #unavailableSessionSyncChannels;
+  dsBot;
 
-  constructor({ unavailableSessionSyncChannels = [] } = {}) {
+  constructor({ unavailableSessionSyncChannels = [], dsBot } = {}) {
     if (!Array.isArray(unavailableSessionSyncChannels)
       || unavailableSessionSyncChannels.some((channel) => (
         typeof channel !== 'string' || !CHANNEL_PATTERN.test(channel)
@@ -141,6 +155,61 @@ export class DeliveryService {
       throw new TypeError('unavailableSessionSyncChannels must contain valid channel ids');
     }
     this.#unavailableSessionSyncChannels = new Set(unavailableSessionSyncChannels);
+    this.dsBot = dsBot;
+  }
+
+  async listDsBotSessions() {
+    const ids = new Set();
+    for (const { adapter } of this.#adapters.values()) {
+      if (!this.#supportsSessionSync(adapter)) continue;
+      for (const binding of await adapter.listDsBotBindings?.() ?? []) ids.add(binding.dsBotId);
+    }
+    if (!ids.size) return [];
+    const result = await this.dsBot?.status();
+    if (result?.state !== 'ready') return [];
+    // Only current, bound sessions and public appearance; no private routes,
+    // account configuration, conversation contents, or historical parts.
+    return result.bots.filter((bot) => ids.has(bot.id)).map(({ sessionId, id, name, color, avatar }) => ({
+      sessionId,
+      bot: { id, name, ...(color ? { color } : {}), ...(avatar ? { avatar } : {}) },
+    }));
+  }
+
+  async dsBotStatus(botId) {
+    const adapter = await this.#adapterFor(botIdOf(botId));
+    const result = this.#supportsSessionSync(adapter)
+      ? await this.dsBot?.status() ?? { state: 'unavailable', bots: [] }
+      : { state: 'remote', bots: [] };
+    return {
+      state: result.state,
+      bots: result.bots.map(({ id, name, color, avatar }) => ({
+        id, name, ...(color ? { color } : {}), ...(avatar ? { avatar } : {}),
+      })),
+      conversations: await adapter.listDsBotConversations?.(botId) ?? [],
+    };
+  }
+
+  async bindDsBot(botId, conversationKey, dsBotId) {
+    const id = botIdOf(botId);
+    const adapter = await this.#adapterFor(id);
+    if (!this.#supportsSessionSync(adapter) || !adapter.bindDsBot) {
+      throw deliveryError('ds-bot-unavailable');
+    }
+    try {
+      return await adapter.bindDsBot(id, conversationKeyOf(conversationKey), botIdOf(dsBotId));
+    } catch (error) {
+      throw publicOperationError(error);
+    }
+  }
+
+  async unbindDsBot(botId, conversationKey) {
+    const id = botIdOf(botId);
+    const adapter = await this.#adapterFor(id);
+    try {
+      return await adapter.unbindDsBot(id, conversationKeyOf(conversationKey));
+    } catch (error) {
+      throw publicOperationError(error);
+    }
   }
 
   registerAdapter(value) {

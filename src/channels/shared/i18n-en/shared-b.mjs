@@ -285,6 +285,8 @@ export default {
   '任务已结束，没有正在运行的任务，无法补充指令。请直接发送消息开始新任务。':
     'The task has ended and there is no running task to steer. Send a message to start a new task.',
   '已排队，等待前序消息处理。': 'Queued. Waiting for the preceding messages to finish.',
+  '排队中的消息在服务重启时被中断。为避免重复执行，未自动重放；如果该消息尚未处理，请重新发送。':
+    'A queued message was interrupted when the service restarted. It was not replayed automatically to avoid running it twice; if it was not processed, please send it again.',
   '已提交补充指令，Agent 会在下一步读取。':
     'Additional instruction submitted; the Agent will read it at the next step.',
 };

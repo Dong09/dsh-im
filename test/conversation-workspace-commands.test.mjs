@@ -128,6 +128,18 @@ test('/new reports directory creation failure through the scoped harness', async
   assert.equal(f.workspaces.conversationWorkspaceFor(f.botId, f.key), f.defaultWorkspace);
 });
 
+test('/new does not clear a DS Bot-bound conversation when directory preparation is denied', async (t) => {
+  const f = await fixture(t);
+  await f.workspaces.setConversationDirectory(f.botId, { enabled: true });
+  await f.workspaces.setDsBotBinding(f.botId, f.key, 'ds-bot-one');
+  await f.state.setSession(f.key, 'session-A');
+  await assert.rejects(
+    startNewConversation({ state: f.scope.state, harness: f.scope.harness, key: f.key }),
+    { code: 'ds-bot-bound' },
+  );
+  assert.equal(f.state.sessionFor(f.key), 'session-A');
+});
+
 test('isolated /session binds only the current conversation', async (t) => {
   const f = await fixture(t);
   await f.workspaces.setConversationDirectory(f.botId, { enabled: true });

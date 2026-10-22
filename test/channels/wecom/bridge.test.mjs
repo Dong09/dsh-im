@@ -593,6 +593,71 @@ test('Enterprise WeChat remembers any private inbound as a connection-test targe
   assert.equal(connectionTestTarget(groupState), null);
 });
 
+test('Enterprise WeChat queries and switches permissions locally for its bound Session', async () => {
+  const transport = testClient();
+  const executed = [];
+  const bridge = new WecomHarnessBridge({
+    client: transport.client,
+    harness: {
+      getSessionPermissions: async (id) => {
+        assert.equal(id, 'session-existing');
+        return { currentValue: 'workspace-write', options: [{ value: 'workspace-write' }] };
+      },
+      executeCommand: async (id, line) => {
+        executed.push({ id, line });
+        return { result: { kind: 'success' } };
+      },
+      ask: async () => assert.fail('permission commands must not be submitted to the model'),
+    },
+    state: state(),
+    accessPolicy: directAccessPolicy({ privilegedIds: ['member-1'] }),
+  });
+  for (const command of ['/permission', '/permissionlist', '/permission 1', '/help']) {
+    await bridge.accept(frame({ msgid: command, text: { content: command } }));
+  }
+  assert.deepEqual(executed, [{ id: 'session-existing', line: '/permission workspace-write' }]);
+  const replies = transport.streamed.map(item => item.content).join('\n');
+  assert.match(replies, /当前会话权限：workspace-write/);
+  assert.match(replies, /当前会话权限已切换为：workspace-write/);
+  assert.match(replies, /\/permissionlist  按序号列出权限档位/);
+});
+
+test('Enterprise WeChat permission commands enforce privileged access before reading or writing', async () => {
+  const transport = testClient();
+  const bridge = new WecomHarnessBridge({
+    client: transport.client,
+    harness: {
+      getSessionPermissions: async () => assert.fail('permission read must be denied'),
+      executeCommand: async () => assert.fail('permission write must be denied'),
+      ask: async () => assert.fail('denied commands must not become prompts'),
+    },
+    state: state(),
+    accessPolicy: directAccessPolicy({ users: [{ id: 'member-1', canExecuteCommands: false }], privilegedIds: ['owner'] }),
+  });
+  for (const command of ['/permission', '/permissionlist', '/permission workspace-write']) {
+    await bridge.accept(frame({ msgid: command, text: { content: command } }));
+  }
+  assert.equal(transport.streamed.length, 3);
+  assert.ok(transport.streamed.every(item => item.content === COMMAND_PERMISSION_DENIED_MESSAGE));
+});
+
+test('Enterprise WeChat rejects permission commands with media without invoking the model or changing permissions', async () => {
+  const transport = testClient();
+  const bridge = new WecomHarnessBridge({
+    client: transport.client,
+    harness: {
+      executeCommand: async () => assert.fail('media must not change permissions'),
+      ask: async () => assert.fail('media command must not become a prompt'),
+    },
+    state: state(),
+  });
+  await bridge.accept(frame({ msgtype: 'mixed', mixed: { msg_item: [
+    { msgtype: 'text', text: { content: '/permission workspace-write' } },
+    { msgtype: 'image', image: { url: 'https://wecom.example/image' } },
+  ] } }));
+  assert.match(transport.streamed.at(-1).content, /权限命令仅支持纯文字/);
+});
+
 test('Enterprise WeChat executes /compact for the bound Session without prompting the model', async () => {
   const store = state();
   const transport = testClient();

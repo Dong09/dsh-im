@@ -1,3 +1,4 @@
+import { captureGroupHistory, groupHistoryEntry } from '../shared/group-history.mjs';
 import { extractConnectionEvidence, createConnectionDiagnostics, atConnectionStage } from '../shared/connection-error.mjs';
 import { splitMessageText } from '../shared/editable-message-stream.mjs';
 import { chunkMarkdownParts } from '../shared/markdown-chunks.mjs';
@@ -167,7 +168,8 @@ export function normalizeSlackEvent(payload, botUserId, {
   if (!event || !payload?.event_id || !event.channel || !event.user || !event.ts) return null;
   const direct = event.type === 'message' && event.channel_type === 'im';
   const mentioned = event.type === 'app_mention';
-  if (!direct && !mentioned) return null;
+  const group = event.type === 'message' && ['channel', 'group'].includes(event.channel_type);
+  if (!direct && !mentioned && !group) return null;
   if ((event.subtype && event.subtype !== 'file_share') || event.bot_id || event.app_id) return null;
   const threadTs = String(event.thread_ts ?? event.ts);
   const replyTo = slackThreadReplyReference(event, loadReply);
@@ -439,6 +441,7 @@ export class SlackRuntime {
   #harness;
   #state;
   #contextEnhancement;
+  #groupHistory;
   #accessPolicy;
   #logger;
   #diagnostics;
@@ -465,6 +468,7 @@ export class SlackRuntime {
     harness,
     state,
     contextEnhancement,
+    groupHistory,
     accessPolicy,
     logger = console,
     replyTimeoutMs = 600_000,
@@ -482,6 +486,7 @@ export class SlackRuntime {
     this.#harness = harness;
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
+    this.#groupHistory = groupHistory;
     this.#accessPolicy = accessPolicy;
     this.#logger = logger; this.#diagnostics = createConnectionDiagnostics({ channel: 'slack', logger });
     this.#replyTimeoutMs = replyTimeoutMs;
@@ -665,7 +670,10 @@ export class SlackRuntime {
         });
         const bridge = this.#bridge;
         if (message && bridge) {
-          void bridge.accept(message).catch((error) => {
+          void captureGroupHistory(this.#groupHistory, message, groupHistoryEntry('slack', packet.payload, message, {
+            scope: this.#config.platformId.split(':')[0],
+          }), { logger: this.#logger })
+            .then(() => bridge.accept(message)).catch((error) => {
             if (generation !== this.#generation || this.#stopped) return;
             this.#logger.error?.(
               `[dsh-im:slack] bot ${this.#config.botId} message handling failed:`,

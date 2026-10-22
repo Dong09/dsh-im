@@ -1,3 +1,4 @@
+import { captureGroupHistory } from '../shared/group-history.mjs';
 import { BusyMessageDispatcher, canAutomaticallySteer } from '../shared/busy-message-dispatcher.mjs';
 import { isPermissionCommand, runPermissionCommand } from '../shared/permission-command.mjs';
 import { createDeferredDeliveryCoordinator, deferredOutcomeText } from '../shared/deferred-delivery-coordinator.mjs';
@@ -94,6 +95,13 @@ export const QQ_IMAGE_HOSTS = Object.freeze([
 ]);
 
 const QQ_IMAGE_FILENAME = /\.(?:gif|jpe?g|png|webp)$/i;
+
+/** Durable queue-entry id; the conversation key keeps ids unique across chats. */
+function pendingMessageId(key, messageId) {
+  return `${key}\u0000${messageId}`;
+}
+
+const PENDING_RESTART_NOTICE = '排队中的消息在服务重启时被中断。为避免重复执行，未自动重放；如果该消息尚未处理，请重新发送。';
 
 function helpText() {
   return [
@@ -440,6 +448,7 @@ export class QqHarnessBridge {
   #state;
   #deferred;
   #contextEnhancement;
+  #groupHistory;
   #accessPolicy;
   #status;
   #logger;
@@ -448,6 +457,8 @@ export class QqHarnessBridge {
   #fetchImpl;
   #fileUploadTimeoutMs;
   #queues = new Map();
+  // Crash-recovery for #queues, started with the bridge; see recoverPendingMessages().
+  #pendingRecovery = null;
   #busyMessages = new BusyMessageDispatcher();
   #pendingInteractions = new Map();
   #interactionKeys = new Map();
@@ -466,6 +477,7 @@ export class QqHarnessBridge {
     harness,
     state,
     contextEnhancement,
+    groupHistory,
     accessPolicy,
     status = createQqBridgeStatus(),
     logger = console,
@@ -486,6 +498,7 @@ export class QqHarnessBridge {
     this.#harness = harness;
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
+    this.#groupHistory = groupHistory;
     this.#accessPolicy = accessPolicy;
     this.#status = status;
     this.#logger = logger;
@@ -498,6 +511,10 @@ export class QqHarnessBridge {
     this.#fetchImpl = fetchImpl;
     this.#fileUploadTimeoutMs = Math.min(fileUploadTimeoutMs, DEFAULT_FILE_UPLOAD_TIMEOUT_MS);
     this.#approvals = new HarnessApprovalQueue({ label: 'qq', logger });
+    // A queued message lives only in #queues. If the process dies before its
+    // turn runs the user has already been told it is queued, so the persisted
+    // entry must be replayed or reported as soon as the bridge starts.
+    this.recoverPendingMessages();
   }
 
   get status() {
@@ -505,6 +522,20 @@ export class QqHarnessBridge {
   }
 
   accept(message) {
+    if (!this.#groupHistory || message?.kind !== 'group') return this.#accept(message);
+    const normalized = { ...qqInboundMessage(message, { fetchImpl: this.#fetchImpl }), kind: 'group',
+      senderId: message.senderId, senderIsBot: message.senderIsBot, addressed: isQqMessageAddressed(message) };
+    return captureGroupHistory(this.#groupHistory, normalized, {
+      channel: 'qq', scope: `app:${this.#bot.appId}`, groupId: message.groupOpenid,
+      messageId: message.messageId, sentAt: message.timestamp, senderName: message.senderName,
+      text: message.raw?.content ?? message.content ?? '',
+      type: message.attachments?.length ? 'file' : 'text',
+      capability: '仅保存实际投递的消息；未 @ 能力及跨应用群身份尚需验证，当前按应用来源隔离。',
+    }, { logger: this.#logger })
+      .then(() => { message.groupHistory = normalized.groupHistory; return this.#accept(message); });
+  }
+
+  #accept(message) {
     if (this.#signal?.aborted) return Promise.resolve();
     const messageId = nonEmptyString(message?.messageId);
     const sender = nonEmptyString(message?.senderId);
@@ -714,6 +745,9 @@ export class QqHarnessBridge {
     alreadyRecorded = false,
     batchSubmission = null,
   } = {}) {
+    // Persist before the message joins the in-memory chain: the chain may wait
+    // behind a long turn, and a restart in that window must not lose the input.
+    const pending = this.#recordPendingMessage(message, messageId, key);
     const addressed = isQqMessageAddressed(message);
     const preparedMessage = addressed
       ? prefetchInboundFiles(
@@ -724,17 +758,141 @@ export class QqHarnessBridge {
     const previous = this.#queues.get(key) ?? Promise.resolve();
     const current = previous
       .catch(() => undefined)
+      .then(() => pending)
       .then(() => this.#process(message, key, {
         alreadyRecorded,
         preparedMessage,
         batchSubmission,
       }))
-      .finally(() => {
+      .finally(async () => {
         if (releaseMessageId) this.#acceptedMessageIds.delete(messageId);
         if (this.#queues.get(key) === current) this.#queues.delete(key);
+        await this.#removePendingMessage(pendingMessageId(key, messageId));
       });
     this.#queues.set(key, current);
     return current;
+  }
+
+  /**
+   * Replay (submitted: false) or report (submitted: true) the messages this
+   * bridge persisted before a restart. Idempotent: each entry is removed as it
+   * is handled, and the returned promise is shared with waitForIdle().
+   */
+  recoverPendingMessages() {
+    this.#pendingRecovery ??= this.#recoverPendingMessages().catch((error) => {
+      this.#logger.warn?.('[dsh-im:qq] queued-message recovery failed:', error?.message ?? error);
+    });
+    return this.#pendingRecovery;
+  }
+
+  async #recoverPendingMessages() {
+    if (typeof this.#state?.pendingMessages !== 'function') return;
+    const entries = this.#state.pendingMessages();
+    if (!Array.isArray(entries) || entries.length === 0) return;
+    for (const entry of entries) {
+      if (!entry || this.#signal?.aborted) return;
+      try {
+        if (entry.submitted === true) {
+          await this.#notifyInterruptedPending(entry);
+          await this.#removePendingMessage(entry.id);
+          continue;
+        }
+        this.#logger.warn?.(
+          '[dsh-im:qq] replaying a queued message that a restart interrupted:',
+          entry.messageId,
+        );
+        // The turn never reached Harness, so any earlier mark-seen is an
+        // attempt, not a completed delivery; clear it so the replay can run.
+        if (typeof this.#state.unmarkSeen === 'function') {
+          await this.#state.unmarkSeen(entry.messageId).catch(() => undefined);
+        }
+        await this.#replayPendingMessage(entry);
+      } catch (error) {
+        this.#logger.warn?.(
+          '[dsh-im:qq] failed to recover a queued message:',
+          entry?.messageId,
+          error?.message ?? error,
+        );
+      }
+    }
+  }
+
+  #recordPendingMessage(message, messageId, key) {
+    if (typeof this.#state?.putPendingMessage !== 'function') return Promise.resolve();
+    const text = safeText(message);
+    if (!text) return Promise.resolve();
+    const senderId = nonEmptyString(message.senderId);
+    const entry = {
+      id: pendingMessageId(key, messageId),
+      key,
+      messageId,
+      kind: message.kind === 'group' ? 'group' : 'c2c',
+      text,
+      submitted: false,
+      createdAt: new Date().toISOString(),
+      ...(senderId ? { senderId } : {}),
+      ...(message.replyTarget !== undefined ? { target: message.replyTarget } : {}),
+    };
+    return this.#state.putPendingMessage(entry).catch((error) => {
+      this.#logger.warn?.('[dsh-im:qq] failed to persist a queued message:', error?.message ?? error);
+    });
+  }
+
+  async #markPendingSubmitted(key, messageId) {
+    if (typeof this.#state?.patchPendingMessage !== 'function') return;
+    await this.#state.patchPendingMessage(pendingMessageId(key, messageId), { submitted: true });
+  }
+
+  async #removePendingMessage(id) {
+    if (typeof this.#state?.removePendingMessage !== 'function') return;
+    try {
+      await this.#state.removePendingMessage(id);
+    } catch (error) {
+      this.#logger.warn?.('[dsh-im:qq] failed to clear a queued-message entry:', error?.message ?? error);
+    }
+  }
+
+  #replayPendingMessage(entry) {
+    const message = this.#pendingReplayMessage(entry);
+    if (!message) return Promise.resolve();
+    return this.#enqueueMessage(message, entry.messageId, entry.key);
+  }
+
+  #pendingReplayMessage(entry) {
+    const separator = String(entry.key).indexOf(':');
+    if (separator < 0) return null;
+    const kind = entry.key.slice(0, separator) === 'group' ? 'group' : 'c2c';
+    const conversationId = entry.key.slice(separator + 1);
+    if (!conversationId || !entry.messageId) return null;
+    // Rebuild exactly the turn fields the queue path reads, so the recovered
+    // text is dispatched as the user's own message with no added framing.
+    return {
+      kind,
+      rawEventType: kind === 'group' ? 'GROUP_AT_MESSAGE_CREATE' : 'C2C_MESSAGE_CREATE',
+      senderId: entry.senderId ?? '',
+      messageId: entry.messageId,
+      content: entry.text,
+      ...(kind === 'group' ? { groupOpenid: conversationId } : {}),
+      ...(entry.target !== undefined ? { replyTarget: entry.target } : {}),
+    };
+  }
+
+  async #notifyInterruptedPending(entry) {
+    if (entry.target === undefined || entry.target === null) {
+      this.#logger.warn?.(
+        '[dsh-im:qq] a queued message was interrupted by a restart but has no delivery target:',
+        entry.messageId,
+      );
+      return;
+    }
+    try {
+      await this.#bot.sendText(entry.target, t(PENDING_RESTART_NOTICE));
+    } catch (error) {
+      this.#logger.warn?.(
+        '[dsh-im:qq] failed to report an interrupted queued message:',
+        error?.message ?? error,
+      );
+    }
   }
 
   async #deliverDeferredOutcome(entry, outcome) {
@@ -843,6 +1001,7 @@ export class QqHarnessBridge {
   }
 
   async waitForIdle() {
+    await this.#pendingRecovery;
     await this.#busyMessages.whenIdle();
     await Promise.allSettled([
       ...this.#queues.values(),
@@ -1107,6 +1266,11 @@ export class QqHarnessBridge {
         // Persist consumption before handing the prompt to Harness. Provider
         // redelivery after a failed error notice must never execute it twice.
         await markMessageSeen();
+        // The prompt is about to enter the Harness inbox, which is itself
+        // durable. Marking the entry submitted first means a crash after this
+        // point reports the message instead of replaying a turn the Harness may
+        // already own.
+        await this.#markPendingSubmitted(key, messageId);
         ({ answer, artifacts = [] } = await askInWorkspaceSession({
           deferredDelivery: () => ({ coordinator: this.#deferred, target: { scope: target.scope, targetId: target.targetId } }),
           harness: this.#harness,
@@ -1120,6 +1284,7 @@ export class QqHarnessBridge {
           createOptions: { signal: this.#signal },
           existsOptions: { signal: this.#signal },
           askOptions: {
+            groupHistory: message.groupHistory,
             timeoutMs: this.#replyTimeoutMs,
             signal: this.#signal,
             control: { owner: this, key },

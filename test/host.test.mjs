@@ -35,6 +35,9 @@ test('Host resolves the bot message language before channels start and serves it
     installHostLanguageRpc: (_ctx, given, authority) => {
       order.push(['language-rpc', given === controller, authority]);
     },
+    installSidebarSettingsRpc: (_ctx, { config }) => {
+      order.push(['sidebar-rpc', config.rpcAuthority, config.language]);
+    },
     applyTelegram: async () => { order.push(['telegram', resolved]); },
   });
 
@@ -47,6 +50,8 @@ test('Host resolves the bot message language before channels start and serves it
   assert.deepEqual(order[0], ['language', 'en']);
   assert.deepEqual(order.find(([kind]) => kind === 'language-rpc'),
     ['language-rpc', true, 'trusted-host']);
+  assert.deepEqual(order.find(([kind]) => kind === 'sidebar-rpc'),
+    ['sidebar-rpc', 'trusted-host', 'en']);
   assert.deepEqual(order.find(([kind]) => kind === 'telegram'), ['telegram', true]);
 });
 

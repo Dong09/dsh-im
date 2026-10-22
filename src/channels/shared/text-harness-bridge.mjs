@@ -169,6 +169,13 @@ function controlTextOf(message) {
   return cleanText(message?.controlText ?? message?.content);
 }
 
+/** Durable queue-entry id; the conversation key keeps ids unique across chats. */
+function pendingMessageId(key, messageId) {
+  return `${key}\u0000${messageId}`;
+}
+
+const PENDING_RESTART_NOTICE = '排队中的消息在服务重启时被中断。为避免重复执行，未自动重放；如果该消息尚未处理，请重新发送。';
+
 export class TextHarnessBridge {
   #descriptor;
   #bot;
@@ -184,6 +191,8 @@ export class TextHarnessBridge {
   #signal;
   #keepaliveIntervalMs;
   #queues = new Map();
+  // Crash-recovery for #queues, started with the bridge; see recoverPendingMessages().
+  #pendingRecovery = null;
   #busyMessages = new BusyMessageDispatcher();
   #pendingInteractions = new Map();
   #interactionKeys = new Map();
@@ -266,6 +275,10 @@ export class TextHarnessBridge {
       label: descriptor.key,
       logger,
     });
+    // A queued message lives only in #queues. If the process dies before its
+    // turn runs the user has already been told it is queued, so the persisted
+    // entry must be replayed or reported as soon as the bridge starts.
+    this.recoverPendingMessages();
   }
 
   get status() {
@@ -748,9 +761,13 @@ export class TextHarnessBridge {
     releaseMessageId = true,
     alreadyRecorded = false,
   } = {}) {
+    // Persist before the message joins the in-memory chain: the chain may wait
+    // behind a long turn, and a restart in that window must not lose the input.
+    const pending = this.#recordPendingMessage(message, messageId, senderId, key);
     const previous = this.#queues.get(key) ?? Promise.resolve();
     const current = previous
       .catch(() => undefined)
+      .then(() => pending)
       .then(() => this.#process(
         message,
         messageId,
@@ -758,12 +775,145 @@ export class TextHarnessBridge {
         key,
         { alreadyRecorded },
       ))
-      .finally(() => {
+      .finally(async () => {
         if (releaseMessageId) this.#acceptedMessageIds.delete(messageId);
         if (this.#queues.get(key) === current) this.#queues.delete(key);
+        await this.#removePendingMessage(pendingMessageId(key, messageId));
       });
     this.#queues.set(key, current);
     return current;
+  }
+
+  /**
+   * Replay (submitted: false) or report (submitted: true) the messages this
+   * bridge persisted before a restart. Idempotent: each entry is removed as it
+   * is handled, and the returned promise is shared with waitForIdle().
+   */
+  recoverPendingMessages() {
+    this.#pendingRecovery ??= this.#recoverPendingMessages().catch((error) => {
+      this.#logger.warn?.(
+        `[dsh-im:${this.#descriptor.key}] queued-message recovery failed:`,
+        error?.message ?? error,
+      );
+    });
+    return this.#pendingRecovery;
+  }
+
+  async #recoverPendingMessages() {
+    if (typeof this.#state?.pendingMessages !== 'function') return;
+    const entries = this.#state.pendingMessages();
+    if (!Array.isArray(entries) || entries.length === 0) return;
+    for (const entry of entries) {
+      if (!entry || this.#signal?.aborted) return;
+      try {
+        if (entry.submitted === true) {
+          await this.#notifyInterruptedPending(entry);
+          await this.#removePendingMessage(entry.id);
+          continue;
+        }
+        this.#logger.warn?.(
+          `[dsh-im:${this.#descriptor.key}] replaying a queued message that a restart interrupted:`,
+          entry.messageId,
+        );
+        // The turn never reached Harness, so any earlier mark-seen is an
+        // attempt, not a completed delivery; clear it so the replay can run.
+        if (typeof this.#state.unmarkSeen === 'function') {
+          await this.#state.unmarkSeen(entry.messageId).catch(() => undefined);
+        }
+        await this.#replayPendingMessage(entry);
+      } catch (error) {
+        this.#logger.warn?.(
+          `[dsh-im:${this.#descriptor.key}] failed to recover a queued message:`,
+          entry?.messageId,
+          error?.message ?? error,
+        );
+      }
+    }
+  }
+
+  #recordPendingMessage(message, messageId, senderId, key) {
+    if (typeof this.#state?.putPendingMessage !== 'function') return Promise.resolve();
+    const text = controlTextOf(message);
+    if (!text) return Promise.resolve();
+    const entry = {
+      id: pendingMessageId(key, messageId),
+      key,
+      messageId,
+      kind: message.kind === 'group' ? 'group' : 'direct',
+      text,
+      submitted: false,
+      createdAt: new Date().toISOString(),
+      ...(senderId ? { senderId } : {}),
+      ...(message.replyTarget !== undefined ? { target: message.replyTarget } : {}),
+    };
+    return this.#state.putPendingMessage(entry).catch((error) => {
+      this.#logger.warn?.(
+        `[dsh-im:${this.#descriptor.key}] failed to persist a queued message:`,
+        error?.message ?? error,
+      );
+    });
+  }
+
+  async #markPendingSubmitted(key, messageId) {
+    if (typeof this.#state?.patchPendingMessage !== 'function') return;
+    await this.#state.patchPendingMessage(pendingMessageId(key, messageId), { submitted: true });
+  }
+
+  async #removePendingMessage(id) {
+    if (typeof this.#state?.removePendingMessage !== 'function') return;
+    try {
+      await this.#state.removePendingMessage(id);
+    } catch (error) {
+      this.#logger.warn?.(
+        `[dsh-im:${this.#descriptor.key}] failed to clear a queued-message entry:`,
+        error?.message ?? error,
+      );
+    }
+  }
+
+  #replayPendingMessage(entry) {
+    const message = this.#pendingReplayMessage(entry);
+    if (!message) return Promise.resolve();
+    return this.#enqueueMessage(message, entry.messageId, entry.senderId ?? '', entry.key);
+  }
+
+  #pendingReplayMessage(entry) {
+    const separator = String(entry.key).indexOf(':');
+    if (separator < 0) return null;
+    const kind = entry.key.slice(0, separator);
+    const conversationId = entry.key.slice(separator + 1);
+    if (!conversationId || !entry.messageId) return null;
+    // Rebuild exactly the turn fields the queue path reads, so the recovered
+    // text is dispatched as the user's own message with no added framing.
+    return {
+      messageId: entry.messageId,
+      senderId: entry.senderId ?? '',
+      kind: kind === 'group' ? 'group' : 'direct',
+      conversationId,
+      content: entry.text,
+      controlText: entry.text,
+      addressed: true,
+      plainText: true,
+      ...(entry.target !== undefined ? { replyTarget: entry.target } : {}),
+    };
+  }
+
+  async #notifyInterruptedPending(entry) {
+    if (entry.target === undefined || entry.target === null) {
+      this.#logger.warn?.(
+        `[dsh-im:${this.#descriptor.key}] a queued message was interrupted by a restart but has no delivery target:`,
+        entry.messageId,
+      );
+      return;
+    }
+    try {
+      await this.#bot.sendText(entry.target, t(PENDING_RESTART_NOTICE));
+    } catch (error) {
+      this.#logger.warn?.(
+        `[dsh-im:${this.#descriptor.key}] failed to report an interrupted queued message:`,
+        error?.message ?? error,
+      );
+    }
   }
 
   async #deliverDeferredOutcome(entry, outcome) {
@@ -774,6 +924,7 @@ export class TextHarnessBridge {
   }
 
   async waitForIdle() {
+    await this.#pendingRecovery;
     await this.#busyMessages.whenIdle();
     await Promise.allSettled([
       ...this.#queues.values(),
@@ -1119,6 +1270,10 @@ export class TextHarnessBridge {
       // opened: the auto-steer lane keys its authorship decision off this
       // record, and the finally below retires it when the turn settles.
       this.#turnAuthors.set(conversationKey, { senderId, steered: 0, turnMessageId: messageId });
+      // The prompt is about to enter the Harness inbox, which is itself durable.
+      // Marking the entry submitted first means a crash after this point reports
+      // the message instead of replaying a turn the Harness may already own.
+      await this.#markPendingSubmitted(conversationKey, messageId);
       const { sessionId, answer, artifacts = [] } = await askInWorkspaceSession({
         deferredDelivery: () => ({ coordinator: this.#deferred, target: this.#descriptor.key === 'whatsapp' ? { jid: target.jid, selfChat: target.selfChat } : target }),
         harness: this.#harness,
@@ -1132,6 +1287,7 @@ export class TextHarnessBridge {
         createOptions: this.#signal ? { signal: this.#signal } : undefined,
         existsOptions: this.#signal ? { signal: this.#signal } : undefined,
         askOptions: {
+          groupHistory: message.groupHistory,
           timeoutMs: this.#replyTimeoutMs,
           signal: this.#signal,
           control: { owner: this, key: conversationKey },
