@@ -6,6 +6,11 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 ## [Unreleased]
 
+### Fixed / 修正
+
+- Matrix 渠道投递结果文件时直接使用文件对象已持有的字节数组，仅在字节缺失时才走提供方下载，避免文件因取用回调不可用而被误判为空内容。
+  Matrix artifact delivery now uses the byte array the file object already carries and only falls back to the provider download when the bytes are missing, so a file is no longer treated as empty merely because its load callback is unavailable.
+
 ## [5.8.0] - 2026-10-30
 
 ### Added / 新增
