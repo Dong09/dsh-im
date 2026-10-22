@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, realpath, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -10,6 +10,8 @@ import {
 } from '../src/channels/shared/bot-workspace-store.mjs';
 import { ConversationStateStore } from '../src/channels/shared/conversation-state-store.mjs';
 import { runWorkspaceCommand } from '../src/channels/shared/workspace-command.mjs';
+import { startNewConversation } from '../src/channels/shared/new-command.mjs';
+import { conversationDirectoryName } from '../src/channels/shared/conversation-directory-ensure.mjs';
 import { askInWorkspaceSession } from '../src/channels/shared/workspace-session.mjs';
 import { symlinkOrSkip } from './support/filesystem.mjs';
 
@@ -101,6 +103,66 @@ test('/session N still follows the bot default without an override', async (t) =
   assert.match(binding.message, /session-A/u);
   assert.equal(f.state.sessionFor(f.key), 'session-A');
   assert.deepEqual(f.listedWorkspaces, [f.defaultWorkspace, f.defaultWorkspace]);
+});
+
+test('automatic directory migration after /conv keeps the next message usable', async (t) => {
+  const f = await fixture(t);
+  await f.command(`/conv ${f.alternateWorkspace}`);
+  await f.workspaces.setConversationDirectory(f.botId, { enabled: true });
+  const receipt = await startNewConversation({ state: f.scope.state, harness: f.scope.harness, key: f.key });
+  assert.match(receipt, /已开启全新/u);
+  await f.ask();
+  assert.equal(f.asked.length, 1);
+  assert.equal(f.asked[0].workspace, f.workspaces.conversationWorkspaceFor(f.botId, f.key));
+  assert.equal(f.scope.state.sessionFor(f.key), f.asked[0].sessionId);
+});
+
+test('/new reports directory creation failure through the scoped harness', async (t) => {
+  const f = await fixture(t);
+  await f.workspaces.setConversationDirectory(f.botId, { enabled: true });
+  const directory = join(f.defaultWorkspace,
+    conversationDirectoryName(f.key, { enabled: true }, Date.now(), `${f.path}:${f.botId}`));
+  await writeFile(directory, 'blocking file');
+  const receipt = await startNewConversation({ state: f.scope.state, harness: f.scope.harness, key: f.key });
+  assert.match(receipt, /会话目录未生效/u);
+  assert.equal(f.workspaces.conversationWorkspaceFor(f.botId, f.key), f.defaultWorkspace);
+});
+
+test('isolated /session binds only the current conversation', async (t) => {
+  const f = await fixture(t);
+  await f.workspaces.setConversationDirectory(f.botId, { enabled: true });
+  const alice = await f.scope.harness.prepareConversationDirectory(f.key);
+  const bobKey = 'group:bob';
+  await f.scope.harness.prepareConversationDirectory(bobKey);
+  await f.state.setSession(bobKey, 'session-bob');
+  f.harness.adoptWorkspaceSession = async (sessionId) => ({ sessionId, workspace: alice.workspace });
+  await f.command('/session session-alice');
+  assert.equal(f.state.sessionFor(f.key), 'session-alice');
+  assert.equal(f.state.sessionFor(bobKey), 'session-bob');
+  assert.equal(f.workspaces.workspaceFor(f.botId), f.defaultWorkspace);
+});
+
+test('/workspacelist retains user directories sharing the isolation prefix', async (t) => {
+  const f = await fixture(t);
+  const personal = join(f.root, 'conv-project');
+  await mkdir(personal);
+  f.harness.listWorkspaces = async () => [personal, f.defaultWorkspace];
+  assert.match((await f.command('/workspacelist')).message, /conv-project/u);
+  await f.workspaces.setConversationDirectory(f.botId, { enabled: true });
+  await f.scope.harness.prepareConversationDirectory(f.key);
+  assert.match((await f.command('/workspacelist')).message, /conv-project/u);
+});
+
+test('/workspacelist hides earlier per-session directories after a new session', async (t) => {
+  const f = await fixture(t);
+  await f.workspaces.setConversationDirectory(f.botId, { enabled: true, strategy: 'per-session' });
+  const first = await f.scope.harness.prepareConversationDirectory(f.key, { explicitNew: true });
+  const second = await f.scope.harness.prepareConversationDirectory(f.key, { explicitNew: true });
+  f.harness.listWorkspaces = async () => [f.defaultWorkspace, first.workspace, second.workspace];
+  const listing = (await f.command('/workspacelist')).message;
+  assert.ok(!listing.includes(first.workspace));
+  assert.ok(!listing.includes(second.workspace));
+  assert.ok(listing.includes(f.defaultWorkspace));
 });
 
 test('/conv reports persisted explicit bindings and following the bot default', async (t) => {

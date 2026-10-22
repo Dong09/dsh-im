@@ -5,13 +5,13 @@ import { validateConversationDirectory } from './conversation-directory.mjs';
 
 let lastSessionTimestamp = 0;
 
-export function conversationDirectoryName(conversationKey, value, timestamp = Date.now()) {
+export function conversationDirectoryName(conversationKey, value, timestamp = Date.now(), identity = '') {
   const config = validateConversationDirectory(value);
   if (config.strategy === 'per-session') {
     timestamp = Math.max(Number(timestamp) || 0, lastSessionTimestamp + 1);
     lastSessionTimestamp = timestamp;
   }
-  const digest = createHash('sha256').update(conversationKey).digest('hex').slice(0, 8);
+  const digest = createHash('sha256').update(JSON.stringify([identity, conversationKey])).digest('hex').slice(0, 16);
   const suffix = `-${digest}${config.strategy === 'per-session' ? `-${timestamp}` : ''}`;
   const readable = conversationKey.replace(/[<>:"/\\|?*\u0000-\u001f\u007f]/gu, '-');
   const room = Math.max(0, 100 - config.prefix.length - suffix.length);

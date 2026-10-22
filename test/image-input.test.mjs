@@ -85,7 +85,9 @@ test('settings validate all fields and serialize atomically without changing TTL
   await Promise.all(values.map((value) => store.set(value)));
   assert.deepEqual(await new ImageInputSettingsStore(path).get(), values[2]);
   assert.deepEqual(await readdir(root), ['image-input-settings.json']);
-  assert.equal((await stat(path)).mode & 0o777, 0o600);
+  if (process.platform !== 'win32') {
+    assert.equal((await stat(path)).mode & 0o777, 0o600);
+  }
   const handler = createImageInputRpcHandler(store);
   assert.equal((await handler(IMAGE_INPUT_ENDPOINTS.set, { ...values[2], secret: 'no' })).ok, false);
   assert.equal((await handler(IMAGE_INPUT_ENDPOINTS.get, {})).value.maxImageMb, 8);

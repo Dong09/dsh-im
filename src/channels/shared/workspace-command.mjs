@@ -122,10 +122,9 @@ export async function workspacePathSnapshot(harness, { includeTitles = false, in
     path: await existingWorkspacePath(withEntries ? item?.path : item),
     title: withEntries ? safeDisplayText(item?.title) : '',
   })));
-  const directoryConfig = harness.conversationDirectoryConfig?.() ?? null;
-  const prefix = directoryConfig?.prefix ?? 'conv-';
+  const directoryPaths = new Set(harness.conversationDirectoryPaths?.() ?? []);
   const paths = [...new Set([...(current ? [current] : []), ...entries.map((item) => item.path).filter(Boolean)])]
-    .filter((path) => includeConversationDirectories || !path.split(/[\\/]/u).pop().startsWith(prefix));
+    .filter((path) => includeConversationDirectories || path === current || !directoryPaths.has(path));
   const titles = {};
   if (includeTitles) {
     for (const item of entries) {

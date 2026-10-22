@@ -197,7 +197,7 @@ test('every literal t() key in src/channels has an English dictionary entry', ()
   };
   const missing = [];
   for (const file of files) {
-    const source = readFileSync(file, 'utf8');
+    const source = readFileSync(file, 'utf8').replace(/\r\n/gu, '\n');
     for (const match of source.matchAll(keyPattern)) {
       const key = decodeLiteral(match[2]);
       if (!/[一-鿿]/.test(key)) continue;

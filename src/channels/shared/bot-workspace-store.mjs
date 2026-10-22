@@ -159,7 +159,15 @@ function normalizeSessionDirectories(value) {
       if (!record || typeof record !== 'object' || typeof record.base !== 'string'
         || typeof record.workspace !== 'string' || !isAbsolute(record.base) || !isAbsolute(record.workspace)) continue;
       const config = normalizeConversationDirectory({ enabled: true, strategy: record.strategy, prefix: record.prefix });
-      if (config) normalized[key] = { base: resolve(record.base), workspace: resolve(record.workspace), ...config };
+      if (config) normalized[key] = {
+        base: resolve(record.base), workspace: resolve(record.workspace), ...config,
+        timestamp: Number.isSafeInteger(record.timestamp) && record.timestamp > 0
+          ? record.timestamp : undefined,
+        pending: record.pending === true,
+        history: Array.isArray(record.history)
+          ? [...new Set(record.history.filter((path) => typeof path === 'string' && isAbsolute(path)).map((path) => resolve(path)))]
+          : [],
+      };
     }
     if (Object.keys(normalized).length) result[botId] = normalized;
   }
@@ -588,7 +596,14 @@ export class BotWorkspaceStore {
     });
   }
 
-  async prepareConversationDirectory(botId, conversationKey, { explicitNew = false, incarnation } = {}) {
+  conversationDirectoryPathsFor(botId) {
+    return [...new Set(Object.values(this.#sessionDirectories[botIdOf(botId)] ?? {})
+      .flatMap((entry) => [entry.workspace, ...(entry.history ?? [])]))];
+  }
+
+  async prepareConversationDirectory(botId, conversationKey, {
+    explicitNew = false, incarnation, clearSession, onConversationGeneration,
+  } = {}) {
     const id = botIdOf(botId);
     if (!this.has(id) || (incarnation !== undefined && incarnation !== this.incarnationFor(id))) {
       const error = new Error('找不到要修改的机器人。');
@@ -606,7 +621,7 @@ export class BotWorkspaceStore {
       const reuse = sameConfig && (config.strategy === 'per-conversation'
         || (!explicitNew && existing?.pending));
       const timestamp = reuse ? existing.timestamp : Date.now();
-      const workspace = reuse ? existing.workspace : resolve(base, conversationDirectoryName(conversationKey, config, timestamp));
+      const workspace = reuse ? existing.workspace : resolve(base, conversationDirectoryName(conversationKey, config, timestamp, `${this.#path}:${id}`));
       try { await prepareDirectoryPath(base, workspace); }
       catch (error) {
         console.warn('[dsh-im] conversation directory preparation failed:', error?.message ?? error);
@@ -614,13 +629,20 @@ export class BotWorkspaceStore {
       }
       const entries = { ...(this.#sessionDirectories[id] ?? {}), [conversationKey]: {
         base, workspace, ...config, timestamp, pending: explicitNew,
+        history: existing && existing.workspace !== workspace
+          ? [...new Set([...(existing.history ?? []), existing.workspace])]
+          : existing?.history ?? [],
       } };
       const previousRecords = this.#sessionDirectories[id];
       const previousOverrides = this.#conversationWorkspaces[id];
+      if (workspace !== current) {
+        const generation = this.publishConversationWorkspaceSwitch(id, conversationKey);
+        onConversationGeneration?.(generation);
+        await clearSession?.(conversationKey);
+      }
       this.#sessionDirectories[id] = entries;
       const overrides = { ...(this.#conversationWorkspaces[id] ?? {}), [conversationKey]: workspace };
       this.#conversationWorkspaces[id] = overrides;
-      if (workspace !== current) this.publishConversationWorkspaceSwitch(id, conversationKey);
       try { await this.#persist(); }
       catch (error) {
         if (previousRecords) this.#sessionDirectories[id] = previousRecords;
@@ -1288,6 +1310,19 @@ export class BotWorkspaceStore {
       // workspace switch queued while the session was being adopted must not be
       // silently overwritten by the binding that started before it.
       assertConversationCurrent();
+      if (this.conversationDirectoryFor(id).enabled) {
+        if (!(await sameWorkspacePath(workspace, this.conversationWorkspaceFor(id, conversationKey)))) {
+          throw workspaceManualEditDisabled();
+        }
+        assertConversationCurrent();
+        await setSession(conversationKey, sessionId);
+        assertConversationCurrent();
+        return {
+          workspace, sessionId,
+          generation: this.#generations.get(id),
+          conversationGeneration,
+        };
+      }
       const sameWorkspace = await sameWorkspacePath(workspace, this.workspaceFor(id));
       const previousOverrides = this.#conversationWorkspaces[id];
       const override = previousOverrides?.[conversationKey];
@@ -1984,6 +2019,23 @@ export function createBotWorkspaceScope(
       if (property === 'conversationDirectoryConfig') {
         return () => workspaces.conversationDirectoryFor(botId);
       }
+      if (property === 'conversationDirectoryPaths') {
+        return () => workspaces.conversationDirectoryPathsFor(botId);
+      }
+      if (property === 'prepareConversationDirectory') {
+        return async (conversationKey, options = {}) => {
+          assertCurrentBotScope(isCurrentScope);
+          const pending = pendingConversationSwitches.get(conversationKey);
+          if (pending) await pending;
+          assertCurrentBotScope(isCurrentScope);
+          return trackConversationSwitch(conversationKey, workspaces.prepareConversationDirectory(botId, conversationKey, {
+            ...options,
+            incarnation,
+            clearSession: (key) => state.clearSession(key),
+            onConversationGeneration: (generation) => maskConversationSwitch(conversationKey, generation),
+          }));
+        };
+      }
       if (property === 'switchConversationWorkspace') {
         return (conversationKey, workspace) => {
           if (workspaces.conversationDirectoryFor(botId).enabled) {
@@ -2107,7 +2159,7 @@ export function createBotWorkspaceScope(
         return async (options = {}) => {
           const { inheritBotModel = true, conversationKey, ...createOptions } = options;
           if (conversationKey) {
-            const prepared = await workspaces.prepareConversationDirectory(botId, conversationKey, { incarnation });
+            const prepared = await scopedHarness.prepareConversationDirectory(conversationKey);
             if (prepared?.workspace) createOptions.workspace = prepared.workspace;
           }
           // /conv publishes its generation before path validation enters the

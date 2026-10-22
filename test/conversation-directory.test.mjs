@@ -12,6 +12,8 @@ test('conversation directory names are stable, bounded, and distinguish sanitize
   const first = conversationDirectoryName('p2p:a:b', config);
   assert.equal(first, conversationDirectoryName('p2p:a:b', config));
   assert.notEqual(first, conversationDirectoryName('p2p:a-b', config));
+  assert.notEqual(conversationDirectoryName('p2p:a:b', config, 0, 'channel:bot-one'),
+    conversationDirectoryName('p2p:a:b', config, 0, 'channel:bot-two'));
   assert.ok(first.length <= 100);
   assert.ok(conversationDirectoryName('x'.repeat(200), config).length <= 100);
   assert.throws(() => validateConversationDirectory({ enabled: true, prefix: '../' }), {
@@ -25,9 +27,19 @@ test('conversation directory settings persist and new sessions follow the select
   const path = join(root, 'workspaces.json');
   const store = await new BotWorkspaceStore(path, { defaultWorkspace: root }).load();
   await store.ensure('bot_one');
+  await store.ensure('bot_two');
   await store.setConversationDirectory(null, { enabled: true });
 
   const first = await store.prepareConversationDirectory('bot_one', 'p2p:alice');
+  const otherBot = await store.prepareConversationDirectory('bot_two', 'p2p:alice');
+  assert.notEqual(first.workspace, otherBot.workspace);
+  const otherChannel = await new BotWorkspaceStore(join(root, 'other-channel.json'), {
+    defaultWorkspace: root,
+  }).load();
+  await otherChannel.ensure('bot_one');
+  await otherChannel.setConversationDirectory(null, { enabled: true });
+  assert.notEqual((await otherChannel.prepareConversationDirectory('bot_one', 'p2p:alice')).workspace,
+    first.workspace);
   assert.equal(dirname(first.workspace), root);
   assert.equal((await stat(first.workspace)).isDirectory(), true);
   const repeated = await store.prepareConversationDirectory('bot_one', 'p2p:alice', { explicitNew: true });
@@ -40,10 +52,16 @@ test('conversation directory settings persist and new sessions follow the select
   const later = await store.prepareConversationDirectory('bot_one', 'p2p:alice', { explicitNew: true });
   assert.notEqual(next.workspace, first.workspace);
   assert.notEqual(later.workspace, next.workspace);
+  assert.deepEqual(new Set(store.conversationDirectoryPathsFor('bot_one')),
+    new Set([first.workspace, next.workspace, later.workspace]));
   assert.equal(dirname(next.workspace), root);
   assert.equal(dirname(later.workspace), root);
 
   const reloaded = await new BotWorkspaceStore(path, { defaultWorkspace: root }).load();
   assert.equal(reloaded.conversationDirectoryFor('bot_one').strategy, 'per-session');
   assert.equal(reloaded.conversationWorkspaceFor('bot_one', 'p2p:alice'), later.workspace);
+  assert.equal((await reloaded.prepareConversationDirectory('bot_one', 'p2p:alice')).workspace,
+    later.workspace);
+  assert.deepEqual(new Set(reloaded.conversationDirectoryPathsFor('bot_one')),
+    new Set([first.workspace, next.workspace, later.workspace]));
 });
