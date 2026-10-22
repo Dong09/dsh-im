@@ -1546,7 +1546,7 @@ export class MatrixRuntime {
     if (!api) throw new Error('Matrix bot is not connected');
     const roomId = typeof target?.roomId === 'string' ? target.roomId : '';
     if (!isMatrixRoomId(roomId)) throw new TypeError('Matrix artifact target requires a valid room id');
-    const bytes = await file?.load?.({}).catch(() => null);
+    const bytes = file?.bytes instanceof Uint8Array ? file.bytes : await file?.load?.({}).catch(() => null);
     if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
       const error = new Error(t('结果文件内容为空或下载失败。'));
       error.code = 'artifact-provider-failed';
