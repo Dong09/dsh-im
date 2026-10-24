@@ -246,6 +246,37 @@ test('a two-member room stays an ordinary room: unaddressed chatter is ignored a
   }
 });
 
+test('incremental sync processes addressed messages in a v12 room without a server suffix', async () => {
+  const roomId = '!KplB3ESm99I-4PaRdWxDUKr0Sia5nRhRtykpfs1VloM';
+  const botUserId = '@purpose09:example.org';
+  const context = await createContext({
+    config: { userId: botUserId, allowedRooms: [roomId] },
+    apiOptions: {
+      initial: { next_batch: 'v12-before' },
+      overrides: { whoami: async () => ({ user_id: botUserId, device_id: 'DSHDEV' }) },
+    },
+  });
+  try {
+    await context.runtime.start();
+    context.fake.push({
+      next_batch: 'v12-after',
+      rooms: { join: { [roomId]: { timeline: { events: [messageEvent({
+        body: '请帮我检查新房间',
+        content: { 'm.mentions': { user_ids: [botUserId] } },
+      })] } } } },
+    });
+    await eventually(() => deliveredAnswers(context.fake, '好的'));
+    equal(context.harness.prompts.length, 1);
+    equal(context.runtime.status.messagesReceived, 1);
+    equal(context.runtime.status.joinedRooms, 1);
+    ok(context.sidecar.joinedRooms().includes(roomId));
+    equal(context.sidecar.nextBatch(), 'v12-after');
+    ok(sentMessages(context.fake).every((call) => call.roomId === roomId));
+  } finally {
+    await context.stop();
+  }
+});
+
 test('a room the retired member-count rule had recorded as a direct chat is forgotten on load', async () => {
   const plain = messageEvent({ sender: '@carol:example.org', body: '群里随口一句' });
   const context = await createContext({

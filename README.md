@@ -122,6 +122,8 @@ Connect IM bots to DeepSeek Harness by scanning a QR code, using an App Manifest
 
 WhatsApp 会保存最近 2,000 条机器人群消息的标识，重启后仍可通过引用这些消息唤醒机器人。升级前未记录或已超出保留范围的历史消息不会作为唤醒依据；请 @ 机器人或回复其新消息。
 
+Matrix 房间标识兼容传统的 `!localpart:server` 与房间版本 v12 的无服务器后缀哈希标识（`!` 加 43 位 base64url 字符）；房间别名仍使用 `#alias:server`。更新插件后需重启 DSH（Host）才能应用，刷新浏览器页面不足以生效；历史消息不会补答，请发送新的 @ 提及验证。
+
 Matrix 加密目前仅供非敏感测试：默认 optional 模式尝试启动加密引擎，失败时跳过收到的加密消息；required 模式在引擎启动失败时拒绝连接。尚未实现交互式设备验证、密钥备份、SSSS 或媒体附件内容加密，本次发布未验证真实 homeserver／Element 互通，请勿将其视为完整的端到端保密保障。
 
 企业微信自建应用的回调基址、代理地址和企业可信 IP 配置，见[企业微信自建应用接入说明](docs/企业微信自建应用接入.md)。

@@ -57,8 +57,11 @@ export function isMatrixUserId(value) {
 }
 
 export function isMatrixRoomId(value) {
+  // Room v12 uses the create-event SHA-256 hash (unpadded base64url) without
+  // a server suffix. Legacy room IDs and aliases retain their existing form.
   return typeof value === 'string'
-    && /^[!#][^:\s]+:[A-Za-z0-9.-]+(?::\d{1,5})?$/u.test(value);
+    && (/^![A-Za-z0-9_-]{43}$/u.test(value)
+      || /^[!#][^:\s]+:[A-Za-z0-9.-]+(?::\d{1,5})?$/u.test(value));
 }
 
 export function isMatrixEventId(value) {

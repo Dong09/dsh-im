@@ -6,6 +6,16 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 ## [Unreleased]
 
+### Added / 新增
+
+- 同 Host 插件服务 `dshIm` 新增 `createTarget(botId, target)`，消费插件可把已知的会话路由注册成投递目标，注册后即可用 `targetId` 投递并出现在设置页目标列表；已存在的 `targetId` 以 `target-conflict` 拒绝。
+  The same-Host `dshIm` service now exposes `createTarget(botId, target)`, so a consumer plugin can register a known conversation route as a delivery target; the target is then addressable by `targetId` and listed in the settings panel. An existing `targetId` is rejected with `target-conflict`.
+
+### Changed / 变更
+
+- Matrix 渠道兼容房间版本 v12 的无服务器后缀哈希房间标识（`!` 加 43 位 base64url 字符），传统 `!localpart:server` 房间标识与 `#alias:server` 别名保持不变；更新插件后需重启 Host 生效。
+  The Matrix channel now accepts room version v12 hash room identifiers without a server suffix (`!` followed by 43 base64url characters) while legacy `!localpart:server` room identifiers and `#alias:server` aliases are unchanged; restart the Host after updating the plugin.
+
 ### Fixed / 修正
 
 - Matrix 渠道投递结果文件时直接使用文件对象已持有的字节数组，仅在字节缺失时才走提供方下载，避免文件因取用回调不可用而被误判为空内容。
