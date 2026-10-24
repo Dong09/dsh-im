@@ -62,6 +62,17 @@ test('address validators accept the protocol forms and reject the rest', () => {
   deepStrictEqual(mxcToMatrixMediaUrl('not-a-url', 'mxc://a/b'), null);
 });
 
+test('room IDs accept v12 hash identifiers without relaxing legacy aliases', () => {
+  const hash = 'KplB3ESm99I-4PaRdWxDUKr0Sia5nRhRtykpfs1VloM';
+  ok(isMatrixRoomId(`!${hash}`), 'v12 rooms omit the homeserver suffix');
+  ok(isMatrixRoomId('!0J0PZPrHJJ1xREtIG91W2cm0cL4eHGN22oIcuS8m6XI'));
+  ok(isMatrixRoomId('!legacy:example.org:8448'));
+  ok(isMatrixRoomId('#alias:example.org:8448'));
+  for (const invalid of [null, '', '!', '!short', `#${hash}`, `!${hash}=`, `!${hash}/`, `!${hash} `, ` !${hash}`]) {
+    ok(!isMatrixRoomId(invalid), `reject malformed room identifier: ${String(invalid)}`);
+  }
+});
+
 test('authenticated calls carry the bearer, the user agent and typed failures', async () => {
   const { api, calls } = apiWith(() => jsonResponse({ user_id: '@bot:example.org' }));
   const identity = await api.whoami();
