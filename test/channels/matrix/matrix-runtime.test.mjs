@@ -277,6 +277,31 @@ test('incremental sync processes addressed messages in a v12 room without a serv
   }
 });
 
+test('a formatted bot mention reaches the harness without its display-name link', async () => {
+  const context = await createContext({
+    config: { e2eeMode: 'off' },
+    apiOptions: { initial: { next_batch: 'mention-before' } },
+  });
+  try {
+    await context.runtime.start();
+    context.fake.push({
+      next_batch: 'mention-cleaned',
+      rooms: { join: { '!group:example.org': { timeline: { events: [messageEvent({
+        body: '[Helper](https://matrix.to/#/@bot:example.org)hi',
+        content: {
+          format: 'org.matrix.custom.html',
+          formatted_body: '<a href="https://matrix.to/#/@bot:example.org">Helper</a>hi',
+          'm.mentions': { user_ids: [BOT] },
+        },
+      })] } } } },
+    });
+    await eventually(() => deliveredAnswers(context.fake, '好的'));
+    deepStrictEqual(context.harness.prompts, ['alice: hi']);
+  } finally {
+    await context.stop();
+  }
+});
+
 test('a room the retired member-count rule had recorded as a direct chat is forgotten on load', async () => {
   const plain = messageEvent({ sender: '@carol:example.org', body: '群里随口一句' });
   const context = await createContext({

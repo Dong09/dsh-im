@@ -111,6 +111,105 @@ test('mention stripping removes bot forms and keeps innocent words intact', () =
   notEqual(stripMatrixMentions('contact mybot team', BOT), '');
 });
 
+test('display-name mention links are stripped by their bot target', () => {
+  deepStrictEqual(stripMatrixMentions('[Helper](https://matrix.to/#/@bot:example.org)hi', BOT), 'hi');
+  deepStrictEqual(stripMatrixMentions('[Helper](https://matrix.to/#/%40bot%3Aexample.org?via=example.org) hi', BOT), 'hi');
+  const malformed = '[Helper](https://matrix.to/#/%ZZ) hi';
+  deepStrictEqual(stripMatrixMentions(malformed, BOT), malformed);
+  const other = '[Alice](https://matrix.to/#/@alice:example.org)';
+  deepStrictEqual(stripMatrixMentions(`${other} [Helper](https://matrix.to/#/@bot:example.org) hi`, BOT), `${other}  hi`);
+  const outcome = funnel(event({}, {
+    body: '[Helper](https://matrix.to/#/@bot:example.org)hi',
+    format: 'org.matrix.custom.html',
+    formatted_body: '<a href="https://matrix.to/#/@bot:example.org">Helper</a>hi',
+    'm.mentions': { user_ids: [BOT] },
+  }));
+  deepStrictEqual(outcome.message.content, 'hi');
+  ok(outcome.message.addressed);
+});
+
+test('Element desktop display-label mentions clean to empty with formatted pill evidence', () => {
+  const botUserId = '@ai_bot:example.org';
+  for (const label of ['ai_bot', 'AI Helper', 'AI & Helper']) {
+    const escapedLabel = label.replaceAll('&', '&amp;');
+    const outcome = funnel(event({}, {
+      body: label,
+      format: 'org.matrix.custom.html',
+      formatted_body: `<p><a href="https://matrix.to/#/@ai_bot:example.org">${escapedLabel}</a></p>`,
+      'm.mentions': { user_ids: [botUserId] },
+    }), { botUserId });
+    deepStrictEqual(outcome.message.content, '');
+    ok(outcome.message.mentioned && outcome.message.addressed);
+  }
+  const formattedOnly = funnel(event({}, {
+    body: 'ai_bot',
+    formatted_body: '<a href="https://matrix.to/#/@ai_bot:example.org">ai_bot</a>',
+  }), { botUserId });
+  deepStrictEqual(formattedOnly.message.content, '', 'a targeted pill alone supplies mention evidence');
+});
+
+test('desktop stripping removes only the formatted mention occurrence, not the same name in prose', () => {
+  const body = 'Helper please explain why Helper is the name';
+  const outcome = funnel(event({}, {
+    body,
+    format: 'org.matrix.custom.html',
+    formatted_body: '<a href="https://matrix.to/#/@bot:example.org">Helper</a> please explain why Helper is the name',
+    'm.mentions': { user_ids: [BOT] },
+  }));
+  deepStrictEqual(outcome.message.content, 'please explain why Helper is the name');
+  const other = funnel(event({}, {
+    body: 'Helper and Alice hello',
+    formatted_body: '<a href="https://matrix.to/#/@bot:example.org">Helper</a> and <a href="https://matrix.to/#/@alice:example.org">Alice</a> hello',
+    'm.mentions': { user_ids: [BOT, '@alice:example.org'] },
+  }));
+  deepStrictEqual(other.message.content, 'and Alice hello');
+});
+
+test('mobile markdown mention-only messages clean to empty and preserve following text', () => {
+  for (const label of ['ai_bot', '<@bot:example.org>', 'AI Helper']) {
+    const pill = `[${label}](https://matrix.to/#/@bot:example.org)`;
+    for (const suffix of ['', ' 请帮忙']) {
+      const outcome = funnel(event({}, { body: pill + suffix, 'm.mentions': { user_ids: [BOT] } }));
+      deepStrictEqual(outcome.message.content, suffix.trim());
+    }
+  }
+});
+
+test('raw whole-body at-localpart mentions clean to empty without metadata', () => {
+  for (const body of ['@bot', ' @BOT ']) {
+    ok(detectMatrixMention({ body }, BOT));
+    deepStrictEqual(stripMatrixMentions(body, BOT), '');
+    const outcome = funnel(event({}, { body }));
+    ok(outcome.message.mentioned && outcome.message.addressed);
+    deepStrictEqual(outcome.message.content, '');
+  }
+  deepStrictEqual(stripMatrixMentions('@alice', BOT), '@alice');
+  deepStrictEqual(stripMatrixMentions('ask @bot about this', BOT), 'ask @bot about this');
+  deepStrictEqual(stripMatrixMentions('bot', BOT), 'bot');
+});
+
+test('bare names require mention evidence and ordinary prose and other-user pills survive', () => {
+  const botUserId = '@ai_bot:example.org';
+  for (const body of ['ai_bot', 'ai_bot is useful', 'ask ai_bot about ai_bot', 'my_ai_bot']) {
+    deepStrictEqual(stripMatrixMentions(body, botUserId), body);
+    deepStrictEqual(funnel(event({}, { body }), { botUserId, isDirect: true }).message.content, body);
+  }
+  const evidence = { 'm.mentions': { user_ids: [botUserId] } };
+  deepStrictEqual(stripMatrixMentions('ai_bot', botUserId, evidence), '');
+  deepStrictEqual(stripMatrixMentions('@ai_bot', botUserId, evidence), '');
+  deepStrictEqual(stripMatrixMentions('ai_bot is useful', botUserId, evidence), 'ai_bot is useful');
+  const other = '[ai_bot](https://matrix.to/#/@alice:example.org)';
+  deepStrictEqual(stripMatrixMentions(other, botUserId, evidence), other);
+  deepStrictEqual(stripMatrixMentions('ai_bot', botUserId, {
+    formatted_body: '<a href="https://matrix.to/#/@alice:example.org">ai_bot</a>',
+    'm.mentions': { user_ids: [botUserId, '@alice:example.org'] },
+  }), 'ai_bot', 'other-user pill targets win over ambiguous explicit user_ids');
+  deepStrictEqual(stripMatrixMentions('ai_bot prose', botUserId, {
+    ...evidence,
+    formatted_body: '<a href="https://matrix.to/#/@ai_bot:example.org">different label</a>',
+  }), 'ai_bot prose', 'unaligned formatting must not remove arbitrary prose');
+});
+
 test('command gates recognize slash and bang forms', () => {
   ok(isMatrixCommandLike('/new'));
   ok(isMatrixCommandLike('!compact now'));

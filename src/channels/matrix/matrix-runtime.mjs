@@ -38,6 +38,7 @@ import {
   extractOutboundMentions,
   hasRoomMention,
 } from './matrix-rich-text.mjs';
+import { createMatrixImageSource, matrixImageFailure } from './matrix-image-input.mjs';
 import { RootContextRegistry } from '../shared/conversation/root-context.mjs';
 import { WindowAmbientProvider } from '../shared/conversation/ambient-provider.mjs';
 import { createEventLru, resolveReplyChain } from '../shared/conversation/reply-context.mjs';
@@ -62,7 +63,6 @@ function safeInt(value, min, max, fallback) {
   return Math.min(Math.max(rounded, min), max);
 }
 const DEAD_ROOM_MARKERS = Object.freeze(['no servers', 'room not found']);
-const IMAGE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 
 function cleanString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
@@ -204,6 +204,8 @@ export class MatrixRuntime {
   #encryptedRooms = new Set();
   #notifiedEncryptedRooms = new Set();
   #e2eeActive = false;
+  #imageInbox;
+  #imageAssociationWindowMs;
 
   constructor({
     config = {},
@@ -221,6 +223,7 @@ export class MatrixRuntime {
     cryptoStore = null,
     createCrypto = null,
     roomHistory = null,
+    imageInbox = null,
     isKnownCommand,
   } = {}) {
     const homeserver = validateMatrixHomeserver(config.homeserver);
@@ -276,6 +279,8 @@ export class MatrixRuntime {
       && typeof roomHistory.recent === 'function'
       ? roomHistory
       : null;
+    this.#imageInbox = imageInbox;
+    this.#imageAssociationWindowMs = safeInt(config.imageAssociationWindowMs, 10_000, 86_400_000, 600_000);
     this.#roomContextLimit = safeInt(config.roomContextLimit, 1, 500, 50);
     this.#roomContextMaxChars = safeInt(config.roomContextMaxChars, 200, 200_000, 8_000);
     this.#roomContextTzOffsetMinutes = safeInt(config.roomContextTzOffsetMinutes, -840, 840, 0);
@@ -438,7 +443,7 @@ export class MatrixRuntime {
       // The binding table and the /new anchor reset serve the trigger policy and the
       // `auto` thread router, not only the context collectors, so those modes wire the
       // hooks even when every structured-context collector stays off.
-      contextHooks: this.#structuredContextActive() || this.#triggerOnReply === 'bot-only' || this.#threadsMode === 'auto'
+      contextHooks: this.#imageInbox || this.#structuredContextActive() || this.#triggerOnReply === 'bot-only' || this.#threadsMode === 'auto'
         ? this.#createContextHooks()
         : null,
     });
@@ -741,7 +746,10 @@ export class MatrixRuntime {
       }
       if (outcome.drop === 'mention-required'
         || outcome.drop === 'reply-to-human'
-        || outcome.drop === 'reply-target-unknown') this.#recordRoomAmbient(roomId, event);
+        || outcome.drop === 'reply-target-unknown') {
+        await this.#recordImageReference(roomId, event);
+        this.#recordRoomAmbient(roomId, event);
+      }
       else if (outcome.drop === 'self') this.#recordRoomBotReply(roomId, event);
       return;
     }
@@ -751,7 +759,7 @@ export class MatrixRuntime {
       if (speakerName) {
         message.speakerName = speakerName;
         const baseSource = typeof message.contextSource === 'function' ? message.contextSource() : {};
-        message.contextSource = () => ({ ...baseSource, senderName });
+        message.contextSource = () => ({ ...baseSource, senderName: speakerName });
       }
     }
     if (message.addressed && typeof message.content === 'string' && message.content.startsWith('!')) {
@@ -777,12 +785,112 @@ export class MatrixRuntime {
         this.#recordRoomHuman(message, { kind: 'human', injected: false });
       }
     }
+    await this.#recordImageReference(roomId, event);
+    await this.#associateImages(message, event);
     void Promise.resolve(this.#bridge?.accept(message)).catch((error) => {
       this.#logger.warn?.('[dsh-im:matrix] inbound message handling failed:', error?.message ?? error);
     });
     if (message.addressed) {
       void this.#api?.setTyping(message.roomId, { typing: true, timeoutMs: 20_000 }).catch(() => undefined);
     }
+  }
+
+  async #recordImageReference(roomId, event) {
+    if (!this.#imageInbox || this.#dmRooms.has(roomId) || event?.content?.msgtype !== 'm.image') return;
+    try {
+      await this.#imageInbox.record({
+        roomId,
+        eventId: event.event_id,
+        senderId: event.sender,
+        threadId: threadIdOf(event.content),
+        ts: event.origin_server_ts,
+        name: typeof event.content.body === 'string' ? event.content.body : 'image',
+      });
+    } catch (error) {
+      this.#ring.forget(event.event_id);
+      throw error;
+    }
+  }
+
+  async #readImageEvent(api, crypto, roomId, eventId, options = {}) {
+    const event = await api.getEvent(roomId, eventId, options);
+    options.signal?.throwIfAborted();
+    if (!event || (event.event_id && event.event_id !== eventId)) throw new Error('Matrix reply event is unavailable');
+    let content = event.content;
+    if (event.type === 'm.room.encrypted') {
+      content = (await crypto?.decryptRoomEvent(roomId, event))?.content;
+      if (!content) throw new Error('Matrix reply event cannot be decrypted');
+    }
+    return { ...event, content };
+  }
+
+  #referencedImageSource(message, reference, resolved = null) {
+    const api = this.#api;
+    const crypto = this.#crypto;
+    const maxBytes = this.#config.maxMediaBytes;
+    return {
+      name: reference.name,
+      load: async (options = {}) => {
+        options.signal?.throwIfAborted();
+        let event;
+        try {
+          event = resolved ?? await this.#readImageEvent(api, crypto, message.roomId, reference.eventId, { signal: options.signal });
+          if (event?.content?.msgtype !== 'm.image'
+            || (reference.senderId && event.sender !== reference.senderId)) {
+            throw new Error('Matrix image reference no longer matches the recorded message');
+          }
+        } catch (error) {
+          if (options.signal?.aborted) throw options.signal.reason ?? error;
+          throw matrixImageFailure(reference.name, 'event', error);
+        }
+        return await createMatrixImageSource(api, event.content, { maxBytes }).load(options);
+      },
+    };
+  }
+
+  /** Explicit replies select exactly their target; implicit attachment selection never crosses authors or threads. */
+  async #associateImages(message, event) {
+    if (!this.#imageInbox || message.kind !== 'group' || !message.addressed
+      || isMatrixCommandLike(message.content)) return;
+    let references = [];
+    if (message.images?.length > 0) {
+      const own = this.#imageInbox.get({ roomId: message.roomId, eventId: message.messageId });
+      if (own) references = [own];
+    } else if (message.replyToEventId) {
+      const reference = this.#imageInbox.get({ roomId: message.roomId, eventId: message.replyToEventId });
+      if (reference) {
+        references = [reference];
+        message.images = [this.#referencedImageSource(message, reference)];
+      } else if (typeof this.#api?.getEvent === 'function') {
+        try {
+          const resolved = await this.#readImageEvent(this.#api, this.#crypto, message.roomId, message.replyToEventId);
+          if (resolved.content?.msgtype === 'm.image') {
+            const selected = { eventId: message.replyToEventId, senderId: resolved.sender,
+              name: typeof resolved.content.body === 'string' ? resolved.content.body : 'image' };
+            message.images = [this.#referencedImageSource(message, selected, resolved)];
+          }
+        } catch (error) {
+          const failure = matrixImageFailure(message.replyToEventId, 'event', error);
+          message.images = [{ name: 'image', load: async () => { throw failure; } }];
+        }
+      }
+      // A reply to a text message must not pick up unrelated pending images.
+    } else {
+      const beforeTs = Number.isSafeInteger(event.origin_server_ts) ? event.origin_server_ts : Date.now();
+      references = this.#imageInbox.pending({
+        roomId: message.roomId, senderId: message.senderId, threadId: message.threadId ?? null,
+        beforeTs, sinceTs: Math.max(0, beforeTs - this.#imageAssociationWindowMs),
+      });
+      message.images = references.map((reference) => this.#referencedImageSource(message, reference));
+      // Keep this arrival's candidates fixed, but decide consumption after earlier queued turns settle.
+      if (references.length > 0) message.prepareImages = (current) => {
+        const pending = references.filter((reference) =>
+          this.#imageInbox.get({ roomId: current.roomId, eventId: reference.eventId })?.consumed !== true);
+        current.images = pending.map((reference) => this.#referencedImageSource(current, reference));
+        current.matrixImageEventIds = pending.map((reference) => reference.eventId);
+      };
+    }
+    message.matrixImageEventIds = references.map((reference) => reference.eventId);
   }
 
   #structuredContextActive() {
@@ -873,7 +981,7 @@ export class MatrixRuntime {
         content = (await this.#crypto.decryptRoomEvent(roomId, event).catch(() => null))?.content ?? null;
       }
       const body = typeof content?.body === 'string' ? content.body : '';
-      if (body) {
+      if (body && content?.msgtype !== 'm.notice') {
         // Chain walking follows genuine reply relations only; a falling-back
         // relation is the thread-membership declaration, not a reply target.
         const replyTo = replyEventIdOf(content);
@@ -1130,8 +1238,21 @@ export class MatrixRuntime {
           : (this.#turnEpochs.get(conversationKey) ?? 0) + 1);
         this.#roomHistory?.clearContextInjected({ conversationKey });
       },
-      onDelivered: async ({ conversationKey, sessionId, providerMessageIds }) => {
+      onDelivered: async ({ conversationKey, sessionId, providerMessageIds, message }) => {
         this.#recordBotEventDelivery({ conversationKey, sessionId, providerMessageIds });
+        if (message?.matrixImageEventIds?.length > 0) {
+          try {
+            await this.#imageInbox.markConsumed({ roomId: message.roomId, eventIds: message.matrixImageEventIds });
+          } catch (error) {
+            const notice = t('回答已发送，但图片处理状态保存失败；下次 @ 可能重复分析这些图片。请检查本地存储后重试。');
+            this.#status.lastError = notice;
+            this.#logger.error?.('[dsh-im:matrix] image consumption state could not be persisted:', error);
+            try { await this.#sendRoomText(message.replyTarget, notice, { notice: true }); }
+            catch (reportError) {
+              this.#logger.error?.('[dsh-im:matrix] image state failure notice could not be delivered:', reportError);
+            }
+          }
+        }
       },
     };
   }
@@ -1383,6 +1504,9 @@ export class MatrixRuntime {
   }
 
   #createMediaSource(content, msgtype) {
+    if (msgtype === 'm.image') {
+      return { images: [createMatrixImageSource(this.#api, content, { maxBytes: this.#config.maxMediaBytes })], files: [] };
+    }
     const encrypted = content?.file && typeof content.file === 'object' ? content.file : null;
     const contentUri = cleanString(content?.url ?? encrypted?.url);
     if (!contentUri || !contentUri.startsWith('mxc://')) return null;
@@ -1402,8 +1526,6 @@ export class MatrixRuntime {
       }
     };
     const source = { name, ...(mediaType ? { mediaType } : {}), load };
-    if (msgtype === 'm.image' && mediaType && !IMAGE_MEDIA_TYPES.has(mediaType.toLowerCase())) return null;
-    if (msgtype === 'm.image') return { images: [source], files: [] };
     if (msgtype === 'm.audio' || msgtype === 'm.video' || msgtype === 'm.file' || msgtype === 'm.sticker') {
       return { images: [], files: [source] };
     }
@@ -1412,7 +1534,10 @@ export class MatrixRuntime {
 
   #createBotClient() {
     return {
-      sendText: async (target, text) => await this.#sendRoomText(target, text),
+      // The bridge stamps final answers with their turn; unbound text is operational feedback.
+      sendText: async (target, text) => await this.#sendRoomText(target, text, {
+        notice: this.#targetTurnKey(target) === null,
+      }),
       sendTyping: async (target) => {
         await this.#api?.setTyping(target?.roomId ?? '', { typing: true, timeoutMs: 20_000 }).catch(() => undefined);
       },
@@ -1483,6 +1608,7 @@ export class MatrixRuntime {
         content = { msgtype: 'm.text', body: chunk.plain };
         sentBody = chunk.plain;
       }
+      if (options.notice === true) content.msgtype = 'm.notice';
       applyMatrixRelations(content, { threadId, replyToEventId });
       const result = await this.#sendRoomEvent(roomId, 'm.room.message', content, {
         ...(options.signal ? { signal: options.signal } : {}),
@@ -1492,7 +1618,7 @@ export class MatrixRuntime {
       // deployment's homeserver verifiably does not echo bot-authored events
       // back onto the timeline, so the room-visible store is fed here too and
       // coalesces with any echo a different server does deliver.
-      if (options.recordRoom !== false) {
+      if (options.recordRoom !== false && options.notice !== true) {
         this.#recordBotRoomMessage({ roomId, eventId: result?.event_id, text: sentBody, threadId, turnKey: this.#targetTurnKey(target) });
       }
     }
@@ -1508,6 +1634,7 @@ export class MatrixRuntime {
     const messageId = opened.providerMessageIds[0] ?? null;
     const threadId = typeof target?.threadId === 'string' && isMatrixEventId(target.threadId)
       ? target.threadId : null;
+    let finalKind = null;
     const stream = createEditableMessageStream({
       initialText,
       limit: this.#config.maxMessageLength,
@@ -1515,11 +1642,16 @@ export class MatrixRuntime {
       create: async () => messageId,
       edit: async (streamMessageId, text) => {
         if (!isMatrixEventId(streamMessageId)) return;
+        const kind = finalKind;
         const content = buildMatrixEditContent({
           originalContent: { msgtype: 'm.text', body: initialText },
           newText: text,
           eventId: streamMessageId,
         });
+        if (kind === 'notice') {
+          content.msgtype = 'm.notice';
+          content['m.new_content'].msgtype = 'm.notice';
+        }
         if (threadId) {
           content['m.relates_to'] = {
             ...content['m.relates_to'],
@@ -1527,18 +1659,30 @@ export class MatrixRuntime {
           };
         }
         await this.#sendRoomEvent(roomId, 'm.room.message', content);
-        // Every edit frame revises the same entry, so the store ends holding the
-        // final body members read in the room regardless of frame count. The turn
-        // stamp rides the same target the stream opened under, so the placeholder
-        // receipt and its final body share one provenance.
-        this.#recordBotRoomMessage({ roomId, eventId: streamMessageId, text, threadId, edit: true, turnKey: this.#targetTurnKey(target) });
+        // Only a completed model answer becomes context; progress and failure notices do not.
+        if (kind === 'answer') {
+          this.#recordBotRoomMessage({ roomId, eventId: streamMessageId, text, threadId, edit: true, turnKey: this.#targetTurnKey(target) });
+        }
       },
-      sendRemainder: async (chunk) => await this.#sendRoomText(target, chunk),
+      sendRemainder: async (chunk) => await this.#sendRoomText(target, chunk, {
+        notice: finalKind === 'notice',
+        recordRoom: finalKind === 'answer',
+      }),
       messageIdForResult: (result) => result?.providerMessageIds?.at(-1) ?? null,
       logger: this.#logger,
     });
     await stream.start();
-    return stream;
+    const finish = stream.finish.bind(stream);
+    stream.finish = async (text) => {
+      finalKind = 'answer';
+      return await finish(text);
+    };
+    const finishNotice = async (text) => {
+      finalKind = 'notice';
+      await finish(text);
+      return { providerMessageIds: stream.providerMessageIds, deliveryOutcome: 'sent' };
+    };
+    return Object.assign(stream, { finishNotice, fail: finishNotice });
   }
 
   async #sendArtifact(target, file, preferImage) {

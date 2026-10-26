@@ -121,6 +121,81 @@ test('the room-visible window and follow-up settings survive the save-and-reread
     /Refusing to persist incomplete Matrix bot data/u);
 });
 
+test('image association settings stay optional and valid bounds round-trip through disk', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-im-matrix-image-config-'));
+  const path = join(directory, 'matrix-bots.json');
+  try {
+    const store = await new MatrixConfigStore(path).load();
+    for (const omitted of [{}, { imageAssociationWindowMs: null, imageHistoryLimit: null }]) {
+      await store.save(botFixture(omitted));
+      const reread = await new MatrixConfigStore(path).load();
+      for (const key of ['imageAssociationWindowMs', 'imageHistoryLimit']) {
+        deepStrictEqual(Object.hasOwn(reread.list()[0], key), false,
+          `${key} stays omitted; runtime/production supplies its default`);
+        deepStrictEqual(Object.hasOwn(JSON.parse(await readFile(path, 'utf8')).bots[0], key), false);
+      }
+    }
+    const settings = [
+      { imageAssociationWindowMs: 10_000, imageHistoryLimit: 1 },
+      { imageAssociationWindowMs: 86_400_000, imageHistoryLimit: 50_000 },
+      { imageAssociationWindowMs: 600_000, imageHistoryLimit: 2_000 },
+      { imageAssociationWindowMs: 900_000, imageHistoryLimit: 100 },
+    ];
+    for (const values of settings) {
+      const saved = await store.save(botFixture(values));
+      const reread = await new MatrixConfigStore(path).load();
+      deepStrictEqual(reread.list(), store.list());
+      for (const [key, value] of Object.entries(values)) {
+        deepStrictEqual(saved[key], value);
+        deepStrictEqual(reread.get(saved.botId)[key], value);
+        deepStrictEqual(JSON.parse(await readFile(path, 'utf8')).bots[0][key], value);
+      }
+    }
+    await store.save(botFixture({ imageAssociationWindowMs: '600000', imageHistoryLimit: '2000' }));
+    const numeric = (await new MatrixConfigStore(path).load()).list()[0];
+    deepStrictEqual(numeric.imageAssociationWindowMs, 600_000,
+      'numeric strings normalize just like the existing bounded integer settings');
+    deepStrictEqual(numeric.imageHistoryLimit, 2_000);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('invalid image association settings are rejected by save and load without replacing valid state', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-im-matrix-image-config-'));
+  const path = join(directory, 'matrix-bots.json');
+  try {
+    const store = await new MatrixConfigStore(path).load();
+    const valid = await store.save(botFixture({ imageAssociationWindowMs: 600_000, imageHistoryLimit: 2_000 }));
+    const committedText = await readFile(path, 'utf8');
+    const invalid = [
+      ...[0, 9_999, 86_400_001, 10_000.5, -1, 'fast', Infinity, NaN].map((value) => ({ imageAssociationWindowMs: value })),
+      ...[0, -1, 50_001, 1.5, 'many', Infinity, NaN].map((value) => ({ imageHistoryLimit: value })),
+    ];
+    for (const values of invalid) {
+      await rejects(() => store.save(botFixture(values)), /Refusing to persist incomplete Matrix bot data/u);
+      deepStrictEqual(store.list(), [valid]);
+      deepStrictEqual(await readFile(path, 'utf8'), committedText,
+        'invalid input cannot replace the committed document');
+    }
+    const serializableInvalid = [
+      { imageAssociationWindowMs: 9_999 }, { imageAssociationWindowMs: 86_400_001 },
+      { imageAssociationWindowMs: 10_000.5 }, { imageAssociationWindowMs: 'fast' },
+      { imageHistoryLimit: 0 }, { imageHistoryLimit: 50_001 },
+      { imageHistoryLimit: 1.5 }, { imageHistoryLimit: 'many' },
+    ];
+    for (const values of serializableInvalid) {
+      const text = JSON.stringify({ version: 1, bots: [botFixture(values)] });
+      await writeFile(path, text, 'utf8');
+      await rejects(() => store.load(), /invalid bot data/u);
+      deepStrictEqual(store.list(), [valid], 'a failed reload leaves committed memory intact');
+      deepStrictEqual(await readFile(path, 'utf8'), text, 'load never silently rewrites invalid config');
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('a corrupt-looking document fails closed on load and an absent file starts empty', async () => {
   const directory = await makeTempDirectory('dsh-im-matrix-store-');
   const path = join(directory, 'matrix-bots.json');

@@ -75,7 +75,7 @@ export function mxcToMatrixMediaUrl(homeserver, contentUri) {
   const [, host, path] = match;
   if (!/^[A-Za-z0-9.-]+(?::\d{1,5})?$/u.test(host)) return null;
   const url = new URL(base);
-  url.pathname = `${MATRIX_MEDIA_PREFIX}/download/${encodeURIComponent(host)}/${encodeURIComponent(path)}`;
+  url.pathname = `/_matrix/client/v1/media/download/${encodeURIComponent(host)}/${encodeURIComponent(path)}`;
   url.search = '';
   return url;
 }
@@ -555,27 +555,26 @@ export class MatrixApi {
   }
 
   /**
-   * Bounded MXC content download against the configured homeserver only. The
-   * media path derives from the `mxc://` server/path pair; foreign servers in
-   * the URI are rejected by the allowlist below, redirects are followed
-   * manually up to a fixed hop budget, and the byte cap is enforced while
-   * streaming so a lying `content-length` cannot inflate memory.
+   * Download MXC content through the configured homeserver's authenticated media
+   * endpoint. The MXC server identifies the media repository, not a request host.
+   * Bearer credentials stay in headers; redirects must retain the homeserver
+   * origin and contain no URL credentials. Redirect hops and streamed bytes are
+   * bounded. Failed downloads reject without returning partial content.
    */
   async downloadContent(contentUri, { signal, maxBytes = 104_857_600 } = {}) {
     const base = validateMatrixHomeserver(this.#homeserver);
-    const allowHost = base ? new URL(base).host : '';
+    const allowOrigin = base ? new URL(base).origin : '';
     let target = mxcToMatrixMediaUrl(this.#homeserver, contentUri);
-    if (!target || target.host !== allowHost) {
-      throw new MatrixApiError('Matrix media content URI is invalid or hosted by a foreign server',
+    if (!target || target.origin !== allowOrigin) {
+      throw new MatrixApiError('Matrix media content URI is invalid',
         { code: 'matrix-invalid', permanent: true });
     }
-    target.searchParams.set('access_token', this.#accessToken);
     const requestSignalValue = requestSignal(signal, MEDIA_TIMEOUT_MS);
     let hops = 0;
     for (;;) {
       const response = await this.#fetchImpl(target.href, {
         method: 'GET',
-        redirect: 'error',
+        redirect: 'manual',
         headers: {
           authorization: `Bearer ${this.#accessToken}`,
           accept: '*/*',
@@ -592,7 +591,7 @@ export class MatrixApi {
         await response.body?.cancel?.().catch(() => undefined);
         if (!location) throw new MatrixApiError('Matrix media redirect without a location', { code: 'matrix-invalid' });
         const next = new URL(location, target);
-        if (next.host !== allowHost) {
+        if (next.origin !== allowOrigin || next.username || next.password) {
           throw new MatrixApiError('Matrix media redirect leaves the configured homeserver',
             { code: 'matrix-invalid', permanent: true });
         }

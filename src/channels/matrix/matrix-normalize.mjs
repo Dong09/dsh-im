@@ -57,6 +57,12 @@ export class EventDedupeRing {
     return true;
   }
 
+  /** Release an event whose durable recording failed so a replay can retry it. */
+  forget(eventId) {
+    this.#seen.delete(eventId);
+    this.#order = this.#order.filter((id) => id !== eventId);
+  }
+
   snapshot() {
     return [...this.#order];
   }
@@ -181,18 +187,62 @@ export function detectMatrixMention(content, botUserId) {
   return false;
 }
 
+function matrixPillTargetsBot(url, own) {
+  const target = /^https?:\/\/matrix\.to\/#\/([^\s?]+)(?:\?.*)?$/iu.exec(url)?.[1];
+  if (!target) return false;
+  try {
+    return lowerId(decodeURIComponent(target)) === own;
+  } catch {
+    return false;
+  }
+}
+
+// This is only a plain-text alignment check, not an HTML renderer. If a client
+// uses formatting we cannot align, keep the original body rather than guessing
+// which occurrence of a display name was the mention.
+function matrixFormattedText(html) {
+  return html.replace(/<br\s*\/?\s*>/giu, '\n')
+    .replace(/<\/(?:p|div)>/giu, '\n')
+    .replace(/<[^>]*>/gu, '')
+    .replace(/&(#x[\da-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/giu, (entity, code) => {
+      const named = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00a0' };
+      if (!code.startsWith('#')) return named[code.toLowerCase()] ?? entity;
+      const point = code[1].toLowerCase() === 'x' ? parseInt(code.slice(2), 16) : Number(code.slice(1));
+      return point > 0 && point <= 0x10ffff ? String.fromCodePoint(point) : entity;
+    }).trim();
+}
+
 /**
- * Remove bot-directed mention forms from prompt text. Only full `@local:server`
- * forms and Matrix pill forms are stripped; a bare localpart word is never
- * removed so phrases like "Hermes Agent" survive intact.
+ * Remove bot-directed mention forms from prompt text. Display labels are only
+ * removed at positions proven by an aligned formatted pill; explicit user_ids
+ * additionally permit a localpart-only mention. Never erase arbitrary prose
+ * merely because it contains the bot's name.
  */
-export function stripMatrixMentions(body, botUserId) {
+export function stripMatrixMentions(body, botUserId, content = {}) {
   let text = String(body ?? '');
   const own = lowerId(botUserId);
   if (own) {
     const escaped = own.replace(/[.*+?^${}()|\\\[\]]/g, '\\$&');
-    const pill = new RegExp(`\\[<${escaped}>\\]\\(https?://matrix\\.to/[^)]*\\)`, 'gi');
-    text = text.replaceAll(pill, '');
+    const formatted = typeof content?.formatted_body === 'string' ? content.formatted_body : '';
+    if (formatted && matrixFormattedText(formatted) === text.trim()) {
+      const withoutPills = formatted.replace(/<a\b[^>]*>[\s\S]*?<\/a\s*>/giu, (pill) => {
+        const url = /\s+href\s*=\s*(["'])(.*?)\1/iu.exec(pill)?.[2];
+        return url && matrixPillTargetsBot(url, own) ? '' : pill;
+      });
+      // Keep body whitespace and formatting untouched unless a bot pill exists.
+      if (withoutPills !== formatted) text = matrixFormattedText(withoutPills);
+    }
+    const userIds = content?.['m.mentions']?.user_ids;
+    const localpart = localpartOf(own);
+    if (!formatted && localpart) {
+      const name = text.trim().toLowerCase();
+      const explicitlyMentioned = Array.isArray(userIds) && userIds.some((id) => lowerId(id) === own);
+      // A whole @localpart is already a mention fallback; a bare name still
+      // needs explicit user_ids. Neither form is removed from human prose.
+      if (name === `@${localpart}` || (name === localpart && explicitlyMentioned)) text = '';
+    }
+    text = text.replaceAll(/\[[^\]\r\n]*\]\((https?:\/\/matrix\.to\/#\/[^\s)]+)\)/giu,
+      (pill, url) => matrixPillTargetsBot(url, own) ? '' : pill);
     text = text.replaceAll(new RegExp(`<${escaped}>`, 'gi'), '');
     text = text.replaceAll(new RegExp(escaped, 'gi'), '');
   }
@@ -334,7 +384,7 @@ export function normalizeMatrixTimelineEvent({
   });
   if (!gate.pass) return { drop: gate.reason };
 
-  const text = stripMatrixMentions(rawText, botUserId);
+  const text = stripMatrixMentions(rawText, botUserId, content);
   const media = MEDIA_MSGTYPES.has(msgtype)
     ? (deps.createMediaSource ? deps.createMediaSource(content, msgtype) : null)
     : null;

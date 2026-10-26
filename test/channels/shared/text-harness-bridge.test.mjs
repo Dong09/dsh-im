@@ -210,6 +210,19 @@ async function committedArtifact(t, fileName, content, suffix) {
   return artifact;
 }
 
+test('empty mentioned messages still require an explicit carrier wake prompt', async () => {
+  const fixture = stateFixture();
+  const sent = [];
+  const bridge = createBridge({
+    state: fixture.state,
+    bot: { sendText: async (_target, text) => sent.push(text) },
+    harness: { ask: async () => assert.fail('a carrier without mention-only support must not prompt') },
+  });
+  await bridge.accept(message('empty-mention-no-capability', '', { kind: 'group', mentioned: true }));
+  await bridge.waitForIdle();
+  assert.deepEqual(sent, ['目前支持文字、图片和文件消息。']);
+});
+
 test('status reactions never delay safe errors, the conversation queue, or waitForIdle', async () => {
   const fixture = stateFixture();
   const sent = [];

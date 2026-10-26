@@ -181,7 +181,7 @@ function loggerStub() {
   };
 }
 
-async function createContext({ config = {}, initialEvents = [], events = {}, withRoomHistory = false, answer, historyFile = null } = {}) {
+async function createContext({ config = {}, initialEvents = [], events = {}, withRoomHistory = false, answer, historyFile = null, contextEnhancement } = {}) {
   const directory = await makeTempDirectory('dsh-im-matrix-context-');
   const sidecar = await new MatrixSidecarStore(join(directory, 'matrix.json')).load();
   const state = stateStub();
@@ -213,6 +213,7 @@ async function createContext({ config = {}, initialEvents = [], events = {}, wit
     sidecar,
     roomHistory,
     accessPolicy,
+    contextEnhancement,
     logger,
     createApi: () => fake,
     cryptoStore: null,
@@ -231,6 +232,192 @@ async function createContext({ config = {}, initialEvents = [], events = {}, wit
 }
 
 const sentRoomMessages = (fake) => fake.calls.filter((call) => call.op === 'send' && call.type === 'm.room.message');
+const sentMessageContent = (call) => call.content['m.new_content'] ?? call.content;
+
+const mentionOnlyClients = [
+  ['mobile markdown', { body: '[1](https://matrix.to/#/@bot:example.org)', content: mentionContent() }],
+  ['desktop formatted label', {
+    body: '1',
+    content: {
+      ...mentionContent(),
+      format: 'org.matrix.custom.html',
+      formatted_body: '<a href="https://matrix.to/#/@bot:example.org">1</a>',
+    },
+  }],
+];
+
+for (const [client, mention] of mentionOnlyClients) {
+  for (const withHistory of [true, false]) {
+    test(`mention-only ${client} wakes the model ${withHistory ? 'with the original unmentioned question' : 'without room history'}`, async () => {
+      const original = groupMessage({ body: '成都今天天气如何？' });
+      const context = await createContext({
+        withRoomHistory: true,
+        initialEvents: withHistory ? [original] : [],
+        contextEnhancement: {
+          botId: `matrix_${'a'.repeat(24)}`,
+          getSettings: () => ({
+            group: { enabled: true, fields: ['senderName'], guidance: '' },
+            direct: { enabled: false, fields: ['senderName'], guidance: '' },
+          }),
+        },
+      });
+      try {
+        await context.runtime.start();
+        if (withHistory) {
+          await eventually(() => context.roomHistory.recent({ roomId: ROOM, limit: 20 })
+            .some((entry) => entry.eventId === original.event_id), 'the unmentioned question is recorded');
+          deepStrictEqual(context.harness.prompts, [], 'the original question does not wake the bot');
+        }
+        context.fake.pushEvents([groupMessage(mention)]);
+        await context.waitForPromptCount(1);
+        await eventually(() => sentRoomMessages(context.fake).some((call) => sentMessageContent(call).body === '好的'), 'the mention-only answer');
+        deepStrictEqual(context.harness.prompts.length, 1, 'one mention produces exactly one model turn');
+        const prompt = context.harness.prompts[0];
+        const blocks = contextBlockBodies(prompt);
+        deepStrictEqual(blocks.map((entry) => [entry.collector, entry.content]),
+          withHistory ? [['room-visible', original.content.body]] : [],
+          'the available unmentioned question is collected, without turning the mention label into history');
+        const source = prompt.match(/<dsh_im_source>([\s\S]*?)<\/dsh_im_source>/);
+        ok(source, 'source enhancement is rendered without a senderName closure error');
+        deepStrictEqual(JSON.parse(source[1]).senderName, 'carol');
+        const wake = prompt.replace(/<dsh_im_[a-z_]+>[\s\S]*?<\/dsh_im_[a-z_]+>/g, '').trim();
+        ok(wake.replace(/^carol:\s*/, '').trim().length > 1, 'the model receives an explicit nonempty wake prompt');
+        ok(wake.endsWith('你被单独 @ 唤醒了。请结合当前会话和提供的群聊上下文回应；若没有明确的问题，请询问用户需要什么帮助。'),
+          'the default locale supplies an explicit instruction to use context or ask how to help');
+        ok(!wake.includes(BOT) && !wake.includes('matrix.to') && !wake.includes('[1]') && !/(?:^|\s)1(?:\s|$)/u.test(wake),
+          'neither desktop label nor mobile mention markup remains in the model instruction');
+        ok(!sentRoomMessages(context.fake).some((call) => /不支持|unsupported/iu.test(call.content.body)),
+          'an empty normalized group mention is supported even without collected history');
+      } finally {
+        await context.stop();
+      }
+    });
+  }
+}
+
+test('local /help is a notice, stays out of room history after self-sync, and is not collected by the next mention', async () => {
+  const context = await createContext({ withRoomHistory: true });
+  try {
+    await context.runtime.start();
+    context.fake.pushEvents([groupMessage({ body: '/help' })]);
+    await eventually(() => sentRoomMessages(context.fake).length > 0, 'the local help reply');
+    const help = sentRoomMessages(context.fake)[0];
+    deepStrictEqual(help.content.msgtype, 'm.notice', 'unbound operational text is sent as a notice');
+    deepStrictEqual(context.harness.prompts, [], '/help is handled locally');
+    ok(!context.roomHistory.recent({ roomId: ROOM, limit: 50 }).some((entry) => entry.text === help.content.body),
+      'the send face never records operational help as a model answer');
+    const sentinel = groupMessage({ body: '帮助之后的真实问题' });
+    context.fake.pushEvents([
+      { type: 'm.room.message', event_id: help.sentEventId, sender: BOT, origin_server_ts: Date.now(), content: help.content },
+      sentinel,
+    ]);
+    await eventually(() => context.roomHistory.recent({ roomId: ROOM, limit: 50 })
+      .some((entry) => entry.eventId === sentinel.event_id), 'the self-sync notice and following question were processed');
+    ok(!context.roomHistory.recent({ roomId: ROOM, limit: 50 }).some((entry) => entry.text === help.content.body),
+      'the self-sync notice cannot repopulate room history');
+    context.fake.pushEvents([groupMessage(mentionOnlyClients[1][1])]);
+    await context.waitForPromptCount(1);
+    const prompt = context.harness.prompts[0];
+    ok(!prompt.includes(help.content.body), 'the subsequent @1 prompt excludes local help');
+    ok(contextBlockBodies(prompt).some((entry) => entry.collector === 'room-visible' && entry.content === sentinel.content.body),
+      'actual room speech still reaches the room-visible collector');
+  } finally {
+    await context.stop();
+  }
+});
+
+for (const outcome of ['failed', 'stopped']) {
+  test(`a ${outcome} streamed turn emits an operational notice without recording progress or the final hint`, async () => {
+    const context = await createContext({ withRoomHistory: true });
+    const originalAsk = context.harness.ask;
+    const partial = '尚未完成的临时回答，不应进入上下文';
+    let releaseFailure;
+    const failureGate = new Promise((resolve) => { releaseFailure = resolve; });
+    context.harness.ask = async (...args) => {
+      await originalAsk(...args);
+      const options = args.find((entry) => typeof entry?.onUpdate === 'function');
+      await options.onUpdate({ type: 'text', text: partial });
+      await failureGate;
+      const error = new Error('fixture model request failed');
+      if (outcome === 'stopped') error.code = 'turn-stopped';
+      throw error;
+    };
+    try {
+      await context.runtime.start();
+      context.fake.pushEvents([groupMessage({ body: addressedBody('触发流式失败'), content: mentionContent() })]);
+      await eventually(() => sentRoomMessages(context.fake).some((call) => sentMessageContent(call).body === partial),
+        'the intermediate stream update is visible');
+      ok(!context.roomHistory.recent({ roomId: ROOM, limit: 50 }).some((entry) => entry.text === partial),
+        'intermediate stream progress is not a completed model answer');
+      releaseFailure();
+      const isFinalNotice = (call) => call.content['m.new_content']?.msgtype === 'm.notice'
+        && sentMessageContent(call).body !== partial;
+      await eventually(() => sentRoomMessages(context.fake).some(isFinalNotice), 'the final failure/stopped notice edit');
+      const notice = sentRoomMessages(context.fake).find(isFinalNotice);
+      const noticeText = sentMessageContent(notice).body;
+      deepStrictEqual(notice.content.msgtype, 'm.notice', 'the edit fallback is also an operational notice');
+      ok(noticeText.trim().length > 0, 'the operational hint is still visible to the user');
+      if (outcome === 'stopped') deepStrictEqual(noticeText, '已停止。');
+      ok(!context.roomHistory.recent({ roomId: ROOM, limit: 50 })
+        .some((entry) => entry.text === partial || entry.text === noticeText),
+      'neither unfinished answer nor operational hint is persisted as room context');
+
+      context.harness.ask = originalAsk;
+      context.fake.pushEvents([groupMessage({ body: '/new' })]);
+      await eventually(() => sentRoomMessages(context.fake).some((call) =>
+        call.content.body.includes('已开启新会话')), 'a fresh session releases previous answer provenance');
+      context.fake.pushEvents([groupMessage({ body: addressedBody('新会话正常提问'), content: mentionContent() })]);
+      await context.waitForPromptCount(2);
+      const prompt = context.harness.prompts[1];
+      ok(!prompt.includes(partial) && !prompt.includes(noticeText),
+        'a new conversation cannot collect failed/stopped stream text as an old answer');
+      await eventually(() => sentRoomMessages(context.fake).some((call) => sentMessageContent(call).body === '好的'),
+        'the subsequent turn succeeds');
+    } finally {
+      releaseFailure();
+      await context.stop();
+    }
+  });
+}
+
+for (const collector of ['reply', 'thread-root']) {
+  test(`the ${collector} collector skips own operational notices but retains real model answers`, async () => {
+    const notice = groupMessage({ sender: BOT, body: '本地操作失败，请稍后重试', content: { msgtype: 'm.notice' } });
+    const answer = groupMessage({ sender: BOT, body: '另一个会话真正给出的模型回答' });
+    const relation = (eventId) => collector === 'reply'
+      ? { 'm.in_reply_to': { event_id: eventId } }
+      : { chain: [{ event_id: eventId, rel_type: 'm.thread' }] };
+    const context = await createContext({
+      withRoomHistory: true,
+      config: { replyContextEnabled: true, rootContextOnceEnabled: true },
+      events: { [notice.event_id]: notice, [answer.event_id]: answer },
+    });
+    try {
+      await context.runtime.start();
+      context.fake.pushEvents([groupMessage({
+        body: addressedBody('引用操作通知'),
+        content: { ...mentionContent(), 'm.relates_to': relation(notice.event_id) },
+      })]);
+      await context.waitForPromptCount(1);
+      ok(!context.harness.prompts[0].includes(notice.content.body), 'a fetched notice is not model context');
+      deepStrictEqual(contextBlockBodies(context.harness.prompts[0]), [], 'the notice contributes no context block');
+      context.fake.pushEvents([groupMessage({
+        body: addressedBody('引用真正回答'),
+        content: { ...mentionContent(), 'm.relates_to': relation(answer.event_id) },
+      })]);
+      await context.waitForPromptCount(2);
+      ok(contextBlockBodies(context.harness.prompts[1]).some((entry) =>
+        entry.collector === collector && entry.event === answer.event_id && entry.content === answer.content.body),
+      'a real m.text answer remains available to the other conversation');
+      await eventually(() => sentRoomMessages(context.fake).filter((call) => sentMessageContent(call).body === '好的').length === 2,
+        'both model answers are delivered');
+      ok(sentRoomMessages(context.fake).filter((call) => sentMessageContent(call).body === '好的')
+        .every((call) => sentMessageContent(call).msgtype === 'm.text'), 'turn-bound final answers remain m.text');
+    } finally {
+      await context.stop();
+    }
+  });
+}
 
 test('a reply that opens a thread at its target inherits the main conversation while isolate mode still forks', async () => {
   const repliedTo = nextEventId();
