@@ -94,6 +94,14 @@ test('/session N selects from the same effective workspace as /sessionlist', asy
   assert.equal(f.workspaces.conversationWorkspaceFor(f.botId, f.key), f.alternateWorkspace);
 });
 
+test('/conv N numbers workspaces from the conversation effective workspace', async (t) => {
+  const f = await fixture(t);
+  await f.command(`/conv ${f.alternateWorkspace}`);
+  const result = await f.command('/conv 1');
+  assert.match(result.message, new RegExp(f.alternateWorkspace.replaceAll('\\', '\\\\'), 'u'));
+  assert.equal(f.workspaces.conversationWorkspaceFor(f.botId, f.key), f.alternateWorkspace);
+});
+
 test('/session N still follows the bot default without an override', async (t) => {
   const f = await fixture(t);
   const listing = await f.command('/sessionlist');

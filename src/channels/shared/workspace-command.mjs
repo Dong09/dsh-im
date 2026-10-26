@@ -111,12 +111,15 @@ async function selectedWorkspacePath(value) {
   }
 }
 
-export async function workspacePathSnapshot(harness, { includeTitles = false, includeConversationDirectories = false, ...options } = {}) {
+export async function workspacePathSnapshot(harness, { includeTitles = false, includeConversationDirectories = false, conversationKey, ...options } = {}) {
   const withEntries = includeTitles && typeof harness.listWorkspaceEntries === 'function';
   const listed = await (withEntries ? harness.listWorkspaceEntries(options) : harness.listWorkspaces(options));
-  const currentValue = typeof harness?.currentWorkspace === 'function'
-    ? harness.currentWorkspace()
-    : null;
+  const currentValue = typeof harness?.currentConversationWorkspace === 'function'
+    && typeof conversationKey === 'string' && conversationKey
+    ? harness.currentConversationWorkspace(conversationKey)
+    : typeof harness?.currentWorkspace === 'function'
+      ? harness.currentWorkspace()
+      : null;
   const current = await existingWorkspacePath(currentValue);
   const entries = await Promise.all((Array.isArray(listed) ? listed : []).map(async (item) => ({
     path: await existingWorkspacePath(withEntries ? item?.path : item),
@@ -465,7 +468,7 @@ async function runConversationWorkspaceCommand(command, harness, conversationKey
   try {
     let selected = argument;
     if (/^\d+$/u.test(argument)) {
-      const { paths } = await workspacePathSnapshot(harness);
+      const { paths } = await workspacePathSnapshot(harness, { conversationKey });
       const position = Number(argument);
       if (!Number.isSafeInteger(position) || position < 1 || position > paths.length) {
         return commandResult(t('工作区序号不存在，请先执行 /workspacelist。'));

@@ -7,6 +7,10 @@ function ConfigForm({ title, value, inherited, busy, onSave, onClear }) {
   const id = React.useId();
   const [draft, setDraft] = React.useState(() => normalizeConversationDirectory(value) ?? { enabled: false, strategy: 'per-conversation', prefix: 'conv-' });
   const [error, setError] = React.useState(null);
+  React.useEffect(() => {
+    setDraft(normalizeConversationDirectory(value) ?? { enabled: false, strategy: 'per-conversation', prefix: 'conv-' });
+    setError(null);
+  }, [value]);
   const update = (key, next) => { setDraft((current) => ({ ...current, [key]: next })); setError(null); };
   const save = async (event) => {
     event.preventDefault();
@@ -64,6 +68,6 @@ export function FeishuConversationDirectorySettingsPage({ account, rpcCall }) {
     h('p', { className: 'dim-botGeneralHelp' }, '设置保存后对新会话生效。发送 /new 使用新设置；已有会话和旧目录中的文件保留。开启后无法手动修改工作区。'),
     error ? h('p', { role: 'alert' }, error) : null,
     bot ? h(React.Fragment, null,
-      h(ConfigForm, { key: `bot-${JSON.stringify(bot.conversationDirectoryOverride ?? bot.conversationDirectory)}`, title: '当前机器人', value: bot.conversationDirectoryOverride ?? bot.conversationDirectory, inherited: bot.conversationDirectoryOverride == null, busy, onSave: (config) => save(FEISHU_ENDPOINTS.setConversationDirectory, config), onClear: () => save(FEISHU_ENDPOINTS.setConversationDirectory, null) }),
+      h(ConfigForm, { key: `bot-${account.botId}`, title: '当前机器人', value: bot.conversationDirectoryOverride ?? bot.conversationDirectory, inherited: bot.conversationDirectoryOverride == null, busy, onSave: (config) => save(FEISHU_ENDPOINTS.setConversationDirectory, config), onClear: () => save(FEISHU_ENDPOINTS.setConversationDirectory, null) }),
       h(ConfigForm, { key: `default-${JSON.stringify(snapshot.conversationDirectory)}`, title: '当前类型全部机器人会话目录隔离', value: snapshot.conversationDirectory, busy, onSave: (config) => save(FEISHU_ENDPOINTS.setConversationDirectoryDefault, config), onClear: () => save(FEISHU_ENDPOINTS.setConversationDirectoryDefault, null) })) : null);
 }
