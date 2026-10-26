@@ -2024,10 +2024,11 @@ export class HarnessClient {
         }
         stagedBatches.push(staged);
         const images = await imageContentFromStaged(staged, limits, { signal });
+        const allImagesDirect = images.filter((part) => part.type === 'image').length === staged.files.length;
         const originalContent = typeof basePrompt === 'string'
           ? [{ type: 'text', text: basePrompt }] : basePrompt;
         prompt = appendInboundFilesToPrompt([...originalContent, ...images], {
-          files: stagedBatches.flatMap((batch) => batch.files),
+          files: stagedBatches.flatMap((batch) => batch === staged && allImagesDirect ? [] : batch.files),
         });
       }
       if (interactionSignal) {

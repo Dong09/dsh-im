@@ -7,6 +7,7 @@ import { MatrixCryptoStore, matrixCryptoPathFor } from '../../../../src/channels
 import { MatrixHarnessClient } from '../../../../src/channels/matrix/matrix-harness-client.mjs';
 import { MatrixRoomHistoryStore, matrixRoomHistoryPathFor } from '../../../../src/channels/matrix/matrix-room-history.mjs';
 import { MatrixRuntime } from '../../../../src/channels/matrix/matrix-runtime.mjs';
+import { MatrixImageInboxStore } from '../../../../src/channels/matrix/matrix-image-inbox.mjs';
 import { ConversationStateStore } from '../../../../src/channels/shared/conversation-state-store.mjs';
 import {
   BotWorkspaceStore,
@@ -65,6 +66,9 @@ export async function createProductionController(ctx, config = {}, internals = {
   const sidecarStores = new Map();
   const cryptoStores = new Map();
   const historyStores = new Map();
+  const imageInboxes = new Map();
+  const ResolvedImageInbox = internals.ImageInboxStore ?? MatrixImageInboxStore;
+  const imageInboxPath = (botId) => resolve(paths.bots, botId, 'matrix-images.json');
   const ResolvedRoomHistory = internals.RoomHistoryStore ?? MatrixRoomHistoryStore;
   const ResolvedCryptoStore = internals.CryptoStore ?? MatrixCryptoStore;
   const statePath = (botId) => resolve(paths.bots, botId, 'state.json');
@@ -150,6 +154,13 @@ export async function createProductionController(ctx, config = {}, internals = {
       const e2eeMode = String(botConfig?.e2eeMode ?? 'optional').trim().toLowerCase();
       const cryptoStore = e2eeMode === 'off' ? null : await cryptoFor(botId);
       const roomHistory = await historyFor(botId);
+      let imageInbox = imageInboxes.get(botId);
+      if (!imageInbox) {
+        imageInbox = await new ResolvedImageInbox(imageInboxPath(botId), {
+          limit: botConfig.imageHistoryLimit ?? 2_000,
+        }).load();
+        imageInboxes.set(botId, imageInbox);
+      }
       return new ResolvedRuntime({
         config: botConfig,
         ...(accessToken ? { accessToken } : {}),
@@ -159,6 +170,7 @@ export async function createProductionController(ctx, config = {}, internals = {
         state: workspaceScope.state,
         sidecar,
         roomHistory,
+        imageInbox,
         ...(cryptoStore ? { cryptoStore } : {}),
         contextEnhancement: { botId, getSettings: () => workspaces.contextEnhancementFor(botId) },
         accessPolicy: accessPolicyProvider(workspaces, botId, {
@@ -177,6 +189,14 @@ export async function createProductionController(ctx, config = {}, internals = {
       });
     },
     deleteState: async ({ botId }) => {
+      const imageInbox = imageInboxes.get(botId);
+      await imageInbox?.flush();
+      try {
+        await unlink(imageInboxPath(botId));
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+      imageInboxes.delete(botId);
       const state = stateStores.get(botId);
       stateStores.delete(botId);
       const sidecar = sidecarStores.get(botId);
@@ -234,8 +254,15 @@ export async function createProductionController(ctx, config = {}, internals = {
     ready: supervisor.ready,
     async close() {
       await supervisor.close();
-      await controller.close();
-      harness.stopManagedProcess();
+      try {
+        await controller.close();
+      } finally {
+        try {
+          await Promise.all([...imageInboxes.values()].map((inbox) => inbox.flush()));
+        } finally {
+          harness.stopManagedProcess();
+        }
+      }
     },
   };
 }

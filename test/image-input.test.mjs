@@ -174,13 +174,65 @@ test('aggregate budget keeps image numbering and originals for file-only images'
   assert.deepEqual(await readFile(join(root, batch.files[1].path)), PNG);
 });
 
+test('direct image prompt is exactly the unchanged caption and image block', async (t) => {
+  const fixture = await clientFixture(t);
+  const caption = '  Look at this image.\n请保留标题、空格和换行。  ';
+  await fixture.client.ask('test-session', caption, { images: [{ name: 'original.png', data: PNG }] });
+  const content = fixture.prompts[0].content;
+  assert.deepEqual(content.map((part) => part.type), ['text', 'image']);
+  assert.deepEqual(content[0], { type: 'text', text: caption });
+  assert.equal(content[1].mediaType, 'image/png');
+  assert.deepEqual(Buffer.from(content[1].data, 'base64'), PNG);
+  assert.equal(fixture.staged.length, 1);
+  assert.deepEqual(await readFile(join(fixture.root, fixture.staged[0].files[0].path)), PNG);
+});
+
+test('multiple direct images retain exact captions and image order without generated text', async (t) => {
+  const fixture = await clientFixture(t);
+  const second = await sharp({ create: { width: 2, height: 1, channels: 3, background: 'blue' } }).png().toBuffer();
+  const captions = [{ type: 'text', text: 'First caption\n' }, { type: 'text', text: '  第二段说明  ' }];
+  await fixture.client.ask('test-session', captions, { images: [
+    { name: 'first.png', data: PNG }, { name: 'second.png', data: second },
+  ] });
+  const content = fixture.prompts[0].content;
+  assert.deepEqual(content.map((part) => part.type), ['text', 'text', 'image', 'image']);
+  assert.deepEqual(content.slice(0, 2), captions);
+  assert.deepEqual(content.slice(2).map((part) => Buffer.from(part.data, 'base64')), [PNG, second]);
+  assert.deepEqual(await Promise.all(fixture.staged[0].files.map((file) => readFile(join(fixture.root, file.path)))), [PNG, second]);
+});
+
+test('partial file-only image fallback keeps its notice and original manifest paths', async (t) => {
+  const fixture = await clientFixture(t);
+  fixture.client.getImageInputLimits = async () => ({
+    ...imageInputLimits(), maxImageBytes: PNG.length, maxTotalImageBytes: PNG.length,
+  });
+  await fixture.client.ask('test-session', 'Compare both images', { images: [
+    { name: 'first.png', data: PNG }, { name: 'second.png', data: PNG },
+  ] });
+  const content = fixture.prompts[0].content;
+  assert.deepEqual(content.filter((part) => part.type === 'image').map((part) => Buffer.from(part.data, 'base64')), [PNG]);
+  const texts = content.filter((part) => part.type === 'text');
+  assert.equal(texts.length, 3, 'only the caption, actual fallback notice and manifest remain');
+  assert.equal(texts[0].text, 'Compare both images');
+  assert.match(texts[1].text, /图片序号：2/);
+  const files = manifest(content);
+  assert.deepEqual(files.map((file) => file.path), fixture.staged[0].files.map((file) => file.path));
+  assert.deepEqual(await Promise.all(files.map((file) => readFile(join(fixture.root, file.path)))), [PNG, PNG]);
+});
+
 test('Harness saves originals before model admission, preserves accompanying files and downloads only once', async (t) => {
   const large = Buffer.concat([PNG, Buffer.alloc(6 * MB)]);
   let loads = 0;
   const fixture = await clientFixture(t, { onPrompt: async (content) => {
     const files = manifest(content);
-    assert.equal(files.length, 2);
-    assert.deepEqual(await readFile(join(fixture.root, files[1].path)), large);
+    assert.equal(files.length, 1, 'direct image originals must not leak into the document manifest');
+    assert.equal(files[0].name, 'note.txt');
+    assert.deepEqual(await readFile(join(fixture.root, files[0].path)), Buffer.from('notes'));
+    assert.equal(fixture.staged.length, 2);
+    assert.deepEqual(files.map((file) => file.path), fixture.staged[0].files.map((file) => file.path));
+    assert.deepEqual(await readFile(join(fixture.root, fixture.staged[1].files[0].path)), large);
+    assert.deepEqual(content.filter((part) => part.type === 'text' && !part.text.includes('<dsh_im_files>')),
+      [{ type: 'text', text: 'look' }]);
     assert.ok(Buffer.from(content.find((part) => part.type === 'image').data, 'base64').length <= 5 * MB);
   } });
   assert.equal(await fixture.client.ask('test-session', 'look', {
@@ -193,17 +245,28 @@ test('Harness saves originals before model admission, preserves accompanying fil
 
 for (const reason of ['MODEL_DOES_NOT_SUPPORT_IMAGES', 'IMAGE_TOO_LARGE', 'IMAGES_TOO_LARGE', 'TOO_MANY_IMAGES', 'IMAGE_TOO_MANY_PIXELS']) {
   test(`Host ${reason} retries once using already saved originals`, async (t) => {
+    const original = Buffer.concat([PNG, Buffer.alloc(6 * MB)]);
     const fixture = await clientFixture(t, { onPrompt: (_content, attempt) => {
       if (attempt === 1) throw new HarnessRpcError('session.prompt', { code: 'attachment-error', details: { reason } });
     } });
     let loads = 0;
-    await fixture.client.ask('test-session', 'caption', { images: [{ load: async () => { loads++; return PNG; } }] });
+    await fixture.client.ask('test-session', 'caption', { images: [{ load: async () => { loads++; return original; } }] });
     assert.equal(loads, 1);
     assert.equal(fixture.staged.length, 1);
     assert.equal(fixture.prompts.length, 2);
     assert.equal(fixture.prompts[0].rpcId, fixture.prompts[1].rpcId);
     assert.equal(fixture.prompts[1].content.some((part) => part.type === 'image'), false);
-    assert.deepEqual(manifest(fixture.prompts[0].content), manifest(fixture.prompts[1].content));
+    assert.deepEqual(fixture.prompts[0].content.map((part) => part.type), ['text', 'image']);
+    assert.deepEqual(fixture.prompts[0].content[0], { type: 'text', text: 'caption' });
+    assert.ok(Buffer.from(fixture.prompts[0].content[1].data, 'base64').length < original.length,
+      'the rejected model block is compressed, not the saved original');
+    const fallback = fixture.prompts[1].content;
+    assert.deepEqual(fallback[0], { type: 'text', text: 'caption' });
+    assert.equal(fallback.filter((part) => part.type === 'text').length, 3);
+    assert.match(fallback[1].text, /不支持直接接收图片输入|宿主拒绝了本次图片输入/);
+    const files = manifest(fallback);
+    assert.deepEqual(files.map((file) => file.path), fixture.staged[0].files.map((file) => file.path));
+    assert.deepEqual(await readFile(join(fixture.root, files[0].path)), original);
   });
 }
 
@@ -231,7 +294,7 @@ test('policy is captured on each ask and loader errors remain image diagnostics'
 
 for (const channel of ['slack', 'telegram', 'discord', 'whatsapp']) {
   test(`${channel} shared bridge passes images through real Harness staging and compression`, async (t) => {
-    const { root, client, prompts } = await clientFixture(t);
+    const { root, client, prompts, staged } = await clientFixture(t);
     const seen = new Set();
     const sent = [];
     const image = Buffer.concat([PNG, Buffer.alloc(6 * MB)]);
@@ -243,13 +306,14 @@ for (const channel of ['slack', 'telegram', 'discord', 'whatsapp']) {
       images: [{ name: 'big.png', data: image }], replyTarget: {} });
     assert.deepEqual(sent, ['verified']);
     assert.equal(prompts.length, 1);
-    const files = manifest(prompts[0].content);
-    assert.deepEqual(await readFile(join(root, files[0].path)), image);
+    assert.deepEqual(prompts[0].content.map((part) => part.type), ['text', 'image']);
+    assert.deepEqual(prompts[0].content[0], { type: 'text', text: 'look' });
+    assert.deepEqual(await readFile(join(root, staged[0].files[0].path)), image);
   });
 }
 
 test('WeCom app media downloads pass through real Harness staging and compression', async (t) => {
-  const { root, client, prompts } = await clientFixture(t);
+  const { root, client, prompts, staged } = await clientFixture(t);
   const seen = new Set();
   const sent = [];
   const image = Buffer.concat([PNG, Buffer.alloc(6 * MB)]);
@@ -275,5 +339,6 @@ test('WeCom app media downloads pass through real Harness staging and compressio
   assert.equal(prompts.length, 1);
   const content = prompts[0].content;
   assert.ok(Buffer.from(content.find((part) => part.type === 'image').data, 'base64').length <= 5 * MB);
-  assert.deepEqual(await readFile(join(root, manifest(content)[0].path)), image);
+  assert.deepEqual(content.map((part) => part.type), ['text', 'image']);
+  assert.deepEqual(await readFile(join(root, staged[0].files[0].path)), image);
 });
