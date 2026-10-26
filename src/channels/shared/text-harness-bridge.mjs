@@ -797,8 +797,8 @@ export class TextHarnessBridge {
   }
 
   /**
-   * Replay (submitted: false) or report (submitted: true) the messages this
-   * bridge persisted before a restart. Idempotent: each entry is removed as it
+   * Replay unsubmitted plain text or report submitted/media-dependent messages
+   * this bridge persisted before a restart. Idempotent: each entry is removed as it
    * is handled, and the returned promise is shared with waitForIdle().
    */
   recoverPendingMessages() {
@@ -818,7 +818,7 @@ export class TextHarnessBridge {
     for (const entry of entries) {
       if (!entry || this.#signal?.aborted) return;
       try {
-        if (entry.submitted === true) {
+        if (entry.submitted === true || entry.requiresMedia === true) {
           await this.#notifyInterruptedPending(entry);
           await this.#removePendingMessage(entry.id);
           continue;
@@ -846,14 +846,18 @@ export class TextHarnessBridge {
   #recordPendingMessage(message, messageId, senderId, key) {
     if (typeof this.#state?.putPendingMessage !== 'function') return Promise.resolve();
     const text = controlTextOf(message);
-    if (!text) return Promise.resolve();
+    const requiresMedia = hasInboundImages(message) || hasInboundFiles(message) || hasReplyReference(message);
+    if (!text && !requiresMedia) return Promise.resolve();
     const entry = {
       id: pendingMessageId(key, messageId),
       key,
       messageId,
       kind: message.kind === 'group' ? 'group' : 'direct',
-      text,
+      // Persistence-only sentinel for empty captions. requiresMedia entries are
+      // reported, never replayed, so this text must never become model input.
+      text: text || '[media]',
       submitted: false,
+      ...(requiresMedia ? { requiresMedia: true } : {}),
       createdAt: new Date().toISOString(),
       ...(senderId ? { senderId } : {}),
       ...(message.replyTarget !== undefined ? { target: message.replyTarget } : {}),
@@ -1106,10 +1110,15 @@ export class TextHarnessBridge {
         this.#status.lastRejectedAt = new Date().toISOString();
         return;
       }
+      // Channel-owned deferred selection must settle before deciding the prompt's media fields.
+      if (typeof message.prepareImages === 'function') await message.prepareImages(message);
       const hasImages = hasInboundImages(message);
       const hasFiles = hasInboundFiles(message);
       const hasReply = hasReplyReference(message);
-      if (!text && !hasImages && !hasFiles && !hasReply) {
+      const mentionOnly = message.mentioned === true
+        && !text && !hasImages && !hasFiles && !hasReply
+        && typeof this.#descriptor.mentionOnlyPrompt === 'function';
+      if (!text && !hasImages && !hasFiles && !hasReply && !mentionOnly) {
         await this.#bot.sendText(target, t('目前支持文字、图片和文件消息。'));
         return;
       }
@@ -1215,7 +1224,7 @@ export class TextHarnessBridge {
       // parsed text kept commands working but lost that decoration entirely.
       let content = hasImages || hasReply
         ? await promptContentForInboundMessage(message, { signal: this.#signal, deferImages: true })
-        : cleanText(message.content) || undefined;
+        : cleanText(message.content) || (mentionOnly ? this.#descriptor.mentionOnlyPrompt() : undefined);
       // A room conversation is shared by everyone who addresses the bot in it, so
       // the delivered prompt says whose turn this is. Only the model-facing content
       // is labelled; the parsed control text, commands, and ledger keys keep the
@@ -1474,7 +1483,7 @@ export class TextHarnessBridge {
         ];
         if (deliveredEventIds.length > 0) {
           try {
-            await this.#contextHooks.onDelivered({ conversationKey, sessionId, providerMessageIds: deliveredEventIds });
+            await this.#contextHooks.onDelivered({ conversationKey, sessionId, providerMessageIds: deliveredEventIds, message });
           } catch (error) {
             // A missing binding only costs reply classification quality for these events; the answer itself reached the room.
             this.#logger.warn?.(`[dsh-im:${this.#descriptor.key}] bot event binding recording failed:`, error?.message ?? error);
@@ -1495,7 +1504,8 @@ export class TextHarnessBridge {
         message.statusReaction?.clear();
         if (stream) {
           try {
-            await stream.finish(t('已停止。'));
+            const method = typeof stream.finishNotice === 'function' ? 'finishNotice' : 'finish';
+            await stream[method](t('已停止。'));
           } catch {
             stream.cancel?.();
           }

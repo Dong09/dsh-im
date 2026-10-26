@@ -1,5 +1,17 @@
 // English translations (matrix area). Keys are exact Chinese literals passed to t().
 export default {
+  '回答已发送，但图片处理状态保存失败；下次 @ 可能重复分析这些图片。请检查本地存储后重试。':
+    'The answer was sent, but the image processing state could not be saved. Another mention may analyze these images again. Check local storage before retrying.',
+  '无法读取引用的图片消息「{name}」，本次未提交图片分析。请回复原图并重新 @，或重新发送图片。':
+    'Cannot read the referenced image message “{name}”. Image analysis was not submitted. Reply to the original image and mention the bot again, or resend the image.',
+  '图片「{name}」解密或完整性校验失败，本次未提交图片分析。请重新发送图片后再 @。':
+    'Decryption or integrity verification failed for image “{name}”. Image analysis was not submitted. Resend the image, then mention the bot again.',
+  '图片「{name}」超过接收大小上限，本次未提交图片分析。请压缩图片后重发，或调整附件大小上限。':
+    'Image “{name}” exceeds the incoming size limit. Image analysis was not submitted. Compress and resend the image, or adjust the attachment size limit.',
+  '图片「{name}」下载失败或内容不可用，本次未提交图片分析。请稍后重新 @ 重试，或重新发送图片。':
+    'Image “{name}” could not be downloaded or is unavailable. Image analysis was not submitted. Mention the bot again later to retry, or resend the image.',
+  '你被单独 @ 唤醒了。请结合当前会话和提供的群聊上下文回应；若没有明确的问题，请询问用户需要什么帮助。':
+    'You were woken by a mention with no accompanying text. Respond using the current conversation and provided room context; if there is no clear question, ask the user what help they need.',
   'Matrix机器人': 'Matrix bot',
   'Matrix机器人凭据缺失，请移除后重新接入。':
     'Matrix bot credentials are missing. Remove the bot and connect it again.',

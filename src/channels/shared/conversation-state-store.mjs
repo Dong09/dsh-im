@@ -17,8 +17,9 @@ const EMPTY_STATE = Object.freeze({ version: 1, sessions: {}, seenMessageIds: []
 
 /**
  * A message persisted when it enters a bridge's in-memory queue, so a restart
- * before its turn runs can replay it (submitted: false) or report it
- * (submitted: true, meaning the Harness inbox already owns it).
+ * before its turn runs can replay plain text (submitted: false) or report it
+ * (submitted: true, meaning the Harness inbox already owns it, or requiresMedia:
+ * true, meaning loaders cannot be reconstructed safely after restart).
  *
  * Wired today by TextHarnessBridge (telegram, slack, discord, matrix,
  * whatsapp, email, imessage) and QqHarnessBridge. The channels that run their
@@ -41,6 +42,7 @@ function normalizePendingMessage(value) {
     text: value.text,
     submitted: value.submitted === true,
   };
+  if (value.requiresMedia === true) entry.requiresMedia = true;
   if (typeof value.senderId === 'string' && value.senderId) entry.senderId = value.senderId;
   if (typeof value.createdAt === 'string' && value.createdAt) entry.createdAt = value.createdAt;
   if (value.target !== undefined) {

@@ -14,7 +14,6 @@ async function loadSharp() {
   return sharpPromise;
 }
 
-export const IMAGE_ORIGINALS_PROMPT = '图片原文件已保存到工作区，文件清单中的图片序号与本条消息一致。图片内容块可能经过缩放或压缩；需要查看细节时可用工具读取原文件。';
 export const IMAGE_INPUT_FALLBACK_PROMPT = '部分图片未直接提供给模型，图片序号：{indexes}。原文件已保存，请使用可用工具读取或分析；不要假设自己已看到这些图片。';
 export const IMAGE_HOST_LIMIT_FALLBACK_PROMPT = '宿主拒绝了本次图片输入。原图已保存到工作区，请根据文件清单使用可用工具读取或分析，不要假设自己已看到图片。';
 
@@ -95,6 +94,7 @@ export async function modelImageFromOriginal(data, mediaType, maxBytes, {
   return null;
 }
 
+/** Emit image blocks in original order, adding a notice only when some originals cannot be sent directly. */
 export async function imageContentFromStaged(staged, limits, { signal, sharpLoader } = {}) {
   const content = [];
   const fileOnly = [];
@@ -107,11 +107,9 @@ export async function imageContentFromStaged(staged, limits, { signal, sharpLoad
       Math.min(limits.maxImageBytes, remaining), { signal, sharpLoader });
     if (!result) { fileOnly.push(index + 1); continue; }
     remaining -= result.data.length;
-    content.push({ type: 'text', text: t('图片 {index}（原图文件：{name}）', { index: index + 1, name: file.name }) },
-      { type: 'image', mediaType: result.mediaType, data: result.data.toString('base64'),
-        name: imageStorageName(file.name.replace(/\.[^.]+$/, ''), result.mediaType, index) });
+    content.push({ type: 'image', mediaType: result.mediaType, data: result.data.toString('base64'),
+      name: imageStorageName(file.name.replace(/\.[^.]+$/, ''), result.mediaType, index) });
   }
-  content.push({ type: 'text', text: t(IMAGE_ORIGINALS_PROMPT) });
   if (fileOnly.length) content.push({ type: 'text',
     text: t(IMAGE_INPUT_FALLBACK_PROMPT, { indexes: fileOnly.join(', ') }) });
   return content;

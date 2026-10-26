@@ -1,5 +1,8 @@
 import test from 'node:test';
 import { deepStrictEqual, match, ok, rejects } from 'node:assert';
+import { fetch as undiciFetch, MockAgent } from 'undici';
+
+import { createMatrixImageSource } from '../../../src/channels/matrix/matrix-image-input.mjs';
 
 import {
   MatrixApi,
@@ -57,7 +60,7 @@ test('address validators accept the protocol forms and reject the rest', () => {
   ok(!isMatrixEventId('abc'));
   const mediaUrl = mxcToMatrixMediaUrl(HOME, 'mxc://media.example.org/ABCDEF');
   deepStrictEqual(mediaUrl?.href,
-    'https://matrix.example.org/_matrix/media/v1/download/media.example.org/ABCDEF');
+    'https://matrix.example.org/_matrix/client/v1/media/download/media.example.org/ABCDEF');
   deepStrictEqual(mxcToMatrixMediaUrl(HOME, 'https://example.org/x.png'), null);
   deepStrictEqual(mxcToMatrixMediaUrl('not-a-url', 'mxc://a/b'), null);
 });
@@ -153,7 +156,7 @@ test('media uploads post raw bytes and must answer with a content URI', async ()
 test('media downloads stay on the configured homeserver and honor byte caps before buffering', async () => {
   const { api, calls } = apiWith((call) => {
     if (call.url.includes('/redirector/')) {
-      return new Response(null, { status: 302, headers: { location: '/_matrix/media/v1/download/media.example.org/OK' } });
+      return new Response(null, { status: 302, headers: { location: '/_matrix/client/v1/media/download/media.example.org/OK' } });
     }
     return new Response(new Uint8Array([1, 2, 3]), {
       status: 200,
@@ -161,7 +164,9 @@ test('media downloads stay on the configured homeserver and honor byte caps befo
     });
   });
   deepStrictEqual(Array.from(await api.downloadContent('mxc://media.example.org/OK')), [1, 2, 3]);
-  match(calls[0].url, /access_token=syt_secret/u);
+  deepStrictEqual(calls[0].url, `${HOME}/_matrix/client/v1/media/download/media.example.org/OK`);
+  deepStrictEqual(calls[0].headers.authorization, 'Bearer syt_secret');
+  deepStrictEqual(new URL(calls[0].url).search, '', 'bearer credentials never enter the media URL');
   const { api: foreign } = apiWith((call) => {
     if (call.url.includes('LEAKTEST')) {
       return new Response(null, { status: 302, headers: { location: 'https://evil.example.org/leak' } });
@@ -183,14 +188,16 @@ test('media downloads stay on the configured homeserver and honor byte caps befo
     (error) => error.code === 'too-large', 'the streaming cap holds even when the declared length lies');
   const { api: hopper, calls: hopCalls } = apiWith((call) => {
     if (call.url.includes('RELAY')) {
-      return new Response(null, { status: 302, headers: { location: '/_matrix/media/v1/download/media.example.org/FINAL' } });
+      return new Response(null, { status: 302, headers: { location: '/_matrix/client/v1/media/download/media.example.org/FINAL' } });
     }
     return new Response(new Uint8Array([7, 8]), { status: 200, headers: { 'content-length': '2' } });
   });
   deepStrictEqual(Array.from(await hopper.downloadContent('mxc://media.example.org/RELAY')), [7, 8],
-    'a same-host redirect is followed to its final payload');
+    'a same-origin redirect is followed to its final payload');
   deepStrictEqual(hopCalls.length, 2, 'the redirect hop and the final hop are both recorded');
-  ok(hopCalls[1].url.includes('/download/media.example.org/FINAL'), 'the token survives the same-host hop');
+  ok(hopCalls[1].url.includes('/download/media.example.org/FINAL'));
+  deepStrictEqual(hopCalls[1].headers.authorization, 'Bearer syt_secret', 'the bearer survives a same-origin hop');
+  deepStrictEqual(new URL(hopCalls[1].url).search, '', 'redirects do not put the token in the URL');
   const { api: runner } = apiWith((call, index) => index === 0
     ? new Response(null, { status: 302, headers: { location: 'https://elsewhere.example/away' } })
     : new Response(new Uint8Array([9]), { status: 200 }));
@@ -198,6 +205,80 @@ test('media downloads stay on the configured homeserver and honor byte caps befo
     (error) => error.code === 'matrix-invalid' && error.permanent,
     'redirects that leave the homeserver authority are refused');
 });
+
+function apiWithMockAgent(context) {
+  const agent = new MockAgent();
+  agent.disableNetConnect();
+  context.after(() => agent.close());
+  const { calls, fetchImpl } = recordingFetch((call) => {
+    const { url, ...init } = call;
+    return undiciFetch(url, { ...init, dispatcher: agent });
+  });
+  const api = new MatrixApi({ homeserver: HOME, accessToken: 'syt_secret', fetchImpl });
+  return { api, agent, calls, pool: agent.get(HOME) };
+}
+
+test('plaintext Matrix image loads through authenticated media when legacy routes return 404', async (context) => {
+  const { api, calls, pool } = apiWithMockAgent(context);
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  pool.intercept({ path: /^\/_matrix\/media\/v(?:1|3)\/download\//u, method: 'GET' })
+    .reply(404, { errcode: 'M_NOT_FOUND', error: 'Not found' }).persist();
+  pool.intercept({
+    path: '/_matrix/client/v1/media/download/media.example.org/PHOTO',
+    method: 'GET',
+    headers: { authorization: 'Bearer syt_secret' },
+  }).reply(200, jpeg, { headers: { 'content-type': 'image/jpeg', 'content-length': String(jpeg.length) } });
+  const source = createMatrixImageSource(api, {
+    msgtype: 'm.image', body: 'photo.jpg', url: 'mxc://media.example.org/PHOTO',
+    info: { mimetype: 'image/jpeg', size: jpeg.length },
+  }, { maxBytes: 1024 });
+  deepStrictEqual(await source.load(), jpeg);
+  deepStrictEqual(calls.length, 1, 'authenticated media succeeds without retrying a legacy route');
+  deepStrictEqual(calls[0].url, `${HOME}/_matrix/client/v1/media/download/media.example.org/PHOTO`);
+  deepStrictEqual(calls[0].headers.authorization, 'Bearer syt_secret');
+  deepStrictEqual(new URL(calls[0].url).search, '', 'access tokens must not appear in request URLs');
+});
+
+test('real Fetch follows a same-origin media redirect manually with bearer-only authentication', async (context) => {
+  const { api, calls, pool } = apiWithMockAgent(context);
+  const path = '/_matrix/client/v1/media/download/media.example.org';
+  pool.intercept({ path: `${path}/RELAY`, method: 'GET' })
+    .reply(302, '', { headers: { location: `${path}/FINAL` } });
+  pool.intercept({ path: `${path}/FINAL`, method: 'GET', headers: { authorization: 'Bearer syt_secret' } })
+    .reply(200, Buffer.from([7, 8]), { headers: { 'content-length': '2' } });
+  deepStrictEqual(Array.from(await api.downloadContent('mxc://media.example.org/RELAY')), [7, 8]);
+  deepStrictEqual(calls.length, 2, 'the API validates and issues each redirect hop itself');
+  deepStrictEqual(calls.map((call) => call.redirect), ['manual', 'manual']);
+  for (const call of calls) {
+    deepStrictEqual(call.headers.authorization, 'Bearer syt_secret');
+    deepStrictEqual(new URL(call.url).search, '');
+  }
+});
+
+for (const [name, destination] of [
+  ['different scheme', 'http://matrix.example.org/leak'],
+  ['foreign hostname', 'https://evil.example.org/leak'],
+  ['different port', 'https://matrix.example.org:8448/leak'],
+  ['URL username', 'https://user@matrix.example.org/leak'],
+  ['URL password', 'https://:password@matrix.example.org/leak'],
+]) {
+  test(`real Fetch refuses a media redirect to ${name} without sending credentials there`, async (context) => {
+    const { api, agent, calls, pool } = apiWithMockAgent(context);
+    let destinationRequests = 0;
+    pool.intercept({ path: '/_matrix/client/v1/media/download/media.example.org/RELAY', method: 'GET' })
+      .reply(302, '', { headers: { location: destination } });
+    agent.get(new URL(destination).origin).intercept({ path: '/leak', method: 'GET' }).reply(() => {
+      destinationRequests += 1;
+      return { statusCode: 200, data: Buffer.from([9]) };
+    });
+    await rejects(() => api.downloadContent('mxc://media.example.org/RELAY'),
+      (error) => error instanceof MatrixApiError && error.code === 'matrix-invalid' && error.permanent);
+    deepStrictEqual(destinationRequests, 0, 'the rejected redirect destination must never receive a request');
+    deepStrictEqual(calls.length, 1, 'only the configured homeserver receives the bearer');
+    deepStrictEqual(calls[0].headers.authorization, 'Bearer syt_secret');
+    deepStrictEqual(calls[0].redirect, 'manual');
+  });
+}
 
 test('password logins keep the server-assigned device identity and fail with typed codes', async () => {
   const { calls, fetchImpl } = recordingFetch(() =>

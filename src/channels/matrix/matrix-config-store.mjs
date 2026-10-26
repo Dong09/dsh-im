@@ -13,6 +13,8 @@ const E2EE_MODES = new Set(['off', 'optional', 'required']);
 const AUTO_JOIN_MODES = new Set(['authorized', 'all']);
 const MAX_MESSAGE_LENGTH_BOUNDS = Object.freeze({ min: 500, max: 65_535 });
 const MAX_MEDIA_BYTES_CEILING = 104_857_600;
+const IMAGE_ASSOCIATION_WINDOW_BOUNDS = Object.freeze({ min: 10_000, max: 86_400_000 });
+const IMAGE_HISTORY_LIMIT_BOUNDS = Object.freeze({ min: 1, max: 50_000 });
 const ROOM_CONTEXT_LIMIT_BOUNDS = Object.freeze({ min: 1, max: 500 });
 const ROOM_CONTEXT_CHARS_BOUNDS = Object.freeze({ min: 200, max: 200_000 });
 const ROOM_CONTEXT_TZ_BOUNDS = Object.freeze({ min: -840, max: 840 });
@@ -191,6 +193,8 @@ export class MatrixConfigStore {
     const autoJoinInvites = cleanString(value.autoJoinInvites) ?? 'authorized';
     const maxMessageLength = boundedInteger(value.maxMessageLength, MAX_MESSAGE_LENGTH_BOUNDS);
     const maxMediaBytes = boundedInteger(value.maxMediaBytes, { min: 1, max: MAX_MEDIA_BYTES_CEILING });
+    const imageAssociationWindowMs = boundedInteger(value.imageAssociationWindowMs, IMAGE_ASSOCIATION_WINDOW_BOUNDS);
+    const imageHistoryLimit = boundedInteger(value.imageHistoryLimit, IMAGE_HISTORY_LIMIT_BOUNDS);
     const allowedRooms = roomIdList(value.allowedRooms);
     const freeResponseRooms = roomIdList(value.freeResponseRooms);
     const ignoreUserPatterns = patternList(value.ignoreUserPatterns);
@@ -211,6 +215,7 @@ export class MatrixConfigStore {
     const autoSteerLimit = boundedInteger(value.autoSteerLimit, AUTO_STEER_LIMIT_BOUNDS);
     if (!E2EE_MODES.has(e2eeMode) || !AUTO_JOIN_MODES.has(autoJoinInvites)
       || maxMessageLength === null || maxMediaBytes === null
+      || imageAssociationWindowMs === null || imageHistoryLimit === null
       || allowedRooms === null || freeResponseRooms === null || ignoreUserPatterns === null
       || roomContextLimit === null || roomContextMaxChars === null
       || roomContextTzOffsetMinutes === null
@@ -244,6 +249,8 @@ export class MatrixConfigStore {
       ...(typeof value.reactions === 'boolean' ? { reactions: value.reactions } : {}),
       ...(maxMessageLength !== undefined ? { maxMessageLength } : {}),
       ...(maxMediaBytes !== undefined ? { maxMediaBytes } : {}),
+      ...(imageAssociationWindowMs !== undefined ? { imageAssociationWindowMs } : {}),
+      ...(imageHistoryLimit !== undefined ? { imageHistoryLimit } : {}),
       ...(allowedRooms !== undefined ? { allowedRooms: Object.freeze(allowedRooms) } : {}),
       ...(freeResponseRooms !== undefined ? { freeResponseRooms: Object.freeze(freeResponseRooms) } : {}),
       ...(ignoreUserPatterns !== undefined ? { ignoreUserPatterns: Object.freeze(ignoreUserPatterns) } : {}),
