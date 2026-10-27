@@ -1438,9 +1438,11 @@ export class HarnessClient {
   }
 
   /**
-   * 提交超时后的入库确认：session.history 是持久账本，按 promptRpcId 找回我们
-   * 的 user/message 即视为提交已成功，让 ask() 继续等回复而不是误报失败。
-   * 确认探测自身的失败一律吞掉——它们不能掩盖或改变原始提交超时的定性。
+   * 提交超时后的入库确认：session.history 是持久账本，按 promptRpcId 找回我们的
+   * 持久化痕迹（已执行的 user/message，或已入队待执行的 agent/inbox/spliced
+   * 回执）即视为提交已成功，让 ask() 继续等回复而不是误报失败。
+   * 确认探测自身的失败一律吞掉——它们不能掩盖或改变原始提交超时的定性；
+   * 唯独取消例外：取消原因必须优先于超时透出。
    */
   async #confirmPromptSubmit(sessionId, promptRpcId, { signal } = {}) {
     for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -1452,12 +1454,23 @@ export class HarnessClient {
         }, 30_000, { signal });
         const confirmed = (history?.events ?? []).some((entry) => {
           const event = entry?.event ?? entry;
-          return event?.type === 'user/message'
-            && event?.data?.source?.rpcId === promptRpcId;
+          if (event?.type === 'user/message') {
+            return event?.data?.source?.rpcId === promptRpcId;
+          }
+          // queue 模式下消息可能已持久入队但尚未产生 user/message：
+          // agent/inbox/spliced 的 inserted[].source.rpcId 就是入队回执。
+          if (event?.type === 'agent/inbox/spliced') {
+            return (event?.data?.inserted ?? [])
+              .some((message) => message?.source?.rpcId === promptRpcId);
+          }
+          return false;
         });
         if (confirmed) return true;
-      } catch {
-        // 账本探测失败不改变定性：本轮未确认，继续轮询或最终按原超时上报。
+      } catch (probeError) {
+        // 取消优先于超时定性：最后一次探测期间被取消时，循环后面没有
+        // sleep 再检查 abort，必须在这里把取消原因抛出，不能被超时覆盖。
+        if (signal?.aborted) throw signal.reason ?? probeError;
+        // 其余账本探测失败不改变定性：本轮未确认，继续轮询或最终按原超时上报。
       }
       if (attempt < 4) await sleep(2_000, signal);
     }

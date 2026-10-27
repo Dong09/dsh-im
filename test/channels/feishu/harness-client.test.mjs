@@ -722,6 +722,72 @@ test('HarnessClient confirms a timed-out prompt submit via session.history inste
   assert.equal(promptTimeouts, 1);
 });
 
+test('HarnessClient confirms a queued-but-not-started submit via agent/inbox/spliced', async () => {
+  const client = new HarnessClient({
+    baseUrl: 'http://127.0.0.1:3080',
+    workspace: '/tmp/dsh-feishu-workspace',
+  });
+  client.ensureRunning = async () => undefined;
+  let promptRpcId;
+  let promptTimeouts = 0;
+  let probeReads = 0;
+  client.rpc = async (method, _payload, _timeoutMs, options) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
+    if (method === 'session.history' && !promptRpcId) return { events: [] };
+    if (method === 'session.prompt') {
+      promptRpcId = options.rpcId;
+      promptTimeouts += 1;
+      throw new HarnessTransportError('harness-timeout', 'session.prompt');
+    }
+    probeReads += 1;
+    // 第一次探测：消息已持久入队（spliced 回执）但尚未开始执行——没有 user/message。
+    if (probeReads === 1) {
+      return {
+        events: [
+          { event: { type: 'turn/start', seq: 1, data: { turn: 1 } } },
+          {
+            event: {
+              type: 'agent/inbox/spliced',
+              seq: 2,
+              data: {
+                target: 'next-turn',
+                start: 0,
+                inserted: [{ source: { rpcId: promptRpcId }, content: [{ type: 'text', text: 'hello' }] }],
+              },
+            },
+          },
+        ],
+      };
+    }
+    return {
+      events: [
+        { event: { type: 'turn/start', seq: 3, data: { turn: 1 } } },
+        {
+          event: {
+            type: 'user/message',
+            seq: 4,
+            data: { turn: 1, source: { rpcId: promptRpcId } },
+          },
+        },
+        {
+          event: {
+            type: 'assistant/message',
+            seq: 5,
+            data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'done' }] } },
+          },
+        },
+        { event: { type: 'turn/end', seq: 6, data: { turn: 1, reason: { kind: 'completed' } } } },
+      ],
+    };
+  };
+
+  assert.equal(await client.ask('session-queued-submit-confirm', 'hello', {
+    onArtifact: async () => undefined,
+  }), 'done');
+  assert.equal(promptTimeouts, 1);
+  assert.equal(probeReads, 2);
+});
+
 test('HarnessClient stages inbound files, appends a neutral manifest, and cleans after turn end', async () => {
   const inboundSources = [{ name: '用户报告.bin', load: async () => Buffer.from('bytes') }];
   const ingressCalls = [];

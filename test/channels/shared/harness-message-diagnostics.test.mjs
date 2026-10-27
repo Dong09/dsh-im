@@ -212,6 +212,26 @@ test('a prompt-submit timeout stays a failure only after the durable ledger miss
   finally { setImHostLanguage('zh'); }
 });
 
+test('a cancellation during the final confirmation probe surfaces the cancel reason', async t => {
+  const tick = clock(t);
+  const controller = new AbortController();
+  const f = fixture({ native: true, fail(method) {
+    if (method === 'session.prompt') throw new HarnessTransportError('harness-timeout', 'session.prompt');
+    // requests.push 先于 fail：probe5 是第 6 次 session.history，进入前在这里取消。
+    if (method === 'session.history'
+      && f.requests.filter(request => request.method === 'session.history').length >= 6) {
+      controller.abort(new Error('cancelled during probe'));
+    }
+  } });
+  const pending = f.client.ask('session-cancelled-probe', 'hello', { signal: controller.signal }).catch(e => e);
+  await flush();
+  for (let attempt = 0; attempt < 5; attempt += 1) await tick(2_000);
+  const error = await pending;
+  // 取消原因优先于原始提交超时透出，不能被 harness-timeout 覆盖。
+  assert.equal(error.message, 'cancelled during probe');
+  assert.ok(!(error instanceof HarnessTransportError));
+});
+
 test('an accepted prompt with no progress retains reply timeout and deferred-delivery context', async t => {
   const tick = clock(t);
   const f = fixture({ native: true, complete: false });
