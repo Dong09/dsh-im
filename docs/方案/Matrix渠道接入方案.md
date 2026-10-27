@@ -1,7 +1,15 @@
 # Matrix 渠道接入方案
 
-日期：2026-09-18。代码基线：v4.20.2 / `82a880c`。状态：已实装，含 PR3 端到端加密接线——设备密钥注册、Megolm 房间密钥经对设备（to-device）消息共享/转发/请求、加密房间收发的解密与出站封装的最简闭环已落码并通过真机 WASM 环回测试；能力范围边界与后续增强见同目录《Matrix端到端加密可行性调研.md》。
-实装验证：Matrix 专属测试套件（六件测试文件，含 `matrix-crypto.test.mjs` 以 `@matrix-org/olm` WASM 真机加解密环回）全绿；全仓测试套件失败集与基线全同（皆为 Windows 环境旧恙，与 Matrix 无关）；client 与 host 双包构建成功；verify-package 文件与 RPC 标记、verify-interface-language 八项真实 HTTP、verify-lan-management 二十四项门检通过，含 Matrix 条目。
+当前主线：非加密房间的稳定收发与生命周期管理。CS API 直写方式、libolm WASM 加密编排、`e2eeMode` 默认值及现有设备与密钥状态均保留；未迁移 Matrix SDK，也未完成后续 E2EE 研究。加密能力仍为实验功能，仅有本地 WASM 环回与适配器自动化验证，未验证真实 homeserver／Element 互通。
+
+当前实现约束：
+
+- 附件的图片优先、明确失败后转文件策略由共享交付层独占；Matrix 原生 `sendImage`、`sendFile` 各只尝试一种事件类型。上传失败属于消息提交前失败；提交后出现网络、超时、5xx、无效 JSON 或缺失有效事件 ID 时，附件报告 `artifact-delivery-uncertain`，禁止改类型补发。429 保留 API 内同事务 ID 重试。
+- 文字、主动文字和附件返回真实 `providerMessageIds`；控制器不再用 `{ sent: true }` 丢弃回执。`deleteBot` 完整成功返回布尔值；部分清理失败抛出 `matrix-cleanup-failed`，保留聚合原因和 `removed` 标志。配置已移除不表示全部状态或凭据已清理。
+- 已知加密房间在没有可用加密引擎时拒绝明文发送，附件在上传前拒绝；引擎可用时保留现有加密路径。出站附件内容加密、设备验证与备份仍未实现，不构成完整端到端保密保证。
+- 暂时同步失败设置 `ready=false`、`connectionState=connecting`，保留当前可取消轮询；永久失败停止该轮询并交给共享 supervisor 重建。`totals.configured`、`totals.connected` 反映所有已配置机器人，不能以当前 runtime 数量代替配置总数。
+- 启动和停止各自单飞；停止先取消，再等待已接收的启动、同步、邀请、回复、原生发送及反应任务完成，然后释放 API／crypto 和刷新存储。共享 Bridge 仅在显式 `waitForIdle({ includeReactions: true })` 时等待反应尾任务，其他渠道默认行为不变。取消不等于服务端已提交事件被撤销。
+- 凭据快照、写入、回滚、配置保存和删除均在稳定 botId 的同一串行操作内完成。关闭禁止新操作，并等待已接收操作及其资源清理；密码检查可能创建服务端登录会话，本地取消或回滚不保证撤销远端登录。回滚失败暂停自动连接，须检查存储并重新接入。停止失败时不删除仍可能被使用的凭据或密钥状态；成功停止后，各项清理均尝试并报告实际结果。
 
 需求来源：Matrix 协议（去中心化、可联邦、可选端到端加密）的自建 homeserver 与社区服务器用户提出的接入诉求；dsh-im 现内置十一个 IM 渠道，无 Matrix 适配器。前置调研为 hermes-agent（NousResearch/hermes-agent）Matrix 适配器的全属性技术分析，本文全部数值常量、漏斗次序与坑账均可溯源至该仓库 `plugins/platforms/matrix/adapter.py` 及周边文件（见 §17）。
 
@@ -22,7 +30,7 @@
 
 ### 2.1 必须实现
 
-1. 凭据接入：homeserver + access token（主路径）；homeserver + 用户 ID + 密码（登录后持久化返回的 access token 与 device_id）。
+1. 凭据接入：homeserver + access token，或 homeserver + 用户 ID + 密码；密码检查与运行时登录复用 `performMatrixPasswordLogin`，保留现有密码凭据模式，不自动改成 token-only。
 2. 收信：`m.text`/`m.notice`/`m.image`/`m.audio`/`m.video`/`m.file` 入站，去重、防回环、白名单、@提及判定、合批、时钟偏移探测。
 3. 房间邀请：授权邀请人门控、非阻塞 join、死房婉拒、`m.direct` 私聊登记、每次全量 sync 后对账补漏。
 4. 发送：纯文本 + HTML 富文本双份、@提及 pill 注入、回复引用/线程/编辑/表情反应关系事件、流式编辑、分片自管。
@@ -48,7 +56,8 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `matrix-api.mjs` | CS API 客户端：`whoami`、`login`、`sync`、room send/state、`join`/`leave`、media upload/download、receipt、typing、redact、account-data、`query_keys`、presence。每请求带超时与错误三分类 `permanent`/`transient`/`rate-limited`，429 读 `retry_after_ms` |
+| `matrix-identifiers.mjs` | 用户、房间、实际投递房间及事件 ID 的纯校验；API 保留原校验导出，Host 主动投递与建议复用同一规则 |
+| `matrix-api.mjs` | CS API 客户端；共享密码登录函数 `performMatrixPasswordLogin`；请求超时、结构化错误与同事务 429 重试 |
 | `matrix-controller.mjs` | 控制器：沿用 `TokenBotController` 生命周期契约，connect/disconnect/重连、sync 循环状态机、诊断摘要（`getDiagnostics` 同构，凭据脱敏输出） |
 | `matrix-runtime.mjs` | 入站漏斗调度、出站发送调度、流式编辑节流、合批窗口、表情反应生命周期任务表 |
 | `matrix-bridge.mjs` | 对接种入 `MessageEvent` 归一化、回复引用、@提及剥、命令规范化、审批交互 |
@@ -108,10 +117,10 @@
 1. 建连会话：代理经 session 级 `proxy=`（undici 侧等价物），无代理时尊重 `HTTP(S)_PROXY` 环境变量。
 2. token 路径：`GET /whoami` 验证并解析 user_id/device_id；token 绑定的实际设备与配置 `deviceId` 冲突时服务端实际设备优先并大声告警（token 只能为其设备上传密钥，冒名身份即陈旧密钥故障根源）；设备解析不到则 `POST /keys/query` 以 `[]` 兜底，恰一个设备自动采用，零设备置未验证旗跳过服务端密钥校验。
 3. 密码路径：`POST /login`（`identifier`、`password`、`device_name`、可选 `device_id`），回读 `device_id` 与 `access_token` 持久化复用。
-4. 首帧：`sync(timeout=10000, full_state=true)` 建立已加入房间集、`next_batch` 持久化进 state store、刷新 DM 缓存、对离线期间排队的 to-device 事件先行 dispatch、对账待处理邀请。
-5. 增量：长轮询 `timeout=30000`，外层 45 s 总限时防连接悬挂；`m_unknown_token` 或 401/403/forbidden 族判永久错误，停环并上报控制器断开原因；其余异常 5 s 定退避续环；每轮尾让出被调度的邀请 join 任务。
-6. 429 限流：读 `retry_after_ms` 精确退避（hermes 缺此处理，为 dsh-im 后发优势项）。
-7. `disconnect`：撤 sync 任务、邀请 join 任务、reaction 撤回任务、媒体上传中的会话，crypto store 收口持久化（PR3）。
+4. 首帧：无 `since` 的 `sync(timeout=0)` 建立房间与 DM 状态，先处理 to-device 事件，再处理时间线与邀请；异步续点检查连接代际与取消信号，持久化 `next_batch` 前拒绝过期连接。
+5. 增量：长轮询传入运行时取消信号；暂时错误展示为未就绪／连接中，5 s 可取消等待后在原循环继续，成功后清除该连接错误，不覆盖图片状态写入等其他未恢复诊断。永久错误停止循环；共享 supervisor 才能重建连接。
+6. 429 限流：按 `retry_after_ms` 等待，并复用同一事务 ID，避免事件重发。
+7. `stop`：撤销新工作接收，取消并等待启动、sync、邀请、Bridge 工作、原生发送和 reaction 任务，随后停止 crypto 并完成存储写入；不使用固定等待时间假定工作已经结束。控制器 `close` 等待同一关闭任务，关闭期间不允许延迟返回的工厂再启动连接。
 
 ## 6. 入站漏斗
 
@@ -149,7 +158,7 @@
 3. 关系：回复引用 `m.in_reply_to`；线程 `m.thread`（含回退为回复的 fallback `is_falling_back`）；编辑 `m.replace` + `m.new_relation`（`m.new_content` + `"* "` 前缀新旧兼容）；表情反应 `m.annotation`。
 4. 流式编辑：复用 `editable-message-stream`；Matrix 特例不带光标（部分客户端光标显豆腐块），保留 buffer_only 渐进；编辑间隔 + 字符阈值双触发；flood 自适应退避倍增封顶 10 s；连 3 strike 废编辑改纯发送。
 5. 分片自管：`maxMessageLength` 16000 自管分片，声明渠道自管分片，投递层不再二次截断（对齐 hermes #53026：4000 会把 Markdown 表格拦腰折断）。
-6. 媒体仓储上传：media upload 端点；图片 `m.image` 不纳则回退 `m.file`（与结果文件"图片优先、文件回退"同一语义）；文件 `m.file`（结果文件回传同一通道）；音频 `m.audio` + MSC3245 `voice` 旗标仅在具备判定依据时标注。
+6. 媒体仓储上传：共享交付策略尝试 `m.image`，明确失败时最多再尝试一次 `m.file`；Matrix 原生发送不再增加第二层回退。事件提交结果未知时不发送新的文件事件；所有成功结果透传服务端事件 ID。
 7. 外链媒体下载具备 SSRF 防护：scheme 白名单、连接时 IP 校验、逐跳重定向复检、跳数上限 20、Content-Length 预检与分块累计上限；下载失败的回退提示文本不含 URL 凭据（防外泄）。
 8. 输入提示：typing 通知（`PUT /typing`）；已读回执；presence 上线/离线附 status message。
 
