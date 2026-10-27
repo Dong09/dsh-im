@@ -100,6 +100,12 @@ const FAILURE_MESSAGES = Object.freeze({
     '回复发送结果未能确认。请先检查聊天内是否已经收到，不要立即重复提交。',
   CHANNEL_DELIVERY:
     '回复已经生成，但当前渠道暂时无法发送。请稍后重试。',
+  // Matrix reports its own outcome codes: an unknown room send must not invite a blind retry,
+  // and a refused encrypted-room plaintext send needs the room choice, not a generic resend.
+  MATRIX_DELIVERY_UNCERTAIN:
+    'Matrix 消息发送结果无法确认；请先检查房间记录，确认未收到后再重试。',
+  MATRIX_ENCRYPTION_UNAVAILABLE:
+    'Matrix 加密能力不可用，已拒绝明文发送。请恢复加密能力，或改用非加密房间。',
   INPUT_INVALID:
     '当前消息包含无法处理的图片或文件。请调整后重新发送。',
   REQUEST_TIMEOUT:
@@ -178,6 +184,8 @@ function failureCode(error, details) {
     || ['channel-rate-limit', 'rate-limited', 'artifact-rate-limited'].includes(code)) {
     return 'CHANNEL_RATE_LIMIT';
   }
+  if (code === 'matrix-delivery-uncertain') return 'MATRIX_DELIVERY_UNCERTAIN';
+  if (code === 'matrix-encryption-unavailable') return 'MATRIX_ENCRYPTION_UNAVAILABLE';
   if (['channel-delivery-uncertain', 'delivery-uncertain', 'artifact-delivery-uncertain']
     .includes(code) || error?.deliveryOutcome === 'unknown') {
     return 'CHANNEL_DELIVERY_UNCERTAIN';

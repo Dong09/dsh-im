@@ -13,6 +13,25 @@ function safeError(code, message) {
   return Object.freeze({ code, message });
 }
 
+function operationError(code, message, cause) {
+  const error = new Error(message, cause ? { cause } : undefined);
+  error.code = code;
+  return error;
+}
+
+function cleanupFailures(results, stages) {
+  return results.flatMap((result, index) => {
+    if (result.status === 'fulfilled') return [];
+    const error = new Error(`Matrix cleanup failed at ${stages[index]}`, { cause: result.reason });
+    error.stage = stages[index];
+    return [error];
+  });
+}
+
+function runtimeConnected(state) {
+  return state?.ready === true && state.connectionState === 'connected' && state.harnessReachable !== false;
+}
+
 export class MatrixController {
   #credentials;
   #configStore;
@@ -25,6 +44,9 @@ export class MatrixController {
   #transitions = new Map();
   #revision = 0;
   #closed = false;
+  #closeTask = null;
+  #runtimeStops = new Map();
+  #inspectionController = new AbortController();
 
   constructor({
     credentials,
@@ -53,31 +75,39 @@ export class MatrixController {
     this.#logger = logger;
   }
 
+  #assertOpen() {
+    if (this.#closed) throw operationError('matrix-controller-closed', t('Matrix 控制器已关闭，请重新启用插件后再操作。'));
+  }
+
+  #requiresRebind(botId) {
+    return ['matrix-bind-rollback-failed', 'matrix-cleanup-failed'].includes(this.#errors.get(botId)?.code);
+  }
+
   async initialize() {
     if (this.#closed) return this.status();
-    for (const config of this.#configStore.list()) {
-      await this.#withBotTransition(config.botId, async () => {
-        if (this.#closed || this.#runtimes.get(config.botId)?.status?.ready) return;
-        const resolved = await this.#resolveCredentials(config);
-        if (!resolved) {
-          this.#errors.set(config.botId, safeError(
-            'missing-token',
-            t('Matrix机器人凭据缺失，请移除后重新接入。'),
-          ));
-          return;
-        }
+    for (const { botId } of this.#configStore.list()) {
+      if (this.#closed) break;
+      await this.#withBotTransition(botId, async () => {
+        if (this.#closed || this.#requiresRebind(botId)) return;
+        const config = this.#configStore.get(botId);
+        if (!config) return;
+        const state = this.#runtimes.get(botId)?.status;
+        if (!this.#errors.has(botId) && (runtimeConnected(state) || state?.connectionState === 'connecting')) return;
         try {
+          await this.#stopRuntime(botId);
+          if (this.#closed) return;
+          const resolved = await this.#resolveCredentials(config);
+          if (this.#closed) return;
+          if (!resolved) {
+            this.#errors.set(botId, safeError('missing-token', t('Matrix机器人凭据缺失，请移除后重新接入。')));
+            return;
+          }
           await this.#startRuntime(config, resolved);
-          this.#errors.delete(config.botId);
+          this.#errors.delete(botId);
         } catch (error) {
-          this.#errors.set(config.botId, safeError(
-            'connection-failed',
-            error?.message ?? t('Matrix 连接未就绪，插件会自动重试。'),
-          ));
-          this.#logger.warn?.(
-            `[dsh-im:matrix] bot ${config.botId} failed to initialize:`,
-            error,
-          );
+          if (this.#closed) return;
+          this.#errors.set(botId, safeError(error.code ?? 'connection-failed', error?.message ?? t('Matrix 连接未就绪，插件会自动重试。')));
+          this.#logger.warn?.(`[dsh-im:matrix] bot ${botId} failed to initialize:`, error);
         } finally {
           this.#touch();
         }
@@ -87,7 +117,7 @@ export class MatrixController {
   }
 
   async bindCredentials({ homeserver, accessToken, userId, password } = {}) {
-    if (this.#closed) throw new Error('Matrix controller is closed');
+    this.#assertOpen();
     const base = validateMatrixHomeserver(homeserver);
     const token = cleanString(accessToken);
     const identifier = cleanString(userId);
@@ -112,7 +142,7 @@ export class MatrixController {
       ...(token ? { accessToken: token } : {}),
       ...(identifier ? { userId: identifier } : {}),
       ...(secret ? { password: secret } : {}),
-    });
+    }, { signal: this.#inspectionController.signal });
     const platformId = cleanString(inspected?.platformId);
     const resolvedUserId = cleanString(inspected?.userId);
     const name = cleanString(inspected?.name);
@@ -120,59 +150,71 @@ export class MatrixController {
       throw new Error('Matrix homeserver returned an incomplete bot identity');
     }
     const derived = deriveMatrixBotIdentity({ homeserver: base, userId: resolvedUserId });
-    const existing = this.#configStore.getByPlatformId(platformId);
-    if (existing && existing.botId !== derived.botId) {
-      throw new Error('This Matrix bot belongs to another Harness installation');
-    }
-    const previous = this.#configStore.get(derived.botId);
-    const previousRefs = await Promise.all([
-      this.#credentials.resolve(derived.tokenRef).catch(() => undefined),
-      this.#credentials.resolve(derived.passwordRef).catch(() => undefined),
-    ]);
-    try {
-      if (token) await this.#credentials.set(derived.tokenRef, token);
-      else await this.#credentials.unset(derived.tokenRef);
-      if (secret) await this.#credentials.set(derived.passwordRef, secret);
-      else await this.#credentials.unset(derived.passwordRef);
-      await this.#configStore.save({
-        botId: derived.botId,
-        platformId,
-        homeserver: base,
-        userId: resolvedUserId,
-        ...(cleanString(inspected?.deviceId) ? { deviceId: cleanString(inspected.deviceId) } : {}),
-        tokenRef: derived.tokenRef,
-        passwordRef: derived.passwordRef,
-        name,
-        username: cleanString(inspected?.username),
-        createdAt: previous?.createdAt ?? new Date().toISOString(),
-        connectedAt: previous?.connectedAt ?? null,
-      });
-    } catch (error) {
-      await Promise.all([
-        this.#restoreCredential(derived.tokenRef, previousRefs[0]),
-        this.#restoreCredential(derived.passwordRef, previousRefs[1]),
-      ]).catch(() => undefined);
-      if (!previous) await this.#configStore.remove(derived.botId).catch(() => undefined);
-      throw error;
-    }
-    await this.#withBotTransition(derived.botId, async () => {
-      await this.#stopRuntime(derived.botId);
-      const config = this.#configStore.get(derived.botId);
-      if (!config) return;
-      const resolved = await this.#resolveCredentials(config);
-      if (!resolved) return;
-      await this.#startRuntime(config, resolved);
-      this.#errors.delete(derived.botId);
+    return await this.#withBotTransition(derived.botId, async () => {
+      this.#assertOpen();
+      const existing = this.#configStore.getByPlatformId(platformId);
+      if (existing && existing.botId !== derived.botId) throw new Error('This Matrix bot belongs to another Harness installation');
+      const previous = this.#configStore.get(derived.botId);
+      const previousRefs = await Promise.all([
+        this.#readCredential(derived.tokenRef), this.#readCredential(derived.passwordRef),
+      ]);
+      this.#assertOpen();
+      try {
+        if (token) await this.#credentials.set(derived.tokenRef, token);
+        else await this.#credentials.unset(derived.tokenRef);
+        if (secret) await this.#credentials.set(derived.passwordRef, secret);
+        else await this.#credentials.unset(derived.passwordRef);
+        await this.#configStore.save({
+          ...previous,
+          botId: derived.botId, platformId, homeserver: base, userId: resolvedUserId,
+          ...(cleanString(inspected?.deviceId) ? { deviceId: cleanString(inspected.deviceId) } : {}),
+          tokenRef: derived.tokenRef, passwordRef: derived.passwordRef, name,
+          username: cleanString(inspected?.username),
+          createdAt: previous?.createdAt ?? new Date().toISOString(), connectedAt: previous?.connectedAt ?? null,
+        });
+      } catch (cause) {
+        const results = await Promise.allSettled([
+          this.#restoreCredential(derived.tokenRef, previousRefs[0]),
+          this.#restoreCredential(derived.passwordRef, previousRefs[1]),
+          previous ? this.#configStore.save(previous) : this.#configStore.remove(derived.botId),
+        ]);
+        const failures = cleanupFailures(results, ['access-token-rollback', 'password-rollback', 'config-rollback']);
+        if (failures.length) {
+          try { await this.#stopRuntime(derived.botId); }
+          catch (error) { failures.push(error); }
+          const error = operationError('matrix-bind-rollback-failed',
+            t('Matrix 凭据或配置回滚失败，已暂停自动连接。请检查凭据存储并重新接入，勿直接重试连接。'),
+            new AggregateError([cause, ...failures], 'Matrix binding rollback failed'));
+          this.#errors.set(derived.botId, safeError(error.code, error.message));
+          this.#touch();
+          throw error;
+        }
+        throw cause;
+      }
+      try {
+        this.#assertOpen();
+        const config = this.#configStore.get(derived.botId);
+        const resolved = await this.#resolveCredentials(config);
+        if (!resolved) throw new Error(t('Matrix机器人凭据缺失，请重新输入凭据。'));
+        await this.#startRuntime(config, resolved);
+        this.#errors.delete(derived.botId);
+        return this.#publicBot(config);
+      } catch (error) {
+        if (!this.#closed) this.#errors.set(derived.botId, safeError(error.code ?? 'connection-failed', error.message));
+        throw error;
+      } finally {
+        this.#touch();
+      }
     });
-    this.#touch();
-    return this.#publicBot(this.#configStore.get(derived.botId));
   }
 
   async reconnectBot(botId, { sendTest = false } = {}) {
     this.#requireId(botId);
     if (this.#closed) return this.status();
     return await this.#withBotTransition(botId, async () => {
+      if (this.#closed) return this.status();
       await this.#stopRuntime(botId);
+      if (this.#closed || this.#requiresRebind(botId)) return this.status();
       const config = this.#configStore.get(botId);
       if (!config) return this.status();
       const resolved = await this.#resolveCredentials(config);
@@ -202,9 +244,10 @@ export class MatrixController {
   }
 
   async sendConnectionTest(botId) {
+    this.#assertOpen();
     this.#requireId(botId);
     const runtime = this.#runtimes.get(botId);
-    if (!runtime?.status?.ready) throw new Error('Matrix bot is not connected');
+    if (this.#errors.has(botId) || !runtime?.status?.ready) throw new Error('Matrix bot is not connected');
     const config = this.#configStore.get(botId);
     const masked = maskMatrixBotId(config?.platformId ?? botId);
     const name = cleanString(runtime.status?.name) ?? cleanString(config?.name) ?? masked;
@@ -215,39 +258,64 @@ export class MatrixController {
   }
 
   async sendProactiveText(botId, target, text, options = {}) {
+    this.#assertOpen();
     this.#requireId(botId);
     const runtime = this.#runtimes.get(botId);
-    if (!runtime?.status?.ready || typeof runtime.sendProactiveText !== 'function') {
+    if (this.#errors.has(botId) || !runtime?.status?.ready || typeof runtime.sendProactiveText !== 'function') {
       throw new Error('Matrix bot is not connected for proactive delivery');
     }
-    await runtime.sendProactiveText(target, String(text ?? ''), options);
-    return { sent: true };
+    return await runtime.sendProactiveText(target, String(text ?? ''), options);
   }
 
   async presentSessionSyncApproval(botId, target, interaction, options = {}) {
+    this.#assertOpen();
     this.#requireId(botId);
     const runtime = this.#runtimes.get(botId);
-    if (!runtime?.status?.ready || typeof runtime.presentSessionSyncApproval !== 'function') {
+    if (this.#errors.has(botId) || !runtime?.status?.ready || typeof runtime.presentSessionSyncApproval !== 'function') {
       throw new Error('Matrix bot is not connected for proactive delivery');
     }
     return runtime.presentSessionSyncApproval(target, interaction, options);
   }
 
   async deleteBot(botId) {
+    this.#assertOpen();
     this.#requireId(botId);
-    const removed = await this.#withBotTransition(botId, async () => {
+    return await this.#withBotTransition(botId, async () => {
+      this.#assertOpen();
       const config = this.#configStore.get(botId);
-      await this.#stopRuntime(botId);
-      await this.#deleteState({ botId, config: config ?? {} }).catch(() => undefined);
-      await Promise.all([
-        this.#credentials.unset(`DSH_MATRIX_TOKEN_${botId.slice(7).toUpperCase()}`),
-        this.#credentials.unset(`DSH_MATRIX_PASSWORD_${botId.slice(7).toUpperCase()}`),
-      ]).catch(() => undefined);
-      return this.#configStore.remove(botId);
+      try { await this.#stopRuntime(botId); }
+      catch (cause) {
+        const error = operationError('matrix-cleanup-failed',
+          t('Matrix 连接未能停止，未执行配置、凭据和状态删除。请检查日志后重试。'),
+          new AggregateError([cause], 'Matrix stop prerequisite failed'));
+        error.removed = false;
+        this.#errors.set(botId, safeError(error.code, error.message));
+        this.#touch();
+        throw error;
+      }
+      const suffix = botId.slice(7).toUpperCase();
+      const results = await Promise.allSettled([
+        this.#deleteState({ botId, config: config ?? {} }),
+        this.#credentials.unset(`DSH_MATRIX_TOKEN_${suffix}`),
+        this.#credentials.unset(`DSH_MATRIX_PASSWORD_${suffix}`),
+      ]);
+      const failures = cleanupFailures(results, ['state', 'access-token', 'password']);
+      let removed = false;
+      try { removed = Boolean(await this.#configStore.remove(botId)); }
+      catch (error) { failures.push(error); }
+      this.#touch();
+      if (failures.length) {
+        const error = operationError('matrix-cleanup-failed', removed
+          ? t('Matrix 配置已移除，但部分状态或凭据未清理。请检查日志并清理残留后再接入。')
+          : t('Matrix 清理未完成，请检查日志并确认配置、状态和凭据的残留情况。'),
+        new AggregateError(failures, 'Matrix deletion cleanup failed'));
+        error.removed = removed;
+        this.#errors.set(botId, safeError(error.code, error.message));
+        throw error;
+      }
+      this.#errors.delete(botId);
+      return removed;
     });
-    this.#errors.delete(botId);
-    this.#touch();
-    return removed;
   }
 
   status() {
@@ -259,9 +327,7 @@ export class MatrixController {
       // them here so a connected bot is reported as connected instead of falling
       // back to the offline defaults, matching the other token channels.
       const hasError = Boolean(this.#errors.get(config.botId));
-      const connected = state?.ready === true
-        && state?.connectionState === 'connected'
-        && state?.harnessReachable !== false;
+      const connected = !this.#closed && !hasError && runtimeConnected(state);
       const botState = connected ? 'connected'
         : state?.connectionState === 'connecting' ? 'connecting'
           : hasError || state?.connectionState === 'failed' ? 'error' : 'offline';
@@ -274,8 +340,8 @@ export class MatrixController {
           idMasked: maskMatrixBotId(config.platformId),
         },
         idMasked: maskMatrixBotId(config.platformId),
-        ready: Boolean(state?.ready),
-        connectionState: state?.connectionState ?? (hasError ? 'failed' : 'idle'),
+        ready: connected,
+        connectionState: this.#closed ? 'idle' : hasError ? 'failed' : state?.connectionState ?? 'idle',
         harnessReachable: state ? state.harnessReachable !== false : false,
         connected,
         state: botState,
@@ -300,17 +366,19 @@ export class MatrixController {
         lastMessageError: publicMessageFailure(state?.lastMessageError) ?? null,
       };
     });
-    const ready = bots.filter((bot) => bot.ready).length;
+    const ready = bots.filter((bot) => bot.connected).length;
+    const allConnected = bots.length > 0 && ready === bots.length;
     return {
       revision: this.#revision,
-      ready: this.#runtimes.size > 0 && ready === this.#runtimes.size,
+      ready: allConnected,
       totals: {
+        configured: bots.length, connected: ready,
         bots: bots.length,
         ready,
         failed: bots.filter((bot) => bot.connectionState === 'failed').length,
       },
       summary: {
-        healthy: this.#runtimes.size > 0 && ready === this.#runtimes.size
+        healthy: allConnected
           ? t('Matrix 长轮询接收和 Harness 回复全部正常。')
           : ready === 0 && bots.length > 0
             ? t('Matrix 长轮询尚未建立，请检查 homeserver 与凭据。')
@@ -322,59 +390,94 @@ export class MatrixController {
     };
   }
 
-  async close() {
-    if (this.#closed) return;
+  /** Revoke admission and await all accepted transitions and their owned runtime cleanup. */
+  close() {
+    if (this.#closeTask) return this.#closeTask;
     this.#closed = true;
-    await Promise.all([...this.#runtimes.keys()].map((botId) => this.#stopRuntime(botId)));
-    this.#runtimes.clear();
-    this.#transitions.clear();
+    this.#inspectionController.abort(new DOMException('Matrix controller closed', 'AbortError'));
+    const stopping = [...this.#runtimes.keys()].map((botId) => this.#stopRuntime(botId));
+    this.#closeTask = this.#finishClose(stopping);
+    return this.#closeTask;
+  }
+
+  async #finishClose(stopping) {
+    await Promise.allSettled([...stopping, ...this.#transitions.values()]);
+    while (this.#transitions.size) await Promise.allSettled([...this.#transitions.values()]);
+    const results = await Promise.allSettled([...this.#runtimeStops.values()]);
+    const failures = cleanupFailures(results, results.map(() => 'runtime-stop'));
     this.#touch();
+    if (failures.length) {
+      throw operationError('matrix-cleanup-failed', t('Matrix 连接资源未能完整释放，请检查日志后重启插件。'),
+        new AggregateError(failures, 'Matrix controller shutdown failed'));
+    }
+    this.#runtimes.clear();
+    this.#runtimeStops.clear();
   }
 
   async #startRuntime(config, resolved) {
+    this.#assertOpen();
     await this.#stopRuntime(config.botId);
+    this.#assertOpen();
     const runtime = await this.#createRuntime({
-      botId: config.botId,
-      config,
-      homeserver: config.homeserver,
-      userId: config.userId,
-      ...resolved,
+      botId: config.botId, config, homeserver: config.homeserver, userId: config.userId, ...resolved,
     });
     this.#runtimes.set(config.botId, runtime);
     try {
+      this.#assertOpen();
       await runtime.start();
+      this.#assertOpen();
+      if (!runtime.status?.ready && runtime.status?.connectionState !== 'connecting') {
+        throw new Error('Matrix connection is not ready');
+      }
+      return runtime;
     } catch (error) {
-      await this.#stopRuntime(config.botId);
+      try { await this.#stopRuntime(config.botId); }
+      catch (cleanupError) {
+        throw operationError('matrix-cleanup-failed', t('Matrix 连接资源未能完整释放，请检查日志后重启插件。'),
+          new AggregateError([error, cleanupError], 'Matrix startup cleanup failed'));
+      }
       throw error;
     }
-    if (!runtime.status?.ready) {
-      await this.#stopRuntime(config.botId);
-      throw new Error('Matrix connection is not ready');
-    }
-    return runtime;
   }
 
-  async #stopRuntime(botId) {
+  #stopRuntime(botId) {
     const previous = this.#runtimes.get(botId);
-    this.#runtimes.delete(botId);
-    try {
-      await previous?.stop?.();
-    } catch (error) {
-      this.#logger.warn?.(`[dsh-im:matrix] bot ${botId} stopped with an error:`, error);
+    if (!previous) return Promise.resolve();
+    const pending = this.#runtimeStops.get(previous);
+    if (pending) return pending;
+    const task = (async () => {
+      try { await previous.stop?.(); }
+      catch (error) {
+        this.#errors.set(botId, safeError('matrix-runtime-stop-failed', error.message));
+        this.#logger.warn?.(`[dsh-im:matrix] bot ${botId} stopped with an error:`, error);
+        throw error;
+      }
+      if (this.#runtimes.get(botId) === previous) this.#runtimes.delete(botId);
+    })();
+    this.#runtimeStops.set(previous, task);
+    const forget = () => { if (!this.#closed) this.#runtimeStops.delete(previous); };
+    void task.then(forget, forget);
+    return task;
+  }
+
+  async #readCredential(ref) {
+    try { return await this.#credentials.resolve(ref); }
+    catch (cause) {
+      throw operationError('matrix-credentials-unavailable', t('Matrix 凭据读取失败，请检查凭据存储后重试。'), cause);
     }
   }
 
   async #resolveCredentials(config) {
-    const token = cleanString((await this.#credentials.resolve(config.tokenRef).catch(() => undefined))?.value);
+    const token = cleanString((await this.#readCredential(config.tokenRef))?.value);
     if (token) return { accessToken: token };
-    const password = cleanString((await this.#credentials.resolve(config.passwordRef).catch(() => undefined))?.value);
+    const password = cleanString((await this.#readCredential(config.passwordRef))?.value);
     if (password && config.userId) return { password, userId: config.userId };
     return null;
   }
 
   async #restoreCredential(ref, previous) {
-    if (previous?.value) await this.#credentials.set(ref, previous.value).catch(() => undefined);
-    else await this.#credentials.unset(ref).catch(() => undefined);
+    if (previous?.value) await this.#credentials.set(ref, previous.value);
+    else await this.#credentials.unset(ref);
   }
 
   #requireId(botId) {
@@ -398,6 +501,7 @@ export class MatrixController {
   }
 
   #withBotTransition(botId, operation) {
+    this.#assertOpen();
     const previous = this.#transitions.get(botId) ?? Promise.resolve();
     const current = previous.catch(() => undefined).then(operation);
     const settled = current.finally(() => {

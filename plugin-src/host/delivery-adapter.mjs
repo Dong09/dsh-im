@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isMatrixEventId, isMatrixRoomTargetId, isMatrixUserId } from '../../src/channels/matrix/matrix-identifiers.mjs';
 import {
   deliverySuggestionsFromSessions,
   privateConversationKeyMatchesTarget,
@@ -148,13 +149,13 @@ function normalizeRoute(channel, kind, route) {
         route,
         kind === 'room' ? ['roomId'] : kind === 'thread' ? ['roomId', 'threadId'] : ['userId'],
       );
-      if (kind === 'dm' && !/^@[^:\s]+:[^\s:]+(?::\d{1,5})?$/u.test(normalized.userId)) {
+      if (kind === 'dm' && !isMatrixUserId(normalized.userId)) {
         throw invalidTarget('route.userId must be a Matrix user id');
       }
-      if (kind !== 'dm' && !/^[!][^:$\s]+:[^\s:$]+(?::\d{1,5})?$/.test(normalized.roomId)) {
+      if (kind !== 'dm' && !isMatrixRoomTargetId(normalized.roomId)) {
         throw invalidTarget('route.roomId must be a Matrix room id');
       }
-      if (kind === 'thread' && !/^\$[^\s]+/.test(normalized.threadId)) {
+      if (kind === 'thread' && !isMatrixEventId(normalized.threadId)) {
         throw invalidTarget('route.threadId must be a Matrix event id');
       }
       return normalized;

@@ -83,13 +83,20 @@ function fakeApi(log, remoteEvents, media, faults) {
   let syncCalls = 0;
   const api = {
     whoami: async () => ({ user_id: BOT, device_id: 'IMAGE_TEST_DEVICE' }),
-    sync: async () => {
+    sync: async ({ signal } = {}) => {
+      signal?.throwIfAborted();
       const call = ++syncCalls;
       if (call === 1) return { next_batch: 'initial', rooms: { join: {} } };
       const pending = Promise.withResolvers();
+      const onAbort = () => pending.reject(signal.reason);
       poll = pending;
+      signal?.addEventListener('abort', onAbort, { once: true });
       log.push({ op: 'sync-ready', api, call });
-      return pending.promise;
+      try { return await pending.promise; }
+      finally {
+        signal?.removeEventListener('abort', onAbort);
+        if (poll === pending) poll = null;
+      }
     },
     async push(roomId, events) {
       await log.wait((entry) => entry.op === 'sync-ready' && entry.api === api && entry.call === syncCalls, 'an outstanding sync request');

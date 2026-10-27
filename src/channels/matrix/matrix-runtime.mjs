@@ -46,7 +46,6 @@ import { renderContextEntries } from '../shared/conversation/context-builder.mjs
 import { TRIGGER_REPLY_MODES } from '../shared/conversation/trigger-policy.mjs';
 import { chunkMarkdownParts } from '../shared/markdown-chunks.mjs';
 
-const RECONNECT_DELAYS_MS = Object.freeze([1_000, 3_000, 5_000, 10_000, 30_000]);
 const SYNC_LONG_POLL_MS = 30_000;
 const SYNC_RETRY_DELAY_MS = 5_000;
 const INVITE_JOIN_TIMEOUT_MS = 45_000;
@@ -183,7 +182,13 @@ export class MatrixRuntime {
   #replyTimeoutMs;
   #api = null;
   #bridge = null;
-  #approvalController = new AbortController();
+  #lifecycleController = null;
+  #startTask = null;
+  #stopTask = null;
+  #syncError = null;
+  #preSyncError = null;
+  #outboundTasks = new Set();
+  #eventTasks = new Set();
   #botUserId = null;
   #deviceId = null;
   #crypto = null;
@@ -193,8 +198,6 @@ export class MatrixRuntime {
   #started = false;
   #stopped = true;
   #syncTask = null;
-  #reconnectTimer = null;
-  #reconnectIndex = 0;
   #inviteTasks = new Map();
   #clock = new ClockSkewGuard({});
   #ring = new EventDedupeRing(1_000);
@@ -379,118 +382,186 @@ export class MatrixRuntime {
     return this.#status;
   }
 
-  async start() {
-    if (this.#started && this.#status.ready) return;
-    this.#stopped = false;
-    this.#approvalController = new AbortController();
-    this.#started = true;
-    const generation = ++this.#generation;
-    const homeserver = this.#config.homeserver;
-    let accessToken = this.#auth.accessToken ?? null;
-    let resolvedUserId = 'userId' in this.#auth ? this.#auth.userId : cleanString(this.#config.userId);
-    let resolvedDeviceId = cleanString(this.#config.deviceId);
-    if (!accessToken) {
-      const session = await performMatrixPasswordLogin({
-        homeserver,
-        userId: resolvedUserId,
-        password: this.#auth.password,
-        ...(resolvedDeviceId ? { deviceId: resolvedDeviceId } : {}),
-      });
-      accessToken = session.accessToken;
-      resolvedUserId = session.userId;
-      if (session.deviceId && resolvedDeviceId && session.deviceId !== resolvedDeviceId) {
-        this.#logger.warn?.(t('Matrix 配置的 device_id 与服务端实际设备不一致，以服务端设备为准。'));
-      }
-      resolvedDeviceId = session.deviceId ?? resolvedDeviceId;
+  #assertCurrentGeneration(generation, signal) {
+    signal?.throwIfAborted();
+    if (this.#stopped || generation !== this.#generation) {
+      throw new DOMException('Matrix connection was superseded', 'AbortError');
     }
-    const api = this.#createApi({ homeserver, accessToken, userId: resolvedUserId });
-    const identity = await api.whoami();
-    const verifiedUserId = cleanString(identity?.user_id) ?? resolvedUserId;
-    const verifiedDeviceId = cleanString(identity?.device_id);
-    if (!verifiedUserId) throw new Error('Matrix whoami returned no user id');
-    if (resolvedUserId && verifiedUserId.toLowerCase() !== resolvedUserId.toLowerCase()) {
-      this.#logger.warn?.(
-        t('Matrix whoami 返回的用户 {verified} 与配置的用户 {configured} 不一致，以 whoami 结果为准。'),
-        { verified: verifiedUserId, configured: resolvedUserId },
-      );
-    }
-    if (verifiedDeviceId && resolvedDeviceId && verifiedDeviceId !== resolvedDeviceId) {
-      this.#logger.warn?.(
-        t('Matrix 配置的 device_id {configured} 与令牌绑定设备 {verified} 不一致，令牌仅能为其设备共享密钥，以令牌设备为准。'),
-        { configured: resolvedDeviceId, verified: verifiedDeviceId },
-      );
-    }
-    this.#api = api;
-    this.#botUserId = verifiedUserId;
-    this.#deviceId = verifiedDeviceId ?? resolvedDeviceId;
-    await this.#startCrypto(api, verifiedUserId, this.#deviceId);
-    if (generation !== this.#generation) return;
-    this.#clock = new ClockSkewGuard({});
-    this.#ring.seed(this.#state.snapshot?.()?.seenMessageIds ?? []);
-    this.#bridge = new MatrixHarnessBridge({
-      descriptor: { ...MATRIX_DESCRIPTOR, reactions: this.#config.reactions ? MATRIX_DESCRIPTOR.reactions : {} },
-      bot: this.#createBotClient(),
-      harness: this.#harness,
-      state: this.#state,
-      contextEnhancement: this.#contextEnhancement,
-      accessPolicy: this.#accessPolicy,
-      status: this.#status,
-      logger: this.#logger,
-      replyTimeoutMs: this.#replyTimeoutMs,
-      autoSteerSameSender: this.#autoSteerSameSender,
-      autoSteerLimit: this.#autoSteerLimit,
-      coalesceWindowMs: this.#coalesceWindowMs,
-      // The binding table and the /new anchor reset serve the trigger policy and the
-      // `auto` thread router, not only the context collectors, so those modes wire the
-      // hooks even when every structured-context collector stays off.
-      contextHooks: this.#imageInbox || this.#structuredContextActive() || this.#triggerOnReply === 'bot-only' || this.#threadsMode === 'auto'
-        ? this.#createContextHooks()
-        : null,
-    });
-    await this.#initialSync();
-    if (generation !== this.#generation) return;
-    this.#status.ready = true;
-    this.#status.connectionState = 'connected';
-    this.#status.harnessReachable = true;
-    this.#status.lastConnectedAt = new Date().toISOString();
-    this.#status.lastCheckedAt = this.#status.lastConnectedAt;
-    this.#status.lastError = null;
-    this.#status.startedAt ??= this.#status.lastConnectedAt;
-    this.#status.e2eeActive = this.#e2eeActive;
-    this.#reconnectIndex = 0;
-    this.#syncTask = Promise.resolve().then(() => this.#syncLoop(generation));
   }
 
-  async stop() {
-    if (this.#stopped) return;
+  #trackTask(tasks, task) {
+    tasks.add(task);
+    void task.then(() => tasks.delete(task), () => tasks.delete(task));
+    return task;
+  }
+
+  #sendOptions(options = {}) {
+    const parent = this.#lifecycleController?.signal;
+    const signal = parent && options.signal ? AbortSignal.any([parent, options.signal]) : parent ?? options.signal;
+    signal?.throwIfAborted();
+    return signal ? { ...options, signal } : options;
+  }
+
+  start() {
+    if (this.#stopTask) return Promise.reject(new DOMException('Matrix is stopping', 'AbortError'));
+    if (this.#startTask) return this.#startTask;
+    if (this.#started && ['connected', 'connecting'].includes(this.#status.connectionState)) return Promise.resolve();
+    if (this.#api || this.#crypto || this.#bridge) return this.stop().then(() => this.start());
+    this.#stopped = false;
+    this.#started = true;
+    this.#lifecycleController = new AbortController();
+    this.#syncError = null;
+    this.#preSyncError = null;
+    const generation = ++this.#generation;
+    const signal = this.#lifecycleController.signal;
+    Object.assign(this.#status, { ready: false, connectionState: 'connecting', harnessReachable: false, lastError: null });
+    const task = this.#startConnection(generation, signal);
+    this.#startTask = task;
+    const clear = () => { if (this.#startTask === task) this.#startTask = null; };
+    void task.then(clear, clear);
+    return task;
+  }
+
+  async #startConnection(generation, signal) {
+    try {
+      const homeserver = this.#config.homeserver;
+      let accessToken = this.#auth.accessToken ?? null;
+      let resolvedUserId = 'userId' in this.#auth ? this.#auth.userId : cleanString(this.#config.userId);
+      let resolvedDeviceId = cleanString(this.#config.deviceId);
+      if (!accessToken) {
+        const session = await performMatrixPasswordLogin({
+          homeserver, userId: resolvedUserId, password: this.#auth.password,
+          ...(resolvedDeviceId ? { deviceId: resolvedDeviceId } : {}),
+        }, { signal });
+        this.#assertCurrentGeneration(generation, signal);
+        accessToken = session.accessToken;
+        resolvedUserId = session.userId;
+        if (session.deviceId && resolvedDeviceId && session.deviceId !== resolvedDeviceId) {
+          this.#logger.warn?.(t('Matrix 配置的 device_id 与服务端实际设备不一致，以服务端设备为准。'));
+        }
+        resolvedDeviceId = session.deviceId ?? resolvedDeviceId;
+      }
+      this.#assertCurrentGeneration(generation, signal);
+      const api = this.#createApi({ homeserver, accessToken, userId: resolvedUserId });
+      const identity = await api.whoami({ signal });
+      this.#assertCurrentGeneration(generation, signal);
+      const verifiedUserId = cleanString(identity?.user_id) ?? resolvedUserId;
+      const verifiedDeviceId = cleanString(identity?.device_id);
+      if (!verifiedUserId) throw new Error('Matrix whoami returned no user id');
+      if (resolvedUserId && verifiedUserId.toLowerCase() !== resolvedUserId.toLowerCase()) {
+        this.#logger.warn?.(
+          t('Matrix whoami 返回的用户 {verified} 与配置的用户 {configured} 不一致，以 whoami 结果为准。'),
+          { verified: verifiedUserId, configured: resolvedUserId },
+        );
+      }
+      if (verifiedDeviceId && resolvedDeviceId && verifiedDeviceId !== resolvedDeviceId) {
+        this.#logger.warn?.(
+          t('Matrix 配置的 device_id {configured} 与令牌绑定设备 {verified} 不一致，令牌仅能为其设备共享密钥，以令牌设备为准。'),
+          { configured: resolvedDeviceId, verified: verifiedDeviceId },
+        );
+      }
+      this.#api = api;
+      this.#botUserId = verifiedUserId;
+      this.#deviceId = verifiedDeviceId ?? resolvedDeviceId;
+      await this.#startCrypto(api, verifiedUserId, this.#deviceId, generation, signal);
+      this.#assertCurrentGeneration(generation, signal);
+      this.#clock = new ClockSkewGuard({});
+      this.#ring.seed(this.#state.snapshot?.()?.seenMessageIds ?? []);
+      this.#bridge = new MatrixHarnessBridge({
+        descriptor: { ...MATRIX_DESCRIPTOR, reactions: this.#config.reactions ? MATRIX_DESCRIPTOR.reactions : {} },
+        bot: this.#createBotClient(), harness: this.#harness, state: this.#state,
+        contextEnhancement: this.#contextEnhancement, accessPolicy: this.#accessPolicy,
+        status: this.#status, logger: this.#logger, replyTimeoutMs: this.#replyTimeoutMs,
+        signal,
+        autoSteerSameSender: this.#autoSteerSameSender, autoSteerLimit: this.#autoSteerLimit,
+        coalesceWindowMs: this.#coalesceWindowMs,
+        contextHooks: this.#imageInbox || this.#structuredContextActive() || this.#triggerOnReply === 'bot-only' || this.#threadsMode === 'auto'
+          ? this.#createContextHooks() : null,
+      });
+      await this.#initialSync(generation, signal);
+      this.#assertCurrentGeneration(generation, signal);
+      this.#markConnected();
+      this.#status.startedAt ??= this.#status.lastConnectedAt;
+      this.#status.e2eeActive = this.#e2eeActive;
+      this.#syncTask = Promise.resolve().then(() => this.#syncLoop(generation, signal));
+    } catch (error) {
+      if (!this.#stopped && generation === this.#generation) {
+        this.#stopped = true;
+        this.#started = false;
+        this.#lifecycleController.abort(error);
+        Object.assign(this.#status, { ready: false, connectionState: 'failed', harnessReachable: false, lastError: safeErrorInfo(error) });
+        await this.#releaseConnectionResources();
+      }
+      throw error;
+    }
+  }
+
+  #markConnected() {
+    if (this.#syncError && this.#status.lastError === this.#syncError) this.#status.lastError = this.#preSyncError;
+    this.#syncError = null;
+    this.#preSyncError = null;
+    const reconnecting = this.#status.connectionState !== 'connected';
+    Object.assign(this.#status, {
+      ready: true, connectionState: 'connected', harnessReachable: true,
+      lastCheckedAt: new Date().toISOString(),
+    });
+    if (reconnecting) this.#status.lastConnectedAt = this.#status.lastCheckedAt;
+  }
+
+  stop() {
+    if (this.#stopTask) return this.#stopTask;
+    if (this.#stopped && !this.#startTask && !this.#api && !this.#crypto && !this.#bridge) return Promise.resolve();
     this.#stopped = true;
-    this.#approvalController.abort();
     this.#started = false;
     this.#generation += 1;
-    if (this.#reconnectTimer !== null) clearTimeout(this.#reconnectTimer);
-    this.#reconnectTimer = null;
-    for (const task of this.#inviteTasks.values()) task.abort?.();
-    this.#inviteTasks.clear();
-    const bridge = this.#bridge;
-    this.#bridge = null;
-    const crypto = this.#crypto;
+    this.#status.ready = false;
+    this.#status.harnessReachable = false;
+    this.#status.e2eeActive = false;
+    this.#lifecycleController?.abort(new DOMException('Matrix runtime stopped', 'AbortError'));
+    for (const entry of this.#inviteTasks.values()) entry.controller.abort();
+    const task = this.#stopConnection();
+    this.#stopTask = task;
+    const clear = () => { if (this.#stopTask === task) this.#stopTask = null; };
+    void task.then(clear, clear);
+    return task;
+  }
+
+  async #stopConnection() {
+    try {
+      await Promise.allSettled([this.#startTask, this.#syncTask]);
+      await this.#releaseConnectionResources();
+      this.#status.connectionState = 'idle';
+    } catch (error) {
+      this.#status.connectionState = 'failed';
+      this.#status.lastError = safeErrorInfo(error);
+      this.#logger.warn?.('[dsh-im:matrix] connection cleanup failed:', error);
+      throw error;
+    }
+  }
+
+  async #releaseConnectionResources() {
+    while (this.#inviteTasks.size || this.#eventTasks.size || this.#outboundTasks.size) {
+      await Promise.allSettled([
+        ...[...this.#inviteTasks.values()].map((entry) => entry.task),
+        ...this.#eventTasks, ...this.#outboundTasks,
+      ]);
+    }
+    await this.#bridge?.waitForIdle({ includeReactions: true });
+    await this.#crypto?.stop?.();
     this.#crypto = null;
     this.#e2eeActive = false;
     this.#status.e2eeActive = false;
+    await this.#roomHistory?.flush?.();
+    await this.#imageInbox?.flush?.();
+    this.#bridge = null;
     this.#api = null;
-    await Promise.race([
-      bridge?.waitForIdle() ?? Promise.resolve(),
-      new Promise((resolve) => setTimeout(resolve, 2_000).unref?.()),
-    ]);
-    await crypto?.stop?.().catch(() => undefined);
-    this.#status.ready = false;
-    this.#status.connectionState = 'idle';
+    this.#syncTask = null;
   }
 
-  async sendConnectionTest(text) {
+  sendConnectionTest(text) {
     const bridge = this.#bridge;
-    if (!bridge) throw new Error('Matrix bot is not connected');
-    return await bridge.sendConnectionTest(text);
+    if (this.#stopped || !bridge) return Promise.reject(new Error('Matrix bot is not connected'));
+    return this.#trackTask(this.#outboundTasks, bridge.sendConnectionTest(text));
   }
 
   async presentSessionSyncApproval(target, interaction, options = {}) {
@@ -501,12 +572,16 @@ export class MatrixRuntime {
       key: options.key.startsWith('dm:') ? `direct:${options.key}` : options.key,
       actor, validate: options.validate,
       send: (text) => this.sendProactiveText(target, text),
-    }, { ...options, runtimeSignal: this.#approvalController.signal });
+    }, { ...options, runtimeSignal: this.#lifecycleController.signal });
   }
 
-  async sendProactiveText(target, text, options = {}) {
-    const api = this.#api;
-    if (!api) throw new Error('Matrix bot is not connected');
+  sendProactiveText(target, text, options = {}) {
+    if (this.#stopped || !this.#status.ready || !this.#api) return Promise.reject(new Error('Matrix bot is not connected'));
+    return this.#trackTask(this.#outboundTasks, this.#sendProactiveText(target, text, options));
+  }
+
+  async #sendProactiveText(target, text, options) {
+    options = this.#sendOptions(options);
     const normalized = normalizeMatrixDeliveryTarget(target ?? {});
     if (normalized.error) {
       const error = new Error(`Matrix delivery target is invalid: ${normalized.error}`);
@@ -516,16 +591,14 @@ export class MatrixRuntime {
     const route = normalized.value;
     if (route.kind === 'dm') {
       const roomId = await this.#resolveDmRoom(route.userId, options);
-      await this.#sendRoomText({ roomId, threadId: null }, text, options);
-      return { sent: true };
+      return await this.#sendRoomText({ roomId, threadId: null }, text, options);
     }
-    await this.#sendRoomText({ roomId: route.roomId, threadId: route.threadId ?? null }, text, options);
-    return { sent: true };
+    return await this.#sendRoomText({ roomId: route.roomId, threadId: route.threadId ?? null }, text, options);
   }
 
   // ---- 端到端加密 ----
 
-  async #startCrypto(api, userId, deviceId) {
+  async #startCrypto(api, userId, deviceId, generation, signal) {
     this.#crypto = null;
     this.#e2eeActive = false;
     this.#status.cryptoStats = null;
@@ -542,6 +615,7 @@ export class MatrixRuntime {
     let engine = null;
     try {
       await this.#cryptoStore.load();
+      this.#assertCurrentGeneration(generation, signal);
       engine = this.#createCrypto({
         api,
         store: this.#cryptoStore,
@@ -549,18 +623,23 @@ export class MatrixRuntime {
         deviceId,
         logger: this.#logger,
       });
-      engine.setPendingMessageHandler((roomId, event) => this.#handleTimelineEvent(roomId, event));
+      engine.setPendingMessageHandler((roomId, event) => {
+        if (signal.aborted || generation !== this.#generation || this.#stopped) return Promise.resolve();
+        return this.#trackTask(this.#eventTasks, this.#handleTimelineEvent(roomId, event, generation, signal));
+      });
       await engine.start();
+      this.#assertCurrentGeneration(generation, signal);
       this.#crypto = engine;
       this.#e2eeActive = true;
       this.#status.cryptoStats = summarizeCryptoStats(engine.getStats());
       this.#logger.info?.(t('Matrix 端到端加密引擎已就绪，设备密钥与一次性密钥已注册。'));
     } catch (error) {
+      await engine?.stop?.();
+      this.#assertCurrentGeneration(generation, signal);
       this.#e2eeActive = false;
       this.#crypto = null;
       this.#status.cryptoStats = null;
       this.#status.lastCryptoError = safeErrorInfo(error);
-      await engine?.stop?.().catch(() => undefined);
       if (this.#config.e2eeMode === 'required') {
         const reason = String(error?.message ?? error).replaceAll(/mxc:\/\/[^\s]+/g, 'mxc://…').slice(0, 300);
         throw new Error(t('端到端加密模式为 required，但加密引擎启动失败，已拒绝建立加密连接：{reason}', { reason }));
@@ -569,16 +648,19 @@ export class MatrixRuntime {
     }
   }
 
-  async #dispatchToDeviceEvents(events) {
+  async #dispatchToDeviceEvents(events, generation, signal) {
+    this.#assertCurrentGeneration(generation, signal);
     if (!this.#crypto || !Array.isArray(events)) return;
     await this.#crypto.handleToDeviceEvents(events).catch(() => undefined);
+    this.#assertCurrentGeneration(generation, signal);
   }
 
   // ---- 连接与 sync 循环 ----
 
-  async #initialSync() {
+  async #initialSync(generation, signal) {
     const api = this.#api;
-    const initial = await api.sync({ timeout: 0 });
+    const initial = await api.sync({ timeout: 0, signal });
+    this.#assertCurrentGeneration(generation, signal);
     const rooms = initial?.rooms ?? {};
     for (const roomId of Object.keys(rooms.join ?? {})) {
       if (!isMatrixRoomId(roomId)) continue;
@@ -587,7 +669,8 @@ export class MatrixRuntime {
         if (event?.type === 'm.room.encryption') this.#encryptedRooms.add(roomId);
       }
     }
-    const direct = await api.getAccountData('m.direct').catch(() => null);
+    const direct = await api.getAccountData('m.direct', { signal }).catch(() => null);
+    this.#assertCurrentGeneration(generation, signal);
     for (const list of Object.values(direct ?? {})) {
       if (!Array.isArray(list)) continue;
       for (const roomId of list) if (isMatrixRoomId(roomId)) this.#dmRooms.add(roomId);
@@ -601,10 +684,11 @@ export class MatrixRuntime {
       this.#scheduleInviteJoin(roomId, inviteSenderOf(room), inviteMarksDirect(room));
     }
     // Queued to-device room keys land before the offline timeline replay so queued ciphertext can decrypt on first sight.
-    await this.#dispatchToDeviceEvents(initial?.to_device?.events);
+    await this.#dispatchToDeviceEvents(initial?.to_device?.events, generation, signal);
     for (const [roomId, room] of Object.entries(rooms.join ?? {})) {
-      for (const event of timelineEventsOf(room)) await this.#handleTimelineEvent(roomId, event);
+      for (const event of timelineEventsOf(room)) await this.#handleTimelineEvent(roomId, event, generation, signal);
     }
+    this.#assertCurrentGeneration(generation, signal);
     if (typeof initial?.next_batch === 'string' && initial.next_batch) {
       this.#lastBatch = initial.next_batch;
       await this.#sidecar.apply({
@@ -613,62 +697,54 @@ export class MatrixRuntime {
         dmRooms: [...this.#dmRooms],
       });
     }
+    this.#assertCurrentGeneration(generation, signal);
     this.#status.joinedRooms = this.#joinedRooms.size;
     this.#status.encryptedRoomsSeen = this.#encryptedRooms.size;
   }
 
-  async #syncLoop(generation) {
-    while (!this.#stopped && generation === this.#generation && this.#api) {
+  async #syncLoop(generation, signal) {
+    while (!this.#stopped && generation === this.#generation && !signal.aborted) {
       try {
-        const data = await this.#api.sync({
-          since: this.#lastBatch ?? undefined,
-          timeout: SYNC_LONG_POLL_MS,
-        });
-        if (generation !== this.#generation || this.#stopped) return;
-        await this.#handleSyncData(data);
+        const data = await this.#api.sync({ since: this.#lastBatch ?? undefined, timeout: SYNC_LONG_POLL_MS, signal });
+        this.#assertCurrentGeneration(generation, signal);
+        await this.#handleSyncData(data, generation, signal);
+        this.#assertCurrentGeneration(generation, signal);
         if (this.#crypto) {
           await this.#crypto.maintain?.().catch(() => undefined);
+          this.#assertCurrentGeneration(generation, signal);
           this.#status.cryptoStats = summarizeCryptoStats(this.#crypto.getStats());
         }
-        this.#status.lastCheckedAt = new Date().toISOString();
-        this.#reconnectIndex = 0;
+        this.#markConnected();
       } catch (error) {
-        if (generation !== this.#generation || this.#stopped) return;
-        const permanent = error instanceof MatrixApiError
-          ? error.permanent
-          : /m_unknown_token|unauthorized|forbidden/i.test(String(error?.message ?? ''));
+        if (signal.aborted || generation !== this.#generation || this.#stopped) return;
+        const permanent = error instanceof MatrixApiError && error.permanent;
+        if (!this.#syncError || this.#status.lastError !== this.#syncError) this.#preSyncError = this.#status.lastError;
+        this.#syncError = safeErrorInfo(error);
+        Object.assign(this.#status, {
+          ready: false, connectionState: permanent ? 'failed' : 'connecting', harnessReachable: false,
+          lastCheckedAt: new Date().toISOString(), lastError: this.#syncError,
+        });
         if (permanent) {
-          this.#status.connectionState = 'failed';
-          this.#status.harnessReachable = false;
-          this.#status.lastError = safeErrorInfo(error);
-          this.#logger.warn?.('[dsh-im:matrix] sync loop stopped on a permanent auth error; reconnecting', error);
-          this.#scheduleReconnect(generation);
+          this.#logger.warn?.('[dsh-im:matrix] sync loop stopped on a permanent auth error; the supervisor will retry', error);
           return;
         }
         this.#logger.warn?.('[dsh-im:matrix] sync loop error; retrying', error);
-        await new Promise((resolve) => setTimeout(resolve, SYNC_RETRY_DELAY_MS).unref?.());
+        await new Promise((resolve) => {
+          const finish = () => { clearTimeout(timer); signal.removeEventListener('abort', finish); resolve(); };
+          const timer = setTimeout(finish, SYNC_RETRY_DELAY_MS);
+          timer.unref?.();
+          signal.addEventListener('abort', finish, { once: true });
+          if (signal.aborted) finish();
+        });
       }
     }
   }
 
-  #scheduleReconnect(generation) {
-    if (this.#stopped || generation !== this.#generation || this.#reconnectTimer !== null) return;
-    const delayMs = RECONNECT_DELAYS_MS[Math.min(this.#reconnectIndex, RECONNECT_DELAYS_MS.length - 1)];
-    this.#reconnectIndex += 1;
-    this.#reconnectTimer = setTimeout(() => {
-      this.#reconnectTimer = null;
-      if (this.#stopped || generation !== this.#generation) return;
-      this.#status.connectionState = 'connecting';
-      void this.start().catch((error) => {
-        this.#logger.warn?.('[dsh-im:matrix] reconnect attempt failed; the supervisor will retry', error);
-      });
-    }, delayMs);
-    this.#reconnectTimer.unref?.();
-  }
-
-  async #handleSyncData(data) {
+  async #handleSyncData(data, generation, signal) {
+    this.#assertCurrentGeneration(generation, signal);
     const rooms = data?.rooms ?? {};
-    await this.#dispatchToDeviceEvents(data?.to_device?.events);
+    await this.#dispatchToDeviceEvents(data?.to_device?.events, generation, signal);
+    this.#assertCurrentGeneration(generation, signal);
     let joinedChanged = false;
     for (const [roomId, room] of Object.entries(rooms.join ?? {})) {
       if (!isMatrixRoomId(roomId)) continue;
@@ -681,29 +757,33 @@ export class MatrixRuntime {
         // A membership change invalidates the shared-device set so the next send re-shares the room key.
         else if (event?.type === 'm.room.member' && event?.state_key && this.#crypto) this.#crypto.invalidateRoomSharing(roomId);
       }
-      for (const event of timelineEventsOf(room)) await this.#handleTimelineEvent(roomId, event);
+      for (const event of timelineEventsOf(room)) await this.#handleTimelineEvent(roomId, event, generation, signal);
     }
     for (const [roomId, room] of Object.entries(rooms.invite ?? {})) {
       if (!isMatrixRoomId(roomId)) continue;
       this.#scheduleInviteJoin(roomId, inviteSenderOf(room), inviteMarksDirect(room));
     }
+    this.#assertCurrentGeneration(generation, signal);
     if (typeof data?.next_batch === 'string' && data.next_batch) {
       this.#lastBatch = data.next_batch;
       await this.#sidecar.apply({
         nextBatch: data.next_batch,
         ...(joinedChanged ? { joinedRooms: [...this.#joinedRooms] } : {}),
       });
+      this.#assertCurrentGeneration(generation, signal);
       this.#status.joinedRooms = this.#joinedRooms.size;
       this.#status.encryptedRoomsSeen = this.#encryptedRooms.size;
     }
   }
 
-  async #handleTimelineEvent(roomId, event) {
+  async #handleTimelineEvent(roomId, event, generation, signal) {
+    this.#assertCurrentGeneration(generation, signal);
     if (event?.type === 'm.room.encrypted') {
       this.#noteEncryptedRoom(roomId);
       if (!this.#crypto) return;
       if (typeof event?.event_id !== 'string' || !event.event_id) return;
       const decrypted = await this.#crypto.decryptRoomEvent(roomId, event).catch(() => null);
+      this.#assertCurrentGeneration(generation, signal);
       if (!decrypted || typeof decrypted.content !== 'object' || decrypted.content === null) return;
       event = { ...event, type: 'm.room.message', content: decrypted.content };
     }
@@ -748,6 +828,7 @@ export class MatrixRuntime {
         || outcome.drop === 'reply-to-human'
         || outcome.drop === 'reply-target-unknown') {
         await this.#recordImageReference(roomId, event);
+        this.#assertCurrentGeneration(generation, signal);
         this.#recordRoomAmbient(roomId, event);
       }
       else if (outcome.drop === 'self') this.#recordRoomBotReply(roomId, event);
@@ -786,12 +867,14 @@ export class MatrixRuntime {
       }
     }
     await this.#recordImageReference(roomId, event);
+    this.#assertCurrentGeneration(generation, signal);
     await this.#associateImages(message, event);
+    this.#assertCurrentGeneration(generation, signal);
     void Promise.resolve(this.#bridge?.accept(message)).catch((error) => {
       this.#logger.warn?.('[dsh-im:matrix] inbound message handling failed:', error?.message ?? error);
     });
     if (message.addressed) {
-      void this.#api?.setTyping(message.roomId, { typing: true, timeoutMs: 20_000 }).catch(() => undefined);
+      void this.#sendRoomTyping(message.roomId);
     }
   }
 
@@ -863,7 +946,7 @@ export class MatrixRuntime {
         message.images = [this.#referencedImageSource(message, reference)];
       } else if (typeof this.#api?.getEvent === 'function') {
         try {
-          const resolved = await this.#readImageEvent(this.#api, this.#crypto, message.roomId, message.replyToEventId);
+          const resolved = await this.#readImageEvent(this.#api, this.#crypto, message.roomId, message.replyToEventId, this.#sendOptions());
           if (resolved.content?.msgtype === 'm.image') {
             const selected = { eventId: message.replyToEventId, senderId: resolved.sender,
               name: typeof resolved.content.body === 'string' ? resolved.content.body : 'image' };
@@ -973,7 +1056,9 @@ export class MatrixRuntime {
     const cacheKey = `${roomId}|${eventId}`;
     const cached = this.#contextEvents.get(cacheKey);
     if (cached !== undefined) return cached;
-    const event = await this.#api.getEvent(roomId, eventId).catch(() => null);
+    const options = this.#sendOptions();
+    const event = await this.#api.getEvent(roomId, eventId, options).catch(() => null);
+    options.signal?.throwIfAborted();
     let resolved = null;
     if (event && typeof event.content === 'object' && event.content !== null) {
       let content = event.content;
@@ -1393,31 +1478,40 @@ export class MatrixRuntime {
     }
     if (this.#inviteTasks.has(roomId)) return;
     const controller = new AbortController();
-    this.#inviteTasks.set(roomId, controller);
-    void this.#joinInvitedRoom(roomId, inviter, controller, marksDirect).finally(() => {
-      this.#inviteTasks.delete(roomId);
+    const generation = this.#generation;
+    const entry = { controller, task: null };
+    this.#inviteTasks.set(roomId, entry);
+    entry.task = this.#joinInvitedRoom(roomId, inviter, controller, marksDirect, generation).finally(() => {
+      if (this.#inviteTasks.get(roomId) === entry) this.#inviteTasks.delete(roomId);
     });
+    void entry.task.catch((error) => this.#logger.warn?.('[dsh-im:matrix] invite task failed:', error));
   }
 
-  async #joinInvitedRoom(roomId, inviter, controller, marksDirect = false) {
-    const timeout = AbortSignal.timeout(INVITE_JOIN_TIMEOUT_MS);
-    const signal = AbortSignal.any([controller.signal, timeout]);
+  async #joinInvitedRoom(roomId, inviter, controller, marksDirect, generation) {
+    const parent = this.#lifecycleController.signal;
+    const signal = AbortSignal.any([parent, controller.signal, AbortSignal.timeout(INVITE_JOIN_TIMEOUT_MS)]);
     try {
       await this.#api.joinRoom(roomId, { signal });
+      this.#assertCurrentGeneration(generation, signal);
       this.#joinedRooms.add(roomId);
       this.#status.joinedRooms = this.#joinedRooms.size;
       await this.#sidecar.apply({ joinedRooms: [...this.#joinedRooms] });
-      if (inviter) await this.#recordDmRoom(roomId, inviter, marksDirect);
+      this.#assertCurrentGeneration(generation, signal);
+      if (inviter) await this.#recordDmRoom(roomId, inviter, marksDirect, generation, signal);
+      this.#assertCurrentGeneration(generation, signal);
       this.#logger.info?.(t('Matrix 已按授权邀请加入房间 {room}。'), { room: roomId });
     } catch (error) {
+      if (parent.aborted || generation !== this.#generation || this.#stopped) return;
       const text = String(error?.message ?? '').toLowerCase();
       if (DEAD_ROOM_MARKERS.some((marker) => text.includes(marker))) {
         try {
-          await this.#api.leaveRoom(roomId, { signal: AbortSignal.timeout(10_000) });
+          await this.#api.leaveRoom(roomId, { signal: AbortSignal.any([parent, AbortSignal.timeout(10_000)]) });
+          this.#assertCurrentGeneration(generation, parent);
           await this.#sidecar.apply({ declinedRooms: [...this.#sidecar.declinedRooms(), roomId] });
+          this.#assertCurrentGeneration(generation, parent);
           this.#logger.info?.(t('Matrix 已婉拒失效房间的遗留邀请 {room}。'), { room: roomId });
-        } catch {
-          // A dead-room decline is best effort; a later sync reconciles again.
+        } catch (declineError) {
+          if (!parent.aborted) this.#logger.warn?.('[dsh-im:matrix] dead-room decline failed; sync will reconcile again:', declineError);
         }
         return;
       }
@@ -1427,13 +1521,15 @@ export class MatrixRuntime {
 
   // The inviter's cached room stays usable for outbound routing either way; only an authoritative
 // is_direct invite registers the room as a direct chat for inbound handling.
-  async #recordDmRoom(roomId, inviter, marksDirect = false) {
-    const direct = await this.#api.getAccountData('m.direct').catch(() => null);
+  async #recordDmRoom(roomId, inviter, marksDirect, generation, signal) {
+    const direct = await this.#api.getAccountData('m.direct', { signal }).catch(() => null);
+    this.#assertCurrentGeneration(generation, signal);
     const map = { ...(direct && typeof direct === 'object' && !Array.isArray(direct) ? direct : {}) };
     const list = Array.isArray(map[inviter]) ? [...map[inviter]] : [];
     if (!list.includes(roomId)) list.push(roomId);
     map[inviter] = list;
-    await this.#api.setAccountData('m.direct', map).catch(() => undefined);
+    await this.#api.setAccountData('m.direct', map, { signal }).catch(() => undefined);
+    this.#assertCurrentGeneration(generation, signal);
     if (marksDirect) this.#dmRooms.add(roomId);
     const dmRoomByUser = { ...this.#sidecar.dmRoomByUser(), [inviter.trim().toLowerCase()]: roomId };
     await this.#sidecar.apply({ dmRooms: [...this.#dmRooms], dmRoomByUser });
@@ -1466,14 +1562,53 @@ export class MatrixRuntime {
 
   // ---- 出站 ----
 
-  async #sendRoomEvent(roomId, eventType, content, options = {}) {
+  #assertRoomSendSupported(roomId) {
+    if (!this.#encryptedRooms.has(roomId) || this.#crypto) return;
+    const error = new Error(t('Matrix 加密能力不可用，已拒绝明文发送。请恢复加密能力，或改用非加密房间。'));
+    error.code = 'matrix-encryption-unavailable';
+    throw error;
+  }
+
+  #uncertainRoomSend(cause) {
+    const error = new Error(t('Matrix 消息发送结果无法确认；请先检查房间记录，确认未收到后再重试。'), { cause });
+    error.code = 'matrix-delivery-uncertain';
+    return error;
+  }
+
+  #sendRoomEvent(roomId, eventType, content, options = {}) {
+    return this.#trackTask(this.#eventTasks, this.#dispatchRoomEvent(roomId, eventType, content, options));
+  }
+
+  async #dispatchRoomEvent(roomId, eventType, content, options) {
     const api = this.#api;
     if (!api) throw new Error('Matrix bot is not connected');
-    if (this.#crypto && this.#encryptedRooms.has(roomId)) {
-      const encrypted = await this.#crypto.encryptForRoom(roomId, content);
-      return await api.sendEvent(roomId, 'm.room.encrypted', encrypted, options);
+    this.#assertRoomSendSupported(roomId);
+    options = this.#sendOptions(options);
+    options.signal?.throwIfAborted();
+    if (this.#encryptedRooms.has(roomId)) {
+      content = await this.#crypto.encryptForRoom(roomId, content);
+      eventType = 'm.room.encrypted';
     }
-    return await api.sendEvent(roomId, eventType, content, options);
+    options.signal?.throwIfAborted();
+    let result;
+    try {
+      result = await api.sendEvent(roomId, eventType, content, options);
+    } catch (cause) {
+      const definiteRejection = cause instanceof MatrixApiError
+        && ((cause.status >= 400 && cause.status < 500)
+          || (cause.status === undefined && [
+            'matrix-auth', 'matrix-forbidden', 'matrix-not-found', 'matrix-rejected',
+            'matrix-permanent', 'matrix-rate-limited', 'matrix-invalid',
+          ].includes(cause.code)));
+      if (definiteRejection) throw cause;
+      throw this.#uncertainRoomSend(cause);
+    }
+    if (!isMatrixEventId(result?.event_id)) {
+      throw this.#uncertainRoomSend(new MatrixApiError('Matrix send response has no valid event_id', {
+        code: 'matrix-invalid-response',
+      }));
+    }
+    return result;
   }
 
   // Resolves a group sender's display name without blocking the synchronous
@@ -1486,9 +1621,11 @@ export class MatrixRuntime {
     if (hit && hit.at + this.#memberNameTtlMs > Date.now()) return hit.name;
     const api = this.#api;
     if (typeof api?.getRoomMemberDisplayName === 'function') {
-      Promise.resolve(api.getRoomMemberDisplayName(roomId, senderId))
+      const generation = this.#generation;
+      const signal = this.#lifecycleController?.signal;
+      const refresh = Promise.resolve(api.getRoomMemberDisplayName(roomId, senderId, { signal }))
         .then((name) => {
-          if (!name) return;
+          if (!name || signal?.aborted || generation !== this.#generation || this.#stopped) return;
           this.#memberNames.delete(key);
           this.#memberNames.set(key, { name, at: Date.now() });
           while (this.#memberNames.size > this.#memberNameCap) {
@@ -1496,6 +1633,7 @@ export class MatrixRuntime {
           }
         })
         .catch(() => undefined);
+      this.#trackTask(this.#eventTasks, refresh);
     }
     if (hit) return hit.name;
     const local = senderId.startsWith('@') ? senderId.slice(1) : senderId;
@@ -1532,42 +1670,57 @@ export class MatrixRuntime {
     return null;
   }
 
+  async #sendRoomTyping(roomId) {
+    const parent = this.#lifecycleController?.signal;
+    try {
+      const options = this.#sendOptions();
+      await this.#trackTask(this.#eventTasks, this.#api.setTyping(roomId, { typing: true, timeoutMs: 20_000 }, options));
+    } catch (error) {
+      if (!parent?.aborted) this.#logger.warn?.('[dsh-im:matrix] typing indicator failed:', error);
+    }
+  }
+
+  async #removeReaction(target, key, options) {
+    if (!isMatrixRoomId(target?.roomId) || !isMatrixEventId(target?.eventId) || !this.#botUserId) return;
+    options = this.#sendOptions(options);
+    const listing = await this.#api.listRelations(target.roomId, target.eventId, 'm.annotation', options);
+    options.signal?.throwIfAborted();
+    let events = Array.isArray(listing?.events) ? listing.events : [];
+    if (this.#crypto) {
+      const opened = [];
+      for (const event of events) {
+        if (event?.type !== 'm.room.encrypted') { opened.push(event); continue; }
+        const decrypted = await this.#crypto.decryptRoomEvent(target.roomId, event).catch(() => null);
+        if (decrypted?.content && typeof decrypted.content === 'object') opened.push({ ...event, content: decrypted.content });
+      }
+      events = opened;
+    }
+    const own = events.filter((event) => (
+      typeof event?.sender === 'string'
+      && event.sender.toLowerCase() === this.#botUserId.toLowerCase()
+      && event?.content?.['m.reaction'] === key
+    ));
+    for (const event of own.slice(0, 5)) {
+      options.signal?.throwIfAborted();
+      await this.#api.redactEvent(target.roomId, event.event_id, undefined, options);
+    }
+  }
+
   #createBotClient() {
     return {
       // The bridge stamps final answers with their turn; unbound text is operational feedback.
       sendText: async (target, text) => await this.#sendRoomText(target, text, {
         notice: this.#targetTurnKey(target) === null,
       }),
-      sendTyping: async (target) => {
-        await this.#api?.setTyping(target?.roomId ?? '', { typing: true, timeoutMs: 20_000 }).catch(() => undefined);
-      },
-      addReaction: async (target, key) => {
+      sendTyping: (target) => this.#sendRoomTyping(target?.roomId ?? ''),
+      addReaction: async (target, key, options = {}) => {
         if (!isMatrixRoomId(target?.roomId) || !isMatrixEventId(target?.eventId)) return undefined;
-        await this.#sendRoomEvent(target.roomId, 'm.reaction', buildMatrixReactionContent(target.eventId, key));
+        await this.#sendRoomEvent(target.roomId, 'm.reaction', buildMatrixReactionContent(target.eventId, key), options);
         return key;
       },
-      removeReaction: async (target, key) => {
-        if (!isMatrixRoomId(target?.roomId) || !isMatrixEventId(target?.eventId) || !this.#botUserId) return;
-        const listing = await this.#api.listRelations(target.roomId, target.eventId, 'm.annotation');
-        let events = Array.isArray(listing?.events) ? listing.events : [];
-        if (this.#crypto) {
-          const opened = [];
-          for (const event of events) {
-            if (event?.type !== 'm.room.encrypted') { opened.push(event); continue; }
-            const decrypted = await this.#crypto.decryptRoomEvent(target.roomId, event).catch(() => null);
-            if (decrypted?.content && typeof decrypted.content === 'object') opened.push({ ...event, content: decrypted.content });
-          }
-          events = opened;
-        }
-        const own = events.filter((event) => (
-          typeof event?.sender === 'string'
-          && event.sender.toLowerCase() === this.#botUserId.toLowerCase()
-          && event?.content?.['m.reaction'] === key
-        ));
-        for (const event of own.slice(0, 5)) {
-          await this.#api.redactEvent(target.roomId, event.event_id).catch(() => undefined);
-        }
-      },
+      removeReaction: (target, key, options = {}) => this.#trackTask(
+        this.#eventTasks, this.#removeReaction(target, key, options),
+      ),
       sendImage: async (target, file) => await this.#sendArtifact(target, file, true),
       sendFile: async (target, file) => await this.#sendArtifact(target, file, false),
       openStream: (target) => this.#openStream(target),
@@ -1690,7 +1843,9 @@ export class MatrixRuntime {
     if (!api) throw new Error('Matrix bot is not connected');
     const roomId = typeof target?.roomId === 'string' ? target.roomId : '';
     if (!isMatrixRoomId(roomId)) throw new TypeError('Matrix artifact target requires a valid room id');
-    const bytes = file?.bytes instanceof Uint8Array ? file.bytes : await file?.load?.({}).catch(() => null);
+    this.#assertRoomSendSupported(roomId);
+    const options = this.#sendOptions();
+    const bytes = file?.bytes instanceof Uint8Array ? file.bytes : await file?.load?.(options).catch(() => null);
     if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
       const error = new Error(t('结果文件内容为空或下载失败。'));
       error.code = 'artifact-provider-failed';
@@ -1703,7 +1858,7 @@ export class MatrixRuntime {
     }
     const mediaType = cleanString(file?.mediaType) ?? 'application/octet-stream';
     const fileName = cleanString(file?.name) ?? (preferImage ? 'image.jpg' : 'file.bin');
-    const contentUri = await api.uploadMedia(bytes, { filename: fileName, mediaType }).catch((cause) => {
+    const contentUri = await api.uploadMedia(bytes, { filename: fileName, mediaType }, options).catch((cause) => {
       const error = new Error(t('Matrix 媒体上传失败。'));
       error.code = 'artifact-provider-failed';
       error.cause = cause;
@@ -1718,24 +1873,18 @@ export class MatrixRuntime {
       url: contentUri,
     };
     const info = { mimetype: mediaType, size: bytes.byteLength };
-    const attempts = imageLike
-      ? [{ msgtype: 'm.image', extra: { info } }, { msgtype: 'm.file', extra: { 'm.file': info } }]
-      : [{ msgtype: 'm.file', extra: { 'm.file': info } }];
-    let lastError = null;
-    for (const attempt of attempts) {
-      const content = { ...baseContent, msgtype: attempt.msgtype, ...attempt.extra };
-      applyMatrixRelations(content, { threadId });
-      try {
-        await this.#sendRoomEvent(roomId, 'm.room.message', content);
-        return { sent: true, msgtype: attempt.msgtype };
-      } catch (error) {
-        lastError = error;
-        if (!(error instanceof MatrixApiError) || (error.code !== 'matrix-rejected' && error.code !== 'matrix-forbidden')) {
-          throw error;
-        }
-      }
+    const msgtype = imageLike ? 'm.image' : 'm.file';
+    const content = { ...baseContent, msgtype, ...(imageLike ? { info } : { 'm.file': info }) };
+    applyMatrixRelations(content, { threadId });
+    try {
+      const result = await this.#sendRoomEvent(roomId, 'm.room.message', content, options);
+      return { providerMessageIds: [result.event_id], msgtype };
+    } catch (cause) {
+      if (cause?.code !== 'matrix-delivery-uncertain') throw cause;
+      const error = new Error(cause.message, { cause });
+      error.code = 'artifact-delivery-uncertain';
+      throw error;
     }
-    throw lastError ?? new Error(t('Matrix 文件消息发送失败。'));
   }
 
   #lastBatch = null;

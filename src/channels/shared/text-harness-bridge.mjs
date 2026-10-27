@@ -206,6 +206,7 @@ export class TextHarnessBridge {
   #acceptedMessageIds = new Map();
   #approvalTasks = new Set();
   #commandTasks = new Set();
+  #reactionTasks = new Set();
   #approvals;
   #batches = new BatchInputManager();
   #interactionCard;
@@ -363,9 +364,17 @@ export class TextHarnessBridge {
     normalized.statusReaction = statusReaction;
 
     const processing = this.#acceptAcceptedMessage(normalized, messageId, senderId, busyMessageMode);
-    void processing.then(
-      () => statusReaction.success(),
-      () => statusReaction.error(),
+    const finalizing = processing.then(
+      () => { statusReaction.success(); return statusReaction.settled(); },
+      () => { statusReaction.error(); return statusReaction.settled(); },
+    );
+    this.#reactionTasks.add(finalizing);
+    void finalizing.then(
+      () => this.#reactionTasks.delete(finalizing),
+      (error) => {
+        this.#reactionTasks.delete(finalizing);
+        this.#logger.warn?.(`[dsh-im:${this.#descriptor.key}] status reaction finalization failed:`, error?.message ?? error);
+      },
     );
     return processing;
   }
@@ -940,7 +949,8 @@ export class TextHarnessBridge {
       : this.#bot.sendText(entry.target, text);
   }
 
-  async waitForIdle() {
+  /** Await accepted work; carriers can opt into draining best-effort reaction tails during teardown. */
+  async waitForIdle({ includeReactions = false } = {}) {
     await this.#pendingRecovery;
     await this.#busyMessages.whenIdle();
     await Promise.allSettled([
@@ -959,6 +969,9 @@ export class TextHarnessBridge {
       })),
     ]);
     await this.#deferred.whenIdle();
+    if (includeReactions) {
+      while (this.#reactionTasks.size > 0) await Promise.allSettled([...this.#reactionTasks]);
+    }
   }
 
   async #processFastCommand(message, messageId, key, runner, senderId) {
