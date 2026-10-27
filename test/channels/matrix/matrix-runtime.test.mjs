@@ -1,12 +1,13 @@
 import test, { after } from 'node:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { deepStrictEqual, equal, match, ok, rejects } from 'node:assert';
 
 import { MatrixRuntime } from '../../../src/channels/matrix/matrix-runtime.mjs';
 import { MatrixSidecarStore } from '../../../src/channels/matrix/matrix-config-store.mjs';
-import { MatrixApiError } from '../../../src/channels/matrix/matrix-api.mjs';
+import { MatrixApi, MatrixApiError } from '../../../src/channels/matrix/matrix-api.mjs';
+import { OutboundArtifactRegistry } from '../../../src/channels/shared/semantic/artifact.mjs';
 import { MatrixRoomHistoryStore } from '../../../src/channels/matrix/matrix-room-history.mjs';
 
 const HOME = 'https://matrix.example.org';
@@ -62,7 +63,8 @@ function createFakeApi({ initial = {}, accountData = {}, memberCounts = {}, over
     calls,
     queue,
     whoami: async () => ({ user_id: BOT, device_id: 'DSHDEV' }),
-    sync: async ({ since } = {}) => {
+    sync: async ({ since, signal } = {}) => {
+      signal?.throwIfAborted();
       calls.push({ op: 'sync', since: since ?? null });
       if (since === undefined) return structuredClone(initial);
       if (queue.length > 0) {
@@ -70,7 +72,19 @@ function createFakeApi({ initial = {}, accountData = {}, memberCounts = {}, over
         if (item.error) throw item.error;
         return item.batch;
       }
-      return await new Promise((resolve, reject) => { pendings.push({ resolve, reject }); });
+      return await new Promise((resolve, reject) => {
+        const finish = (settle, value) => {
+          const index = pendings.indexOf(pending);
+          if (index >= 0) pendings.splice(index, 1);
+          signal?.removeEventListener('abort', onAbort);
+          settle(value);
+        };
+        const pending = { resolve: (value) => finish(resolve, value), reject: (error) => finish(reject, error) };
+        const onAbort = () => pending.reject(signal.reason);
+        pendings.push(pending);
+        signal?.addEventListener('abort', onAbort, { once: true });
+        if (signal?.aborted) onAbort();
+      });
     },
     getAccountData: async (type) => accountData[type] ?? {},
     setAccountData: async (type, body) => {
@@ -212,6 +226,122 @@ async function createContext(options = {}) {
   };
   return { runtime, fake, sidecar, state, logger, harness, stop };
 }
+
+async function artifactContext(t, { name = 'result.png', outcome, uploadError, encrypted = false } = {}) {
+  const directory = await makeTempDirectory('dsh-matrix-artifact-');
+  const registry = new OutboundArtifactRegistry();
+  const session = { header: { id: 'artifact-session', cwd: directory }, events: [
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'user/message', data: { turn: 1, source: { rpcId: 'artifact-rpc' } } },
+  ] };
+  const releaseConsumer = registry.openConsumer('artifact-session', 'artifact-rpc');
+  for (const event of session.events) registry.observeSessionEvent(session, event);
+  await writeFile(join(directory, name), Buffer.from([1, 2, 3]));
+  const staged = await registry.stage({ path: name }, { agent: { session }, callId: 'artifact-call' });
+  registry.commit(staged);
+  const artifact = registry.take('artifact-session', 1)[0];
+  const media = [];
+  let uploads = 0;
+  let asks = 0;
+  const roomId = '!artifact:example.org';
+  const api = createFakeApi({ initial: { next_batch: 'artifact-start', rooms: { join: {
+    [roomId]: { state: { events: encrypted ? [{ type: 'm.room.encryption', content: {} }] : [] } },
+  } } } });
+  api.uploadMedia = async () => {
+    uploads += 1;
+    if (uploadError) throw uploadError;
+    return 'mxc://media.example.org/artifact';
+  };
+  api.sendEvent = async (room, type, content) => {
+    api.calls.push({ op: 'send', roomId: room, type, content });
+    if (content.msgtype === 'm.image' || content.msgtype === 'm.file') {
+      media.push(content);
+      if (outcome) return await outcome(content, media.length);
+      return { event_id: '$artifact-result:example.org' };
+    }
+    return { event_id: `$sent-${api.calls.length}:example.org` };
+  };
+  const harness = { ...harnessStub(), ask: async (_sessionId, _text, options) => {
+    asks += 1;
+    if (asks === 1) await options.onArtifact(artifact);
+    return '文件已准备好';
+  } };
+  const context = await createContext({ api, harness, config: {
+    e2eeMode: 'off', coalesceWindowMs: 0, autoSteerSameSender: false,
+    triggerOnReply: 'bot-only',
+  } });
+  t.after(async () => { await context.stop(); registry.clear(); releaseConsumer(); });
+  await context.runtime.start();
+  api.push({ next_batch: 'artifact-turn', rooms: { join: { [roomId]: { timeline: { events: [
+    messageEvent({ body: '发文件 <@bot:example.org>' }),
+  ] } } } } });
+  await eventually(() => (context.runtime.status.artifactsSent ?? 0) + (context.runtime.status.artifactSendErrors ?? 0) === 1);
+  return { ...context, roomId, media, get uploads() { return uploads; }, get asks() { return asks; } };
+}
+
+test('matrix send proactive text preserves ordered chunk IDs for rooms and DMs', async (t) => {
+  const context = await createContext({ config: { e2eeMode: 'off', maxMessageLength: 500 },
+    apiOptions: { initial: { next_batch: 'start' } } });
+  t.after(() => context.stop());
+  await context.runtime.start();
+  const room = await context.runtime.sendProactiveText({ kind: 'room', route: { roomId: '!r:example.org' } }, 'x'.repeat(1100));
+  const sends = context.fake.calls.filter((call) => call.op === 'send');
+  deepStrictEqual(room.providerMessageIds, sends.map((call) => `$sent-${context.fake.calls.indexOf(call) + 1}:example.org`));
+  equal(room.providerMessageIds.length, 3);
+  const dm = await context.runtime.sendProactiveText({ kind: 'dm', route: { userId: '@alice:example.org' } }, 'hello');
+  equal(dm.providerMessageIds.length, 1);
+});
+
+test('matrix send file receipt binds the actual event ID for a bot-only follow-up', async (t) => {
+  const context = await artifactContext(t, { name: 'report.txt' });
+  equal(context.media.length, 1);
+  equal(context.media[0].msgtype, 'm.file');
+  context.fake.push({ next_batch: 'artifact-followup', rooms: { join: { [context.roomId]: { timeline: { events: [
+    messageEvent({ body: '解释这个文件', content: { 'm.relates_to': { 'm.in_reply_to': { event_id: '$artifact-result:example.org' } } } }),
+  ] } } } } });
+  await eventually(() => context.sidecar.nextBatch() === 'artifact-followup');
+  equal(context.runtime.status.messagesReceived, 2, 'the shared receipt makes the delivered file a recognized bot reply target');
+});
+
+test('matrix send definitive image and file rejections never produce a third event', async (t) => {
+  const context = await artifactContext(t, { outcome: async () => {
+    throw new MatrixApiError('media rejected', { code: 'matrix-rejected', status: 400 });
+  } });
+  deepStrictEqual(context.media.map((content) => content.msgtype), ['m.image', 'm.file']);
+  equal(context.uploads, 2);
+  equal(context.runtime.status.artifactSendErrors, 1);
+});
+
+for (const [name, fetchImpl] of [
+  ['network failure', async () => { throw new TypeError('connection reset'); }],
+  ['timeout', async () => { throw new DOMException('timed out', 'TimeoutError'); }],
+  ['server error', async () => new Response(JSON.stringify({ errcode: 'M_UNKNOWN' }), { status: 503 })],
+  ['invalid JSON', async () => new Response('{')],
+  ['missing event ID', async () => new Response('{}')],
+  ['invalid event ID', async () => new Response(JSON.stringify({ event_id: 'not-an-event' }))],
+]) {
+  test(`matrix send ${name} after event dispatch never retries as a file`, async (t) => {
+    const api = new MatrixApi({ homeserver: HOME, accessToken: 'fixture', fetchImpl });
+    const context = await artifactContext(t, { outcome: (content) => api.sendEvent('!artifact:example.org', 'm.room.message', content) });
+    deepStrictEqual(context.media.map((content) => content.msgtype), ['m.image']);
+    equal(context.uploads, 1);
+    equal(context.runtime.status.lastMessageError?.reason, 'ARTIFACT_DELIVERY_UNCERTAIN');
+  });
+}
+
+test('matrix send upload failure remains definitely before message submission', async (t) => {
+  const context = await artifactContext(t, { uploadError: new TypeError('upload unavailable') });
+  equal(context.media.length, 0);
+  equal(context.runtime.status.lastMessageError?.reason, 'ARTIFACT_PROVIDER_FAILED');
+});
+
+test('matrix send known encrypted rooms without crypto reject text and do not upload files', async (t) => {
+  const context = await artifactContext(t, { encrypted: true });
+  await rejects(() => context.runtime.sendProactiveText({ kind: 'room', route: { roomId: context.roomId } }, 'private'),
+    (error) => error.code === 'matrix-encryption-unavailable');
+  equal(context.uploads, 0);
+  equal(context.fake.calls.filter((call) => call.op === 'send' && call.type === 'm.room.message').length, 0);
+});
 
 const sentMessages = (fake) => fake.calls.filter((call) => call.op === 'send' && call.type === 'm.room.message');
 const sentReactions = (fake) => fake.calls.filter((call) => call.op === 'send' && call.type === 'm.reaction');
@@ -632,7 +762,7 @@ test('password boot logs in through the module fetch path and keeps the server-a
   }
 });
 
-test('sync failures re-arm through reconnect on permanent walls and keep retrying transient ones', async () => {
+test('sync failures hand permanent recovery to the supervisor and expose transient degradation', async () => {
   const api = createFakeApi({ initial: { next_batch: 'b0', rooms: {} } });
   api.queue.push({ error: new MatrixApiError('token revoked', { code: 'matrix-auth', permanent: true, status: 401 }) });
   const context = await createContext({ api });
@@ -652,8 +782,9 @@ test('sync failures re-arm through reconnect on permanent walls and keep retryin
   try {
     await flakyContext.runtime.start();
     await eventually(() => flakyContext.logger.warnings.some((line) => line.includes('retrying')));
-    deepStrictEqual(flakyContext.runtime.status.connectionState, 'connected',
-      'a transient blip keeps the loop alive instead of failing the bot');
+    deepStrictEqual(flakyContext.runtime.status.connectionState, 'connecting',
+      'a transient blip keeps the loop alive without falsely reporting healthy');
+    equal(flakyContext.runtime.status.ready, false);
   } finally {
     await flakyContext.stop();
   }
@@ -750,7 +881,8 @@ test('Matrix proactive Markdown preserves long code without retrying network err
     for (const row of rows) equal(joined.split(row).length - 1, 1);
     let calls = 0;
     context.fake.sendEvent = async () => { calls++; throw new Error('network lost'); };
-    await rejects(context.runtime.sendProactiveText(target, '**answer**', { format: 'markdown' }), /network lost/);
+    await rejects(context.runtime.sendProactiveText(target, '**answer**', { format: 'markdown' }),
+      (error) => error.code === 'matrix-delivery-uncertain' && error.cause?.message === 'network lost');
     equal(calls, 1);
   } finally {
     await context.stop();

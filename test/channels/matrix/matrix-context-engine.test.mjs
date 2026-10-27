@@ -93,14 +93,27 @@ function createFakeApi({ initial = {}, events = {} } = {}) {
       else queue.push(chunk);
     },
     whoami: async () => ({ user_id: BOT, device_id: 'DSHDEV' }),
-    sync: async ({ since } = {}) => {
+    sync: async ({ since, signal } = {}) => {
+      signal?.throwIfAborted();
       calls.push({ op: 'sync', since: since ?? null });
       if (!deliveredInitial && since === undefined) {
         deliveredInitial = true;
         return structuredClone(initial);
       }
       if (queue.length > 0) return structuredClone(queue.shift());
-      return await new Promise((resolve, reject) => { pendings.push({ resolve, reject }); });
+      return await new Promise((resolve, reject) => {
+        const finish = (settle, value) => {
+          const index = pendings.indexOf(pending);
+          if (index >= 0) pendings.splice(index, 1);
+          signal?.removeEventListener('abort', onAbort);
+          settle(value);
+        };
+        const pending = { resolve: (value) => finish(resolve, value), reject: (error) => finish(reject, error) };
+        const onAbort = () => pending.reject(signal.reason);
+        pendings.push(pending);
+        signal?.addEventListener('abort', onAbort, { once: true });
+        if (signal?.aborted) onAbort();
+      });
     },
     getAccountData: async () => ({}),
     setAccountData: async () => ({}),

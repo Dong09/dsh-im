@@ -1,5 +1,7 @@
 // Email conversation keys contain Message-IDs or bound Session IDs, not
 // recipient addresses. Keep email targets explicit until a mapping is stored.
+import { isMatrixEventId, isMatrixRoomTargetId, isMatrixUserId } from '../../src/channels/matrix/matrix-identifiers.mjs';
+
 const CHANNELS = new Set([
   'weixin',
   'feishu',
@@ -85,11 +87,14 @@ function whatsappSuggestion(key) {
 }
 
 function matrixSuggestion(key) {
-  const dm = /^dm:(@[A-Za-z0-9._=\-\/+]+:[A-Za-z0-9.-]+(?::\d{1,5})?)$/.exec(key);
-  if (dm) return { kind: 'dm', route: { userId: dm[1] } };
-  const room = /^room:([!#][^:$\s]+:[A-Za-z0-9.-]+(?::\d{1,5})?)(?:\$(\$[^\s]+))?$/u.exec(key);
-  if (!room) return null;
+  if (key.startsWith('dm:')) {
+    const userId = key.slice(3);
+    return isMatrixUserId(userId) ? { kind: 'dm', route: { userId } } : null;
+  }
+  const room = /^room:([^$]+)(?:\$(\$.*))?$/u.exec(key);
+  if (!room || !isMatrixRoomTargetId(room[1])) return null;
   if (room[2] === undefined) return { kind: 'room', route: { roomId: room[1] } };
+  if (!isMatrixEventId(room[2])) return null;
   return { kind: 'thread', route: { roomId: room[1], threadId: room[2] } };
 }
 

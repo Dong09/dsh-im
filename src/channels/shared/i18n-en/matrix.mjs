@@ -1,5 +1,23 @@
 // English translations (matrix area). Keys are exact Chinese literals passed to t().
 export default {
+  'Matrix 控制器已关闭，请重新启用插件后再操作。':
+    'The Matrix controller is closed. Enable the plugin again before continuing.',
+  'Matrix 凭据或配置回滚失败，已暂停自动连接。请检查凭据存储并重新接入，勿直接重试连接。':
+    'Matrix credential or configuration rollback failed; automatic connection is paused. Check credential storage and bind the bot again rather than retrying the connection.',
+  'Matrix 连接未能停止，未执行配置、凭据和状态删除。请检查日志后重试。':
+    'The Matrix connection could not be stopped. Configuration, credentials and state were not deleted. Check the logs before retrying.',
+  'Matrix 配置已移除，但部分状态或凭据未清理。请检查日志并清理残留后再接入。':
+    'The Matrix configuration was removed, but some state or credentials remain. Check the logs and clean up the remaining data before binding again.',
+  'Matrix 清理未完成，请检查日志并确认配置、状态和凭据的残留情况。':
+    'Matrix cleanup is incomplete. Check the logs and verify any remaining configuration, state and credentials.',
+  'Matrix 连接资源未能完整释放，请检查日志后重启插件。':
+    'Matrix connection resources could not be fully released. Check the logs before restarting the plugin.',
+  'Matrix 凭据读取失败，请检查凭据存储后重试。':
+    'Matrix credentials could not be read. Check credential storage before retrying.',
+  'Matrix 加密能力不可用，已拒绝明文发送。请恢复加密能力，或改用非加密房间。':
+    'Matrix encryption is unavailable, so plaintext delivery was refused. Restore encryption or use an unencrypted room.',
+  'Matrix 消息发送结果无法确认；请先检查房间记录，确认未收到后再重试。':
+    'The Matrix delivery result is uncertain. Check the room history and retry only after confirming the message was not received.',
   '回答已发送，但图片处理状态保存失败；下次 @ 可能重复分析这些图片。请检查本地存储后重试。':
     'The answer was sent, but the image processing state could not be saved. Another mention may analyze these images again. Check local storage before retrying.',
   '无法读取引用的图片消息「{name}」，本次未提交图片分析。请回复原图并重新 @，或重新发送图片。':

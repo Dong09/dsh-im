@@ -74,6 +74,22 @@ test('uncertain Telegram delivery does not become a safe-to-retry timeout', () =
   assert.match(failure.message, /先检查聊天.*不要立即重复提交/u);
 });
 
+test('matrix delivery uncertainty and the encryption refusal keep their own public guidance', () => {
+  for (const [error, expected, copy] of [
+    [{ code: 'matrix-delivery-uncertain', cause: { code: 'ECONNRESET' } },
+      'MATRIX_DELIVERY_UNCERTAIN', /Matrix 消息发送结果无法确认；请先检查房间记录/u],
+    [{ code: 'matrix-encryption-unavailable' },
+      'MATRIX_ENCRYPTION_UNAVAILABLE', /已拒绝明文发送。请恢复加密能力，或改用非加密房间/u],
+  ]) {
+    const failure = classifyMessageFailure(error, options);
+    assert.equal(failure.code, expected);
+    assert.equal(failure.reason, expected);
+    assert.match(failure.message, copy);
+    assert.doesNotMatch(failure.message, /暂时无法确定原因/u);
+    assert.equal(JSON.stringify(publicMessageFailure(failure)).includes(expected), true);
+  }
+});
+
 test('cancellation, mixed unrelated causes and unstructured text remain unclassified', () => {
   for (const error of [
     new DOMException('timeout', 'AbortError'),

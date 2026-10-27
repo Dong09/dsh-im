@@ -329,3 +329,53 @@ test('credential inspection resolves one stable identity for either auth form', 
   await rejects(() => inspectMatrixCredentials({ homeserver: HOME },
     { fetchImpl: tokenProbe.fetchImpl }), (error) => error.code === 'invalid-config');
 });
+
+test('matrix protocol password login refuses a pre-aborted request without contacting the server', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const probe = recordingFetch(() =>
+    jsonResponse({ access_token: 'session', user_id: '@bot:example.org', device_id: 'DEV' }));
+  await rejects(() => performMatrixPasswordLogin(
+    { homeserver: HOME, userId: '@bot:example.org', password: 'secret', fetchImpl: probe.fetchImpl },
+    { signal: controller.signal }), (error) => error.name === 'AbortError');
+  deepStrictEqual(probe.calls.length, 0);
+});
+
+test('matrix protocol password inspection uses the bounded cancellable login and preserves device identity', async () => {
+  const controller = new AbortController();
+  const probe = recordingFetch(() =>
+    jsonResponse({ access_token: 'session', user_id: '@Alice:example.org', device_id: 'ACTUAL_DEVICE' }));
+  const identity = await inspectMatrixCredentials(
+    { homeserver: HOME, userId: '@alice:example.org', password: 'secret' },
+    { fetchImpl: probe.fetchImpl, signal: controller.signal });
+  deepStrictEqual(identity.platformId, 'matrix.example.org|@alice:example.org');
+  deepStrictEqual(identity.deviceId, 'ACTUAL_DEVICE');
+  deepStrictEqual(JSON.parse(probe.calls[0].body).identifier, { type: 'm.id.user', user: '@alice:example.org' });
+  ok(probe.calls[0].signal instanceof AbortSignal);
+  controller.abort();
+  deepStrictEqual(probe.calls[0].signal.aborted, true);
+});
+
+test('matrix protocol login forwards the requested device ID and retains error status', async () => {
+  const probe = recordingFetch(() => jsonResponse({ errcode: 'M_FORBIDDEN' }, 403));
+  await rejects(() => performMatrixPasswordLogin(
+    { homeserver: HOME, userId: '@bot:example.org', password: 'secret', deviceId: 'STABLE_DEVICE', fetchImpl: probe.fetchImpl }),
+    (error) => error instanceof MatrixApiError && error.status === 403 && error.providerCode === 'M_FORBIDDEN');
+  deepStrictEqual(JSON.parse(probe.calls[0].body).device_id, 'STABLE_DEVICE');
+});
+
+for (const status of [401, 403]) {
+  test(`matrix protocol password inspection classifies HTTP ${status} as authentication failure`, async () => {
+    await rejects(() => inspectMatrixCredentials(
+      { homeserver: HOME, userId: '@bot:example.org', password: 'wrong' },
+      { fetchImpl: async () => jsonResponse({ errcode: 'M_FORBIDDEN' }, status) }),
+      (error) => error.code === 'auth-failed');
+  });
+}
+
+test('matrix protocol password inspection reports unreachable servers as network failure', async () => {
+  await rejects(() => inspectMatrixCredentials(
+    { homeserver: HOME, userId: '@bot:example.org', password: 'secret' },
+    { fetchImpl: async () => { throw new TypeError('connection reset'); } }),
+    (error) => error.code === 'network');
+});
