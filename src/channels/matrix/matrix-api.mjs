@@ -1,4 +1,6 @@
 import { t } from '../shared/i18n.mjs';
+import { isMatrixEventId, isMatrixRoomId, isMatrixUserId } from './matrix-identifiers.mjs';
+export { isMatrixEventId, isMatrixRoomId, isMatrixUserId } from './matrix-identifiers.mjs';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const UPLOAD_TIMEOUT_MS = 120_000;
@@ -49,23 +51,6 @@ export function validateMatrixHomeserver(value) {
   if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
   if (url.username || url.password || url.hash) return null;
   return url.href.replace(/\/+$/, '');
-}
-
-export function isMatrixUserId(value) {
-  return typeof value === 'string'
-    && /^@[-.=_+/A-Za-z0-9]+:[-.A-Za-z0-9]+(?::\d{1,5})?$/u.test(value);
-}
-
-export function isMatrixRoomId(value) {
-  // Room v12 uses the create-event SHA-256 hash (unpadded base64url) without
-  // a server suffix. Legacy room IDs and aliases retain their existing form.
-  return typeof value === 'string'
-    && (/^![A-Za-z0-9_-]{43}$/u.test(value)
-      || /^[!#][^:\s]+:[A-Za-z0-9.-]+(?::\d{1,5})?$/u.test(value));
-}
-
-export function isMatrixEventId(value) {
-  return typeof value === 'string' && /^\$[^:\s]+(?::[^\s]+)?$/u.test(value) && value.length <= 512;
 }
 
 export function mxcToMatrixMediaUrl(homeserver, contentUri) {
@@ -138,6 +123,7 @@ export async function performMatrixPasswordLogin(
   }
   const url = new URL(`${base}${MATRIX_CLIENT_PREFIX}/login`);
   const signal = requestSignal(options.signal, DEFAULT_TIMEOUT_MS);
+  signal.throwIfAborted();
   const response = await fetchImpl(url.href, {
     method: 'POST',
     redirect: 'error',
@@ -151,16 +137,25 @@ export async function performMatrixPasswordLogin(
     }),
     signal,
   }).catch((cause) => {
-    throw new MatrixApiError('Matrix password login is unreachable', {
-      code: cause?.name === 'AbortError' || cause?.name === 'TimeoutError' ? 'timeout' : 'network',
+    options.signal?.throwIfAborted();
+    const error = new MatrixApiError('Matrix password login is unreachable', {
+      code: signal.aborted || cause?.name === 'AbortError' || cause?.name === 'TimeoutError' ? 'timeout' : 'network',
     });
+    error.cause = cause;
+    throw error;
   });
+  signal.throwIfAborted();
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
-    throw new MatrixApiError(`Matrix password login failed with HTTP ${response.status}`,
-      classifyMatrixError(response.status, cleanString(body?.errcode), 1_000));
+    const providerCode = cleanString(body?.errcode);
+    throw new MatrixApiError(`Matrix password login failed with HTTP ${response.status}`, {
+      ...classifyMatrixError(response.status, providerCode, 1_000),
+      status: response.status,
+      providerCode,
+    });
   }
   const body = await response.json().catch(() => ({}));
+  signal.throwIfAborted();
   const accessToken = cleanString(body?.access_token);
   const resolvedUserId = cleanString(body?.user_id);
   if (!accessToken || !resolvedUserId) {
@@ -269,19 +264,6 @@ export class MatrixApi {
     }).catch(() => null);
     const name = cleanString(event?.content?.displayname);
     return name && name.length <= 256 ? name : null;
-  }
-
-  async login({ identifier, password, deviceId, displayName }, options = {}) {
-    const body = {
-      type: 'm.login.password',
-      identifier: { type: 'm.id.user', user: identifier },
-      password: String(password ?? ''),
-      ...(cleanString(deviceId) ? { device_id: deviceId } : {}),
-      initial_device_display_name: cleanString(displayName) ?? 'DeepSeek Harness',
-    };
-    return await this.#request('login', {
-      path: '/login', method: 'POST', body, signal: options.signal,
-    });
   }
 
   async sync({ since, timeout = 0, signal } = {}) {
@@ -647,8 +629,9 @@ export class MatrixApi {
  */
 export async function inspectMatrixCredentials(
   { homeserver, accessToken, userId, password } = {},
-  { fetchImpl } = {},
+  { fetchImpl, signal } = {},
 ) {
+  signal?.throwIfAborted();
   const base = validateMatrixHomeserver(homeserver);
   const token = cleanString(accessToken);
   const identifier = cleanString(userId);
@@ -674,8 +657,9 @@ export async function inspectMatrixCredentials(
     const api = new MatrixApi({ homeserver: base, accessToken: token, ...(fetchImpl ? { fetchImpl } : {}) });
     let identity;
     try {
-      identity = await api.whoami();
+      identity = await api.whoami({ signal });
     } catch (cause) {
+      signal?.throwIfAborted();
       if (cause instanceof MatrixApiError && cause.permanent) {
         const error = new Error(t('Matrix 访问令牌无效或已失效，请在 homeserver 重新签发后重试。'));
         error.code = 'auth-failed';
@@ -693,31 +677,30 @@ export async function inspectMatrixCredentials(
       throw error;
     }
   } else {
-    const url = new URL(`${base}${MATRIX_CLIENT_PREFIX}/login`);
-    const response = await (fetchImpl ?? globalThis.fetch)(url.href, {
-      method: 'POST',
-      redirect: 'error',
-      headers: { 'content-type': 'application/json', accept: 'application/json' },
-      body: JSON.stringify({
-        type: 'm.login.password',
-        identifier: { type: 'm.id.user', user: identifier },
-        password: secret,
-        initial_device_display_name: 'DeepSeek Harness',
-      }),
-    }).catch(() => null);
-    if (!response?.ok) {
-      if (response && (response.status === 403 || response.status === 401)) {
-        const error = new Error(t('Matrix 用户名或密码不正确，请核对后重试。'));
+    let session;
+    try {
+      session = await performMatrixPasswordLogin({
+        homeserver: base, userId: identifier, password: secret,
+        ...(fetchImpl ? { fetchImpl } : {}),
+      }, { signal });
+    } catch (cause) {
+      signal?.throwIfAborted();
+      if (cause instanceof MatrixApiError && (cause.status === 401 || cause.status === 403)) {
+        const error = new Error(t('Matrix 用户名或密码不正确，请核对后重试。'), { cause });
         error.code = 'auth-failed';
         throw error;
       }
-      const error = new Error(t('Matrix homeserver 暂不支持密码登录，请改用访问令牌接入。'));
+      if (cause instanceof MatrixApiError && (cause.code === 'network' || cause.code === 'timeout')) {
+        const error = new Error(t('Matrix homeserver 暂时无法访问，请确认网络与地址后重试。'), { cause });
+        error.code = 'network';
+        throw error;
+      }
+      const error = new Error(t('Matrix homeserver 暂不支持密码登录，请改用访问令牌接入。'), { cause });
       error.code = 'login-failed';
       throw error;
     }
-    const body = await response.json().catch(() => ({}));
-    resolvedUserId = cleanString(body?.user_id) ?? identifier;
-    resolvedDeviceId = cleanString(body?.device_id);
+    resolvedUserId = session.userId;
+    resolvedDeviceId = session.deviceId;
   }
   const host = new URL(base).host.toLowerCase();
   const localpart = resolvedUserId.slice(1, Math.max(1, resolvedUserId.indexOf(':')));

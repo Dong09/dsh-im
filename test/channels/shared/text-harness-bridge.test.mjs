@@ -223,6 +223,38 @@ test('empty mentioned messages still require an explicit carrier wake prompt', a
   assert.deepEqual(sent, ['目前支持文字、图片和文件消息。']);
 });
 
+for (const failed of [false, true]) {
+  test(`matrix lifecycle shared idle optionally drains ${failed ? 'failed' : 'successful'} reaction finalization`, async (t) => {
+    const state = stateFixture();
+    const gate = deferred();
+    const calls = [];
+    const bridge = createBridge({
+      state: state.state,
+      reactions: { processing: 'eyes', success: 'done', error: 'error' },
+      bot: {
+        sendText: async () => ({ providerMessageIds: ['$answer'] }),
+        addReaction: async (_target, emoji) => {
+          calls.push(emoji);
+          return emoji === 'eyes' ? gate.promise : emoji;
+        },
+        removeReaction: async () => {},
+      },
+      harness: { sessionExists: async () => false, createSession: async () => 'session-idle', ask: async () => 'answer' },
+    });
+    t.after(async () => { gate.resolve('eyes'); await bridge.waitForIdle({ includeReactions: true }); });
+    await bridge.accept(message('idle-reaction', 'hello', { reactionTarget: { id: 'source' } }));
+    await bridge.waitForIdle();
+    let idle = false;
+    const draining = bridge.waitForIdle({ includeReactions: true }).then(() => { idle = true; });
+    await new Promise(setImmediate);
+    assert.equal(idle, false, 'opt-in idle includes the reaction tail without blocking ordinary queue completion');
+    if (failed) gate.reject(new Error('reaction unavailable'));
+    else gate.resolve('eyes');
+    await draining;
+    assert.equal(calls.at(-1), 'done');
+  });
+}
+
 test('status reactions never delay safe errors, the conversation queue, or waitForIdle', async () => {
   const fixture = stateFixture();
   const sent = [];

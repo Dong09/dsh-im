@@ -1,5 +1,5 @@
 import test from 'node:test';
-import { deepStrictEqual, ok } from 'node:assert';
+import { deepStrictEqual, ok, throws } from 'node:assert';
 
 import {
   deliverySuggestionFromConversationKey,
@@ -99,4 +99,41 @@ test('the delivery adapter enforces the matrix target grammar', async () => {
     () => normalizeDeliveryTarget('matrix', target, { targetIdRequired: false }),
     `${label} must be rejected`,
   )));
+});
+
+const V12_ROOM = '!KplB3ESm99I-4PaRdWxDUKr0Sia5nRhRtykpfs1VloM';
+
+test('matrix protocol suggestions retain v12 room and thread routes', () => {
+  deepStrictEqual(deliverySuggestionFromConversationKey('matrix', `room:${V12_ROOM}`),
+    { kind: 'room', route: { roomId: V12_ROOM } });
+  deepStrictEqual(deliverySuggestionFromConversationKey('matrix', `room:${V12_ROOM}$$thr:example.org`),
+    { kind: 'thread', route: { roomId: V12_ROOM, threadId: '$thr:example.org' } });
+});
+
+test('matrix protocol proactive targets accept v12 and legacy rooms', () => {
+  for (const roomId of [V12_ROOM, '!r:example.org:8448']) {
+    const room = { kind: 'room', route: { roomId } };
+    const thread = { kind: 'thread', route: { roomId, threadId: '$thr:example.org' } };
+    deepStrictEqual(normalizeDeliveryTarget('matrix', room, { targetIdRequired: false }), room);
+    deepStrictEqual(normalizeDeliveryTarget('matrix', thread, { targetIdRequired: false }), thread);
+  }
+});
+
+test('matrix protocol suggestions reject aliases and malformed room or thread identifiers', () => {
+  for (const key of ['room:#alias:example.org', 'room:!short', `room:${V12_ROOM}$`,
+    `room:${V12_ROOM}$$thr:example.org trailing`]) {
+    deepStrictEqual(deliverySuggestionFromConversationKey('matrix', key), null, key);
+  }
+});
+
+test('matrix protocol target validation checks the entire thread and user identifier', () => {
+  for (const target of [
+    { kind: 'room', route: { roomId: '#alias:example.org' } },
+    { kind: 'room', route: { roomId: '!short' } },
+    { kind: 'thread', route: { roomId: '!r:example.org', threadId: '$thr:example.org trailing' } },
+    { kind: 'dm', route: { userId: '@bad@user:example.org' } },
+  ]) {
+    throws(() => normalizeDeliveryTarget('matrix', target, { targetIdRequired: false }),
+      (error) => error.code === 'invalid-target');
+  }
 });
