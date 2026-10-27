@@ -44,14 +44,30 @@
 
 ---
 
-<a id="recognition"></a>
+## ❤️ Sponsors
 
-> [!NOTE]
-> **DSH-IM has received official sponsorship from DeepSeek Harness in the form of RMB 2,000 in token credits**. Thank you to the DeepSeek Harness team for supporting this project!
->
-> This project is independently developed and maintained by community developers.
+<table width="100%">
+  <tr>
+    <td width="180" align="center" valign="middle">
+      <a href="https://88api.ai/sign-up?aff=lJoL"><img src="assets/sponsors/88api.jpg" alt="88API Token Aggregation Platform" width="150"></a>
+    </td>
+    <td valign="middle">
+      <a href="https://88api.ai/sign-up?aff=lJoL"><strong>88API Token Aggregation Platform</strong></a> sponsors this project! Operated by a Hong Kong company, 88API is an all-in-one, multi-model API platform for developers, creators, and AI application users. Its unified interface connects text, image, speech, and video models for workflows including AI coding, translation, content creation, voiceovers, image generation, and video generation. It offers high-quality, discounted access to official DeepSeek inference services and self-hosted DeepSeek inference on its own B300 clusters. It supports major international payment methods, provides invoices, and offers enterprise-grade reliable service. <a href="https://88api.ai/sign-up?aff=lJoL"><strong>Sign up through this link to receive exclusive bonus credits!</strong></a>
+    </td>
+  </tr>
+  <tr>
+    <td width="180" align="center" valign="middle">
+      <a id="recognition"></a>
+      <a href="https://github.com/deepseek-ai/deepseek-harness"><strong>DeepSeek<br>Harness</strong></a>
+    </td>
+    <td valign="middle">
+      <strong>DSH-IM has received official sponsorship from <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> in the form of token credits</strong>. Thank you to the DeepSeek Harness team for supporting this project!
+      <p>This project is independently developed and maintained by community developers.</p>
+    </td>
+  </tr>
+</table>
 
-<!-- -->
+---
 
 > [!IMPORTANT]
 > **Install using the full package name: `@xmanrui/dsh-im`**

@@ -19,6 +19,8 @@ import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
+import { parseStringAt } from './i18n-source-literal.mjs';
+
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, '..', '..', '..');
 const sourceRoot = join(repoRoot, 'src');
@@ -29,50 +31,6 @@ const sharedDir = join(sourceRoot, 'channels', 'shared');
 const TRANSLATOR_MODULE = 'i18n.mjs';
 
 const DICTIONARY_ENTRY = /^i18n-([a-z]{2,8}(?:-[a-z0-9]+)*)(\.mjs)?$/u;
-
-const quoteChars = new Set(["'", '"', '`']);
-
-// Decode the escapes a real string literal applies, so a key written as
-// `...\n...` in source compares against the runtime key that holds a newline.
-function decodeLiteral(raw) {
-  let out = '';
-  for (let i = 0; i < raw.length; i += 1) {
-    if (raw[i] !== '\\' || i + 1 >= raw.length) {
-      out += raw[i];
-      continue;
-    }
-    const next = raw[i + 1];
-    if (next === 'n') out += '\n';
-    else if (next === 't') out += '\t';
-    else if (next === 'r') out += '\r';
-    else out += next; // \', \", \\, \` and anything else keep the char
-    i += 1;
-  }
-  return out;
-}
-
-// Parse the string literal starting at `start`, or return null when the text
-// there is not one. A template literal with `${…}` is an expression rather than
-// a key, so it is reported as unparsable and the caller skips it.
-function parseStringAt(source, start) {
-  const quote = source[start];
-  if (!quoteChars.has(quote)) return null;
-  let raw = '';
-  for (let i = start + 1; i < source.length; i += 1) {
-    const char = source[i];
-    if (char === '\\') {
-      raw += char;
-      if (i + 1 < source.length) raw += source[i + 1];
-      i += 1;
-      continue;
-    }
-    if (char === quote) return { value: decodeLiteral(raw), end: i + 1 };
-    if (quote === '`' && char === '$' && source[i + 1] === '{') return null;
-    if (quote !== '`' && char === '\n') return null;
-    raw += char;
-  }
-  return null;
-}
 
 // Parse `[ 'a', 'b' ].join('\n')` at `start`; the source builds multi-line usage
 // texts this way, and the translator receives the joined result as its key.
@@ -458,6 +416,49 @@ test('dictionary entries no source string references are reported, not failed', 
 // The scanner is fed synthetic modules from here on: a defect in the scan is
 // only caught by a case that would make the guard pass a string it should
 // report, and the real tree does not contain one any more.
+
+test('physical template line endings yield the runtime key without hiding missing translations', () => {
+  const known = '已进入批量输入模式，最多可发送 {limit} 条文字。\n完成后发送 /send，取消请发送 /cancel。';
+  const missing = '审查探针：第一行\n审查探针：确实缺失';
+  for (const eol of ['\n', '\r\n', '\r']) {
+    const scan = scanSources([{
+      label: 'src/channels/shared/newlines.mjs',
+      source: `const NOTICE = \`${known.replaceAll('\n', eol)}\`;\nsend(t(NOTICE), t(\`${missing.replaceAll('\n', eol)}\`));\n`,
+    }]);
+    assert.deepEqual([...scan.strings.keys()], [known, missing]);
+    assert.equal(scan.diagnostics.size, 0);
+    for (const { entries } of dictionaries) {
+      assert.deepEqual(
+        [...scan.strings.keys()].filter((key) => !Object.hasOwn(entries, key)),
+        [missing],
+      );
+    }
+  }
+});
+
+test('line continuations disappear in quoted and template keys, but escaped CRLF stays distinct', () => {
+  for (const quote of ["'", '"', '`']) {
+    for (const eol of ['\n', '\r\n', '\r', '\u2028', '\u2029']) {
+      const scan = scanSources([{
+        label: 'src/channels/shared/continuation.mjs',
+        source: `const NOTICE = ${quote}审查探针：甲\\${eol}乙${quote};\nsend(t(NOTICE));`,
+      }]);
+      assert.deepEqual([...scan.strings.keys()], ['审查探针：甲乙']);
+      assert.equal(scan.diagnostics.size, 0);
+    }
+  }
+  const scan = scanSources([{
+    label: 'src/channels/shared/escaped.mjs',
+    source: "send(t('审查探针：甲\\r\\n乙'), t(`审查探针：甲\\r\\n乙`));",
+  }]);
+  assert.deepEqual([...scan.strings.keys()], ['审查探针：甲\r\n乙']);
+  // Only physical template CR/CRLF is cooked to LF, not explicit escapes or
+  // the Unicode line/paragraph separators that JavaScript preserves verbatim.
+  assert.equal(parseStringAt('`甲\u2028乙\u2029丙`', 0)?.value, '甲\u2028乙\u2029丙');
+  assert.equal(parseStringAt("'甲\r乙'", 0), null);
+  assert.equal(parseStringAt("'甲\n乙'", 0), null);
+  assert.equal(parseStringAt('`甲${suffix}`', 0), null);
+});
 
 test('a constant used in two modules resolves to the string of the module that uses it', () => {
   // A table keyed by identifier alone lets the last module of the walk win, so

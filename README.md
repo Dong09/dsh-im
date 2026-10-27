@@ -45,14 +45,30 @@
 
 ---
 
-<a id="recognition"></a>
+## ❤️ 赞助商
 
-> [!NOTE]
-> **DSH-IM 已获得 DeepSeek Harness 官方 Token 赞助，价值人民币 2,000 元**。感谢官方对本项目的支持！
->
-> 本项目由社区开发者独立开发与维护。
+<table width="100%">
+  <tr>
+    <td width="180" align="center" valign="middle">
+      <a href="https://88api.ai/sign-up?aff=lJoL"><img src="assets/sponsors/88api.jpg" alt="88API Token聚合平台" width="150"></a>
+    </td>
+    <td valign="middle">
+      <a href="https://88api.ai/sign-up?aff=lJoL"><strong>88API Token聚合平台</strong></a>赞助了本项目！88API 是一家由香港企业运营并且主要面向开发者、创作者与 AI 应用用户的一站式多模型 API 平台，通过统一接口接入文本、图片、语音和视频模型，覆盖 AI 编程、智能翻译、内容创作、配音、图像生成、视频生成等常见工作流。可提供高质量的折扣Deepseek官转算力和自有B300集群自部署Deepseek算力；支持国际主流付款方式，可提供发票，提供企业级稳定服务。<a href="https://88api.ai/sign-up?aff=lJoL"><strong>通过此链接注册可以获取专属赠送额度！</strong></a>
+    </td>
+  </tr>
+  <tr>
+    <td width="180" align="center" valign="middle">
+      <a id="recognition"></a>
+      <a href="https://github.com/deepseek-ai/deepseek-harness"><strong>DeepSeek<br>Harness</strong></a>
+    </td>
+    <td valign="middle">
+      <strong>DSH-IM 已获得 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> 官方 Token 赞助</strong>。感谢官方对本项目的支持！
+      <p>本项目由社区开发者独立开发与维护。</p>
+    </td>
+  </tr>
+</table>
 
-<!-- -->
+---
 
 > [!IMPORTANT]
 > **安装请认准完整包名：`@xmanrui/dsh-im`**

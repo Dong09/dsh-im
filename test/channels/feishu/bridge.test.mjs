@@ -6453,7 +6453,8 @@ test('workspace titles flow through both cards, refreshes, and path-based dropdo
   await bridge.waitForIdle();
   assert.deepEqual(selected, [paths[1]]);
   assert.equal(picker(JSON.parse(patches.at(-1).data.content)).options[0].text.content, '✓ 交流区');
-  assert.ok(sent.some((item) => item.msgType === 'text' && item.content.includes(paths[1])));
+  assert.ok(sent.some((item) => item.msgType === 'text'
+    && JSON.parse(item.content).text === `工作区已切换为：${paths[1]}`));
 
   await send('/workspacelist');
   const list = buttonsFromCard(sent.at(-1).content).filter((button) => callbackAction(button).startsWith('workspace:'));

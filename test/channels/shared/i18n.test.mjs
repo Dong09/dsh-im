@@ -15,6 +15,7 @@ import {
 import { EN } from '../../../src/channels/shared/i18n-en.mjs';
 import { RU } from '../../../src/channels/shared/i18n-ru.mjs';
 import { parseSessionListArgument } from '../../../src/channels/shared/workspace-command.mjs';
+import { parseStringAt } from './i18n-source-literal.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const srcChannelsDir = join(here, '..', '..', '..', 'src', 'channels');
@@ -284,6 +285,38 @@ test('dictionary source files do not define duplicate keys', async () => {
   }
 });
 
+function literalKeys(source) {
+  const keys = [];
+  for (const match of source.matchAll(/\bt\(\s*/gu)) {
+    const literal = parseStringAt(source, match.index + match[0].length);
+    if (literal) keys.push(literal.value);
+  }
+  return keys;
+}
+
+test('literal key coverage treats physical LF and CRLF alike and still detects missing keys', () => {
+  const known = '已进入批量输入模式，最多可发送 {limit} 条文字。\n完成后发送 /send，取消请发送 /cancel。';
+  const missing = '审查探针：第一行\n审查探针：确实缺失';
+  for (const eol of ['\n', '\r\n', '\r']) {
+    const keys = literalKeys(`t(\`${known.replaceAll('\n', eol)}\`);\nt(\`${missing.replaceAll('\n', eol)}\`);`);
+    assert.deepEqual(keys, [known, missing]);
+    for (const entries of [EN, RU]) {
+      assert.deepEqual(keys.filter((key) => !Object.hasOwn(entries, key)), [missing]);
+    }
+  }
+});
+
+test('literal key coverage does not normalize explicit CRLF escapes into a translated LF key', () => {
+  const lf = '已进入批量输入模式，最多可发送 {limit} 条文字。\n完成后发送 /send，取消请发送 /cancel。';
+  const crlf = lf.replaceAll('\n', '\r\n');
+  const keys = literalKeys(`t(\`${lf.replaceAll('\n', '\\r\\n')}\`);`);
+  assert.deepEqual(keys, [crlf]);
+  for (const entries of [EN, RU]) {
+    assert.ok(Object.hasOwn(entries, lf));
+    assert.deepEqual(keys.filter((key) => !Object.hasOwn(entries, key)), [crlf]);
+  }
+});
+
 test('every literal t() key in src/channels has an English and a Russian entry', () => {
   const files = [];
   const walk = (dir) => {
@@ -303,34 +336,14 @@ test('every literal t() key in src/channels has an English and a Russian entry',
   };
   walk(srcChannelsDir);
 
-  const keyPattern = /\bt\(\s*(['`])((?:[^\\`'"$]|\$(?!\{)|\\.)*)\1/g;
-  // Decode the escapes a real string literal would apply, so keys written as
-  // `...\n...` in source compare against the runtime dictionary key (newline).
-  const decodeLiteral = (raw) => {
-    let out = '';
-    for (let i = 0; i < raw.length; i += 1) {
-      if (raw[i] !== '\\' || i + 1 >= raw.length) {
-        out += raw[i];
-        continue;
-      }
-      const next = raw[i + 1];
-      if (next === 'n') out += '\n';
-      else if (next === 't') out += '\t';
-      else if (next === 'r') out += '\r';
-      else out += next; // \', \", \\, \` and anything else keep the char
-      i += 1;
-    }
-    return out;
-  };
   const missingEnglish = [];
   const missingRussian = [];
   for (const file of files) {
     const source = readFileSync(file, 'utf8');
-    for (const match of source.matchAll(keyPattern)) {
-      const key = decodeLiteral(match[2]);
+    for (const key of literalKeys(source)) {
       if (!/[\u4e00-\u9fff]/.test(key)) continue;
-      if (!Object.hasOwn(EN, key)) missingEnglish.push(`${file}: ${match[2]}`);
-      if (!Object.hasOwn(RU, key)) missingRussian.push(`${file}: ${match[2]}`);
+      if (!Object.hasOwn(EN, key)) missingEnglish.push(`${file}: ${key}`);
+      if (!Object.hasOwn(RU, key)) missingRussian.push(`${file}: ${key}`);
     }
   }
   assert.deepEqual(missingEnglish, [], 't() keys missing from the English dictionary');

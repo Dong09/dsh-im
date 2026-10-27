@@ -1,3 +1,5 @@
+// Email conversation keys contain Message-IDs or bound Session IDs, not
+// recipient addresses. Keep email targets explicit until a mapping is stored.
 const CHANNELS = new Set([
   'weixin',
   'feishu',
