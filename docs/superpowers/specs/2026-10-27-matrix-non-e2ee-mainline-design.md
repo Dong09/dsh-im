@@ -1,6 +1,6 @@
 # Matrix 非加密主线第一批优化设计
 
-状态：用户于 2026-10-27 批准设计并授权实施；已在隔离 worktree `dsh-im-matrix-mainline`（分支 `matrix/non-e2ee-mainline`）按五任务计划完成实施并通过隔离验证，未提交、未推送、未合并。源码基准：`d9fb1bd8`。
+状态：用户于 2026-10-27 批准设计并授权实施，现已完成实施与隔离验证；实现提交为 `1b232261`，原实施说明同步提交为 `2ad3f672`。源码基准：`d9fb1bd8`。长期决策见 [Matrix 非加密主线优化笔记](<../../../.agents/notes/implemented/bug-fix/2026-10-27-matrix-non-e2ee-mainline.md>)；后续消融简化仍为待实施提案。
 
 ## 目标与范围
 
