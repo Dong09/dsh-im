@@ -645,8 +645,17 @@ export class BotWorkspaceStore {
     return this.#enqueue(id, async () => {
       const existing = this.#sessionDirectories[id]?.[conversationKey];
       const current = this.conversationWorkspaceFor(id, conversationKey);
-      const base = existing?.base ?? current;
-      const sameConfig = existing?.workspace === current
+      const records = Object.values(this.#sessionDirectories[id] ?? {});
+      let base = existing?.base ?? current;
+      const visited = new Set();
+      while (!visited.has(base)) {
+        visited.add(base);
+        const parent = records.find((record) => record.workspace === base
+          || record.history?.includes(base))?.base;
+        if (!parent || parent === base) break;
+        base = parent;
+      }
+      const sameConfig = existing?.workspace === current && existing?.base === base
         && existing?.strategy === config.strategy && existing?.prefix === config.prefix;
       const reuse = sameConfig && (config.strategy === 'per-conversation'
         || (!explicitNew && existing?.pending));

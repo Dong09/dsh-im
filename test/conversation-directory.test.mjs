@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, realpath, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -64,4 +64,46 @@ test('conversation directory settings persist and new sessions follow the select
     later.workspace);
   assert.deepEqual(new Set(reloaded.conversationDirectoryPathsFor('bot_one')),
     new Set([first.workspace, next.workspace, later.workspace]));
+});
+
+test('group directories stay beside a generated private directory and repair nested records', async (t) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'dsh-im-group-dir-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 'workspaces.json');
+  const botId = 'bot_one';
+  const privateKey = 'p2p:alice';
+  const nestedKey = 'group:chat:managed:member';
+  const freshKey = 'group:other:managed:member';
+  const config = { enabled: true, strategy: 'per-conversation', prefix: 'feishu-' };
+  const store = await new BotWorkspaceStore(path, { defaultWorkspace: root }).load();
+  await store.ensure(botId);
+  await store.setConversationDirectory(botId, config);
+  const privateDirectory = (await store.prepareConversationDirectory(botId, privateKey)).workspace;
+  await store.setConversationDirectory(botId, { ...config, prefix: 'new-prefix-' });
+  const renamedPrivateDirectory = (await store.prepareConversationDirectory(botId, privateKey, {
+    explicitNew: true,
+  })).workspace;
+  assert.notEqual(renamedPrivateDirectory, privateDirectory);
+  await store.setConversationDirectory(botId, { enabled: false });
+  await store.setWorkspace(botId, privateDirectory);
+  await store.setConversationDirectory(botId, config);
+
+  const nestedDirectory = join(privateDirectory, 'old-group-directory');
+  await mkdir(nestedDirectory);
+  const document = JSON.parse(await readFile(path, 'utf8'));
+  document.sessionDirectories[botId][nestedKey] = {
+    base: privateDirectory, workspace: nestedDirectory, ...config,
+  };
+  document.conversationWorkspaces[botId][nestedKey] = nestedDirectory;
+  await writeFile(path, JSON.stringify(document));
+
+  const reloaded = await new BotWorkspaceStore(path, { defaultWorkspace: root }).load();
+  const fresh = await reloaded.prepareConversationDirectory(botId, freshKey);
+  const repaired = await reloaded.prepareConversationDirectory(botId, nestedKey, { explicitNew: true });
+  assert.equal(dirname(fresh.workspace), root);
+  assert.equal(dirname(repaired.workspace), root);
+  assert.notEqual(repaired.workspace, nestedDirectory);
+  assert.equal((await stat(nestedDirectory)).isDirectory(), true);
+  assert.ok(reloaded.conversationDirectoryPathsFor(botId).includes(nestedDirectory));
+  assert.equal((await reloaded.prepareConversationDirectory(botId, nestedKey)).workspace, repaired.workspace);
 });
