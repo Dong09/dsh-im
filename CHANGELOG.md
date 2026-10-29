@@ -6,10 +6,25 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 ## [Unreleased]
 
+## [5.8.0] - 2026-10-30
+
+### Added / 新增
+
+- 飞书新增会话目录隔离，支持每个对话固定目录或每次新会话创建新目录，可设置渠道默认、单机器人覆盖及目录前缀。目录直接创建在基工作区下，默认关闭；开启后禁止手动切换工作区，工作区列表默认隐藏隔离目录，使用 `/wsl all` 可查看全部。（[#422](https://github.com/xmanrui/dsh-im/pull/422)、[#481](https://github.com/xmanrui/dsh-im/pull/481)）
+  Added opt-in Feishu conversation directories, with a fixed directory per conversation or a new directory per session, channel defaults, per-bot overrides, and configurable prefixes. Directories are created directly under the base workspace. Manual workspace switching is disabled while enabled; workspace lists hide these directories by default, with `/wsl all` showing all entries. ([#422](https://github.com/xmanrui/dsh-im/pull/422), [#481](https://github.com/xmanrui/dsh-im/pull/481))
+
 ### Fixed / 修复
+
+- 飞书引用消息中的文件现在通过正常附件流程下载并交给会话处理；话题根消息与工作区重试保留附件引用，避免重复附加或重复下载文件。（[#353](https://github.com/xmanrui/dsh-im/issues/353)）
+  Files quoted in Feishu messages now pass through the normal inbound attachment pipeline. Topic-root handling and workspace retries preserve attachment references without adding or downloading the same quoted files repeatedly. ([#353](https://github.com/xmanrui/dsh-im/issues/353))
 
 - `session.prompt` 提交超时（30 秒窗口到期）不再直接判定消息失败：客户端会按本次请求的 RPC ID 回查 `session.history` 持久账本，确认消息已入库（含已入队、尚未开始执行的状态）则继续等待回复，取消请求也优先于超时定性；仅当确认不到时才上报失败，并把「提交请求超时、是否送达未知」与「已提交、结果未知」的提示文案区分开。修复 Host 繁忙时每条消息先收到「已尝试提交，但任务结果尚未确认」误报、正常回复随后照达的问题。
   A `session.prompt` submission timeout no longer fails the message outright: the client re-checks the durable `session.history` ledger by this request's RPC ID and keeps waiting for the reply once the message is confirmed as recorded (including the queued-but-not-yet-executing state), with cancellation taking precedence over the timeout; a failure is reported only when the message cannot be confirmed, with distinct wording for "submission request timed out, delivery unknown" versus "submitted, outcome unconfirmed". This fixes the false "submission attempted but unconfirmed" notice that appeared before every normal reply while the Host was busy.
+
+### Notes / 使用说明
+
+- 会话目录设置对新会话生效；发送 `/new` 使用新设置，已有会话和旧目录中的文件保留。依赖声明、Node.js 要求及 DSH 兼容声明保持不变。升级后重启 Host 并刷新管理页面。
+  Conversation directory settings apply to new sessions. Send `/new` to use updated settings; existing sessions and files in old directories are retained. Dependency declarations, Node.js requirements, and DSH compatibility declarations are unchanged. Restart the Host and refresh management pages after upgrading.
 
 ## [5.7.0] - 2026-10-28
 
@@ -2080,7 +2095,8 @@ Thanks to [@Dong09](https://github.com/Dong09) for the Matrix conversation-conte
 - 改进 npm 发布包结构，保留 CLI 入口并避免安装脚本拦截。
   Improved npm package contents to preserve the CLI entry point and avoid install-script blocking.
 
-[Unreleased]: https://github.com/xmanrui/dsh-im/compare/v5.7.0...HEAD
+[Unreleased]: https://github.com/xmanrui/dsh-im/compare/v5.8.0...HEAD
+[5.8.0]: https://github.com/xmanrui/dsh-im/compare/v5.7.0...v5.8.0
 [5.7.0]: https://github.com/xmanrui/dsh-im/compare/v5.6.0...v5.7.0
 [5.6.0]: https://github.com/xmanrui/dsh-im/compare/v5.5.0...v5.6.0
 [5.5.0]: https://github.com/xmanrui/dsh-im/compare/v5.4.0...v5.5.0
