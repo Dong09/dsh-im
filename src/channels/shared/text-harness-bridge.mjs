@@ -75,6 +75,7 @@ import {
 } from './message-failure.mjs';
 import { logDeliveryFailure } from './delivery-failure-log.mjs';
 import { beginStatusReaction } from './status-reaction.mjs';
+import { startNewConversation } from './new-command.mjs';
 
 /** Cap and TTL for the in-memory workspace-picker snapshots behind button presses. */
 const MAX_WORKSPACE_CARDS = 50;
@@ -1141,7 +1142,7 @@ export class TextHarnessBridge {
         return;
       }
       if (!hasImages && !hasFiles && command === '/new') {
-        await this.#state.clearSession(conversationKey);
+        const receipt = await startNewConversation({ state: this.#state, harness: this.#harness, key: conversationKey });
         if (this.#contextHooks?.onSessionCleared) {
           try {
             await this.#contextHooks.onSessionCleared(conversationKey);
@@ -1150,7 +1151,7 @@ export class TextHarnessBridge {
             this.#logger.warn?.(`[dsh-im:${this.#descriptor.key}] failed to reset context anchors after /new:`, error?.message ?? error);
           }
         }
-        await this.#bot.sendText(target, t('已开启新会话。请发送你的问题。'));
+        await this.#bot.sendText(target, `${receipt}\n${t('请发送你的问题。')}`);
         return;
       }
       const compactCommand = !hasImages && !hasFiles

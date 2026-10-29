@@ -6488,6 +6488,51 @@ test('workspace titles flow through both cards, refreshes, and path-based dropdo
   ]);
 });
 
+test('isolated Feishu workspace listings retain all while bare workspace commands stay disabled', async (t) => {
+  const root = realpathSync(await mkdtemp(join(tmpdir(), 'dsh-isolated-workspace-list-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const isolated = join(root, 'conv-generated');
+  mkdirSync(isolated);
+  let enabled = true;
+  const sent = [];
+  const bridge = new FeishuHarnessBridge({
+    client: cardClient(async (message) => sent.push(message)),
+    channel: {},
+    harness: {
+      ...sessionsHarness(0),
+      currentWorkspace: () => root,
+      conversationDirectoryConfig: () => ({ enabled }),
+      conversationDirectoryPaths: () => [isolated],
+      listWorkspaces: async () => [root, isolated],
+    },
+    state: stateFixture().state,
+    status: bridgeStatus(),
+    allowedSenderOpenIds: new Set(['ou_owner']),
+  });
+  let input = 0;
+  const send = async (text) => {
+    await bridge.accept(event(`isolation-list-${++input}`, text, { senderOpenId: 'ou_owner' }));
+    await bridge.waitForIdle();
+  };
+  const listed = () => buttonsFromCard(sent.at(-1).content)
+    .map(callbackAction).filter((action) => action.startsWith('workspace:'));
+
+  await send('/ws');
+  await send('/workspace');
+  assert.equal(sent.length, 0);
+  await send('/workspacelist');
+  assert.deepEqual(listed(), [`workspace:${root}`]);
+  await send('/workspacelist all');
+  assert.deepEqual(listed(), [`workspace:${root}`, `workspace:${isolated}`]);
+  enabled = false;
+  for (const command of ['/ws', '/workspace']) {
+    const before = sent.length;
+    await send(command);
+    assert.equal(sent.length, before + 1);
+    assert.deepEqual(listed(), [`workspace:${root}`]);
+  }
+});
+
 test('menu optional Host data is bounded by the card data timeout', async () => {
   const fixture = stateFixture();
   const waitForAbort = ({ signal }) => new Promise((resolve, reject) => {

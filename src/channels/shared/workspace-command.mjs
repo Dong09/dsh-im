@@ -112,18 +112,23 @@ async function selectedWorkspacePath(value) {
   }
 }
 
-export async function workspacePathSnapshot(harness, { includeTitles = false, ...options } = {}) {
+export async function workspacePathSnapshot(harness, { includeTitles = false, includeConversationDirectories = false, conversationKey, ...options } = {}) {
   const withEntries = includeTitles && typeof harness.listWorkspaceEntries === 'function';
   const listed = await (withEntries ? harness.listWorkspaceEntries(options) : harness.listWorkspaces(options));
-  const currentValue = typeof harness?.currentWorkspace === 'function'
-    ? harness.currentWorkspace()
-    : null;
+  const currentValue = typeof harness?.currentConversationWorkspace === 'function'
+    && typeof conversationKey === 'string' && conversationKey
+    ? harness.currentConversationWorkspace(conversationKey)
+    : typeof harness?.currentWorkspace === 'function'
+      ? harness.currentWorkspace()
+      : null;
   const current = await existingWorkspacePath(currentValue);
   const entries = await Promise.all((Array.isArray(listed) ? listed : []).map(async (item) => ({
     path: await existingWorkspacePath(withEntries ? item?.path : item),
     title: withEntries ? safeDisplayText(item?.title) : '',
   })));
-  const paths = [...new Set([...(current ? [current] : []), ...entries.map((item) => item.path).filter(Boolean)])];
+  const directoryPaths = new Set(harness.conversationDirectoryPaths?.() ?? []);
+  const paths = [...new Set([...(current ? [current] : []), ...entries.map((item) => item.path).filter(Boolean)])]
+    .filter((path) => includeConversationDirectories || path === current || !directoryPaths.has(path));
   const titles = {};
   if (includeTitles) {
     for (const item of entries) {
@@ -162,12 +167,14 @@ export function splitWorkspaceCommandMessage(message) {
  * channel without an interactive picker keeps exactly what it always showed;
  * `listing` is the machine-readable half a channel may render as a picker.
  */
-async function workspaceListingCommand(harness) {
+async function workspaceListingCommand(harness, { includeConversationDirectories = false } = {}) {
   if (typeof harness?.listWorkspaces !== 'function') {
     return commandResult(t('当前机器人暂不支持列出工作区。'));
   }
   try {
-    const { current, paths, titles } = await workspacePathSnapshot(harness, { includeTitles: true });
+    const { current, paths, titles } = await workspacePathSnapshot(harness, {
+      includeTitles: true, includeConversationDirectories,
+    });
     if (paths.length === 0) {
       return commandResult(t('当前 Harness Host 上没有仍然存在的已登记工作区。'));
     }
@@ -195,8 +202,9 @@ async function workspaceListingCommand(harness) {
 }
 
 async function runWorkspaceListCommand(match, harness) {
-  if (match[1]?.trim()) return commandResult(t('用法：/workspacelist'));
-  return workspaceListingCommand(harness);
+  const includeConversationDirectories = match[1]?.trim().toLowerCase() === 'all';
+  if (match[1]?.trim() && !includeConversationDirectories) return commandResult(t('用法：/workspacelist'));
+  return workspaceListingCommand(harness, { includeConversationDirectories });
 }
 
 async function conversationEffectiveWorkspace(harness, conversationKey) {
@@ -475,6 +483,7 @@ async function runConversationWorkspaceCommand(command, harness, conversationKey
   try {
     let selected = argument;
     if (/^\d+$/u.test(argument)) {
+      // Match the ordering shown by /workspacelist, /ws and bare /conv.
       const { paths } = await workspacePathSnapshot(harness);
       const position = Number(argument);
       if (!Number.isSafeInteger(position) || position < 1 || position > paths.length) {
@@ -516,6 +525,10 @@ export function workspaceSwitchFailureText(error) {
 
 export async function runWorkspaceCommand(text, harness, conversationKey) {
   if (!isWorkspaceCommand(text)) return null;
+  const config = harness.conversationDirectoryConfig?.();
+  if (config?.enabled === true && /^(?:\/(?:workspace|ws|conv|conversation|thread))(?:\s|$)/iu.test(text.trim())) {
+    return { message: '', messages: [] };
+  }
   const command = text.trim();
   const threadMatch = THREAD_WORKSPACE_COMMAND.exec(command);
   if (threadMatch) {

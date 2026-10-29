@@ -1,5 +1,10 @@
 // English translations (shared-a area). Keys are exact Chinese literals passed to t().
 export default {
+  '请发送你的问题。': 'Please send your question.',
+  '会话目录未生效：无法创建目录（权限或磁盘空间不足）；本次仍在原工作区运行。':
+    'Conversation directory isolation did not take effect: the directory could not be created. This session will use the original workspace.',
+  '会话目录未生效：无法切换目录；本次仍在原工作区运行。':
+    'Conversation directory isolation did not take effect: the directory could not be selected. This session will use the original workspace.',
   '这个问题已在其他客户端处理，无需再次回答。':
     'This question has already been answered from another client; no further reply is needed.',
   '任务已完成。': 'Task completed.',
