@@ -20,6 +20,7 @@ import { installDeliveryRpc } from './delivery-rpc.mjs';
 import { installDeliveryHttp } from './delivery-http.mjs';
 import { createDeliveryService } from './delivery-service.mjs';
 import { createDsBotClient } from './ds-bot-client.mjs';
+import { installDsBotQuestionSync } from './ds-bot-question-sync.mjs';
 import { installInboundTtlRpc } from './inbound-ttl-rpc.mjs';
 import { installSidebarSettingsRpc } from './sidebar-settings.mjs';
 import { installInjectedContext } from './injected-context.mjs';
@@ -110,6 +111,7 @@ export function createImHostPlugin(internals = {}) {
             deliveryService.send(botId, targetId, text, options)
           ),
           listTargets: async (botId) => (await deliveryService.listTargets(botId)).targets,
+          createTarget: (botId, target) => deliveryService.createTarget(botId, target),
           listBots: () => deliveryService.listBots(),
         }));
       }
@@ -217,6 +219,7 @@ export function createImHostPlugin(internals = {}) {
           logger,
           inputScope: ctx.root ?? ctx,
         });
+        installDsBotQuestionSync(ctx, deliveryService, { logger });
       } catch (error) {
         logger.error?.('[dsh-im] failed to activate Session sync; continuing with channels', error);
       }

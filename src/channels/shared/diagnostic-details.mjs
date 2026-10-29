@@ -13,6 +13,7 @@ const STAGES = new Set([
   'runtime.prepare', 'activation', 'harness.check', 'connection.start', 'connection.poll', 'connection.stop', 'status.read', 'rollback', 'management.request',
 ]);
 const REASONS = new Set([
+  'session-log-corrupt',
   'stream-closed-before-open', 'stream-failed-before-open', 'stream-failed',
   'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH', 'ENETUNREACH', 'ETIMEDOUT', 'EPIPE',
   'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',

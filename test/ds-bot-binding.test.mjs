@@ -332,3 +332,29 @@ test('sidebar avatars expose only bound current sessions, follow rollover and di
   await f.service.unbindDsBot('im-one', f.key);
   assert.deepEqual(await f.service.listDsBotSessions(), []);
 });
+
+test('DS Bot async question uses the registered route and rejects a stale answer', async () => {
+  let question = { id: 'q1', question: 'Continue?', options: [{ label: 'Yes' }] };
+  const calls = [];
+  const client = createDsBotClient({ connection: {
+    createPeer: (options) => ({ ...options, dispose() {} }),
+    createSharedFetchHandler: () => ({ async fetch(request, peer) {
+      assert.equal(peer.principal.kind, 'owner');
+      const body = await request.json();
+      calls.push(body);
+      if (body.endpoint === 'state') return Response.json({ ok: true, value: {
+        bots: [bot], questions: { [bot.sessionId]: question, unrelated: { id: 'private' } },
+      } });
+      if (!question) return Response.json({ ok: false, error: { code: 'bot/stale' } });
+      question = null;
+      return Response.json({ ok: true, value: true });
+    } }),
+  } });
+  assert.deepEqual(await client.question(bot.sessionId), question);
+  assert.equal(await client.question('old-session'), null);
+  assert.equal(await client.answerQuestion(bot.sessionId, 'q1', { selected: ['Yes'] }), true);
+  assert.deepEqual(calls.at(-1), { endpoint: 'answer-question', payload: {
+    sessionId: bot.sessionId, questionId: 'q1', answer: { selected: ['Yes'] },
+  } });
+  await assert.rejects(client.answerQuestion(bot.sessionId, 'q1', { selected: ['Yes'] }), { code: 'interaction-not-pending' });
+});

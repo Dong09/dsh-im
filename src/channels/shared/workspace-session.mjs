@@ -1,6 +1,7 @@
 import { withSessionBindingLock } from './session-binding-lock.mjs';
 import { initialSessionTitle } from './session-title.mjs';
-import { messageDiagnosticError } from './connection-error.mjs';
+import { extractConnectionEvidence, messageDiagnosticError } from './connection-error.mjs';
+import { t } from './i18n.mjs';
 
 export const WORKSPACE_SESSION_STALE = 'workspace-session-stale';
 
@@ -103,6 +104,7 @@ export async function askInWorkspaceSession({
   existsOptions,
   askOptions,
   deferredDelivery,
+  onNotice,
 }) {
   const initialTitle = contextEnhanced
     ? initialSessionTitle({
@@ -114,16 +116,20 @@ export async function askInWorkspaceSession({
   const renameSignal = createOptions?.signal
     ?? (typeof askOptions === 'object' ? askOptions?.signal : undefined);
   const renameOptions = renameSignal ? { signal: renameSignal } : undefined;
+  let unreadableSessionId;
   while (true) {
     const diagnostic = { stage: 'session.prepare', submissionState: 'not-submitted' };
+    let dsBotSession = false;
     try {
       const binding = await withSessionBindingLock(state, key, async () => {
         await awaitPendingConversationSwitch(harness, key);
         const dsBotSessionId = await harness.resolveDsBotSession?.(key);
+        dsBotSession = Boolean(dsBotSessionId);
         let sessionId = dsBotSessionId || state.sessionFor(key);
         diagnostic.sessionId = sessionId;
         let session = sessionId ? workspaceSession(harness, sessionId, key) : null;
-        if (!session || !(await sessionExists(session, existsOptions))) {
+        const replacingUnreadable = sessionId && sessionId === unreadableSessionId;
+        if (!session || replacingUnreadable || !(await sessionExists(session, existsOptions))) {
           if (dsBotSessionId) {
             throw Object.assign(new Error('DS Bot 的当前会话不可用。'), { code: 'ds-bot-unavailable' });
           }
@@ -153,12 +159,15 @@ export async function askInWorkspaceSession({
           if (conversationGenerationMoved(harness, key, conversationGeneration)) {
             throw workspaceSessionStaleError();
           }
-          return { sessionId, session };
+          return { sessionId, session, recovered: replacingUnreadable };
         }
         return { sessionId, session };
       });
       if (!binding) continue;
       diagnostic.sessionId = binding.sessionId;
+      if (binding.recovered) {
+        await onNotice?.(t('绑定会话的日志已损坏，已切换到新会话并继续处理本条消息。原会话记录已保留，历史上下文不会自动带入。'));
+      }
       diagnostic.stage = 'prompt.prepare';
       const artifacts = [];
       const originalOnArtifact = typeof askOptions === 'object'
@@ -203,7 +212,18 @@ export async function askInWorkspaceSession({
         ...(artifacts.length > 0 ? { artifacts } : {}),
       };
     } catch (error) {
-      if (error?.code !== WORKSPACE_SESSION_STALE) throw messageDiagnosticError(error, diagnostic);
+      const failure = messageDiagnosticError(error, diagnostic);
+      // Retry once, only with positive evidence that no prompt was submitted.
+      // The binding lock rechecks identity so a concurrent /new or workspace
+      // switch cannot be overwritten by recovery of the previous Session.
+      if (!unreadableSessionId && !dsBotSession && diagnostic.sessionId
+        && error?.code === 'session-unreadable'
+        && !renameSignal?.aborted && !existsOptions?.signal?.aborted
+        && extractConnectionEvidence(failure).details.submissionState === 'not-submitted') {
+        unreadableSessionId = diagnostic.sessionId;
+        continue;
+      }
+      if (error?.code !== WORKSPACE_SESSION_STALE) throw failure;
     }
   }
 }

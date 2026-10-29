@@ -1,5 +1,5 @@
 import { BusyMessageDispatcher, canAutomaticallySteer } from './busy-message-dispatcher.mjs';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 
 import { createDeferredDeliveryCoordinator, deferredOutcomeText } from './deferred-delivery-coordinator.mjs';
 import { t } from './i18n.mjs';
@@ -13,7 +13,7 @@ import {
   captureContextEnhancementSource,
   enhanceContextContent,
 } from './context-enhancement.mjs';
-import { runWorkspaceCommand } from './workspace-command.mjs';
+import { runWorkspaceCommand, workspaceSwitchFailureText } from './workspace-command.mjs';
 import { runCompactCommand } from './compact-command.mjs';
 import { isClearCommand, runClearCommand } from './clear-command.mjs';
 import { isHistoryCommand, runHistoryCommand } from './history-command.mjs';
@@ -73,8 +73,14 @@ import {
   messageFailureText,
   setLastMessageFailure,
 } from './message-failure.mjs';
+import { logDeliveryFailure } from './delivery-failure-log.mjs';
 import { beginStatusReaction } from './status-reaction.mjs';
 import { startNewConversation } from './new-command.mjs';
+
+/** Cap and TTL for the in-memory workspace-picker snapshots behind button presses. */
+const MAX_WORKSPACE_CARDS = 50;
+const WORKSPACE_CARD_TTL_MS = 60 * 60 * 1000;
+const WORKSPACE_CARD_NONCE_BYTES = 9;
 
 const INTERACTION_RESOLVED_TEXT = '这个问题已在其他客户端处理，无需再次回答。';
 const FILE_ONLY_COMPLETION_TEXT = '任务已完成。';
@@ -203,6 +209,11 @@ export class TextHarnessBridge {
   #approvals;
   #batches = new BatchInputManager();
   #interactionCard;
+  #workspaceCard;
+  // Workspace picker snapshots by nonce: the press carries an index, not a path.
+  #workspaceCards = new Map();
+  // Conversation key → the one picker card that is still authoritative there.
+  #workspaceCardKeys = new Map();
   #contextHooks = null;
   // Delivery attempts per message id. A failed turn releases its `markSeen` so
   // the next poll can retry, and this counter is what keeps that from becoming
@@ -230,6 +241,7 @@ export class TextHarnessBridge {
     signal,
     keepaliveIntervalMs = 4_000,
     interactionCard = null,
+    workspaceCard = null,
     contextHooks = null,
     autoSteerSameSender = false,
     autoSteerLimit = 0,
@@ -251,6 +263,7 @@ export class TextHarnessBridge {
     this.#signal = signal;
     this.#keepaliveIntervalMs = keepaliveIntervalMs;
     this.#interactionCard = interactionCard ?? null;
+    this.#workspaceCard = workspaceCard ?? null;
     // Opt-in follow-up lanes for channels whose groups run on rapid consecutive
     // posts: fold a same sender's burst into one dispatch, and steer that
     // sender's own mid-turn follow-ups into the in-flight turn instead of
@@ -1119,6 +1132,9 @@ export class TextHarnessBridge {
       const workspaceCommand = !hasImages && !hasFiles
         ? await runWorkspaceCommand(text, this.#harness, conversationKey)
         : null;
+      if (workspaceCommand && await this.#presentWorkspaceCommand(
+        target, workspaceCommand, conversationKey,
+      )) return;
       if (workspaceCommand) {
         for (const reply of workspaceCommand.messages ?? [workspaceCommand.message]) {
           await this.#bot.sendText(target, reply);
@@ -1275,6 +1291,7 @@ export class TextHarnessBridge {
       // the message instead of replaying a turn the Harness may already own.
       await this.#markPendingSubmitted(conversationKey, messageId);
       const { sessionId, answer, artifacts = [] } = await askInWorkspaceSession({
+        onNotice: (notice) => this.#bot.sendText(target, notice),
         deferredDelivery: () => ({ coordinator: this.#deferred, target: this.#descriptor.key === 'whatsapp' ? { jid: target.jid, selfChat: target.selfChat } : target }),
         harness: this.#harness,
         state: this.#state,
@@ -1309,6 +1326,10 @@ export class TextHarnessBridge {
               return;
             }
             if (update.type === 'reasoning') return;
+            // A carrier that delivers the answer as its own message must not
+            // stream that answer into itself first: the reader would see the
+            // reply twice, and every preview costs an edit.
+            if (update.type === 'text' && stream.previewAnswer === false) return;
             const progress = update.type === 'text' ? update.text
               : update.type === 'tool' ? t('正在使用{name}…', { name: update.name }) : update.text;
             if (progress) {
@@ -1356,12 +1377,16 @@ export class TextHarnessBridge {
       const answerFormat = fileOnlyCompletion ? 'plain' : 'markdown';
       let textDeliveryError = null;
       let textReceipt = null;
+      // What the channel observed about the send itself; it is written to the
+      // log together with the reference id the user is shown.
+      let deliveryEvidence = null;
       if (stream) {
         try {
           const result = await stream.finish(semanticStream || thinkingStream
             ? createTextDeliveryBlock(visibleAnswer, answerFormat)
             : visibleAnswer);
           streamFinished = true;
+          deliveryEvidence = result?.deliveryEvidence ?? deliveryEvidence;
           textReceipt = createDeliveryReceipt({
             deliveryId: messageId,
             presentation: result?.presentation
@@ -1391,6 +1416,7 @@ export class TextHarnessBridge {
                 createTextDeliveryBlock(visibleAnswer, answerFormat),
               )
             : await this.#bot.sendText(answerTarget, visibleAnswer);
+          deliveryEvidence = result?.deliveryEvidence ?? deliveryEvidence;
           textReceipt = createDeliveryReceipt({
             deliveryId: messageId,
             presentation: result?.presentation ?? `${this.#descriptor.key}-text`,
@@ -1400,6 +1426,7 @@ export class TextHarnessBridge {
           });
         } catch (error) {
           textDeliveryError = channelDeliveryFailure(error);
+          deliveryEvidence = error?.deliveryEvidence ?? deliveryEvidence;
         }
       }
       const finalDeliveryUnknown = textReceipt?.deliveryOutcome === 'unknown';
@@ -1413,6 +1440,11 @@ export class TextHarnessBridge {
           Object.assign(new Error('Final text delivery outcome is unknown'), { code: textReceipt.reason }),
         );
       }
+      if (textDeliveryError && deliveryEvidence) {
+        // The catch further down reports this error, and the log line must
+        // carry the same evidence the channel recorded for the failed send.
+        textDeliveryError.deliveryEvidence = deliveryEvidence;
+      }
       // A failed final text must not discard an already registered result file.
       // Settle the independent attachment path before surfacing the text error.
       const delivery = await this.#deliverArtifacts(target, messageId, artifacts, textReceipt);
@@ -1421,7 +1453,8 @@ export class TextHarnessBridge {
         throw textDeliveryError;
       }
       if (textDeliveryError && delivery.artifactSendErrors === 0) {
-        setLastMessageFailure(this.#status, textDeliveryError);
+        const failure = setLastMessageFailure(this.#status, textDeliveryError);
+        logDeliveryFailure(this.#logger, this.#descriptor.key, failure, textDeliveryError.deliveryEvidence);
       }
       if (delivery.userVisible) {
         this.#status.messagesReplied += 1;
@@ -1508,6 +1541,9 @@ export class TextHarnessBridge {
         `[dsh-im:${this.#descriptor.key}] failed to process a message [${failure.referenceId}]:`,
         messageFailureDiagnostic(error, failure),
       );
+      // One line per failed or unconfirmed delivery, carrying the same id the
+      // user will quote back: a reference id nobody can grep is useless.
+      logDeliveryFailure(this.#logger, this.#descriptor.key, failure, error?.deliveryEvidence);
       if (await presentStreamFailure(failureText)) {
         return error.deliveryReceipt;
       }
@@ -1801,6 +1837,10 @@ export class TextHarnessBridge {
     if (!conversationId || !senderId || !messageId || callback?.senderIsBot === true) return;
     const kind = callback.kind === 'group' ? 'group' : 'direct';
     const key = `${kind}:${conversationId}`;
+    // Workspace pickers are stateless cards, not pending questions: route their
+    // namespace before the question bookkeeping so a press can never touch it.
+    const workspacePress = this.#workspaceCard?.parse?.(callback.data) ?? null;
+    if (workspacePress) return this.#handleWorkspaceCardPress(callback, key, workspacePress);
     const pending = this.#pendingInteractions.get(key);
     const notice = (text) => this.#answerInteractionCallback(callback, text);
     if (!pending) return notice(t('该问题已处理，无需再次选择。'));
@@ -1866,6 +1906,168 @@ export class TextHarnessBridge {
       // A failed submission rolls the question back, so let the user press again.
       if (this.#pendingInteractions.get(key) === pending) pending.callbackClaimed = false;
     });
+  }
+
+  /**
+   * Send the merged /ws listing as an interactive picker when the channel and
+   * the payload support one. Returns false so the caller can fall back to the
+   * text list: a failed or impossible card must never lose the listing.
+   */
+  async #presentWorkspaceCommand(target, command, conversationKey) {
+    const listing = command?.listing;
+    if (!listing
+      || typeof this.#workspaceCard?.render !== 'function'
+      || typeof this.#bot.sendInteractionCard !== 'function') return false;
+    const nonce = randomBytes(WORKSPACE_CARD_NONCE_BYTES).toString('base64url');
+    const card = this.#workspaceCard.render(listing, { nonce });
+    if (!card) return false;
+    const entry = { listing, key: conversationKey, target, createdAt: Date.now(), submitting: false };
+    this.#rememberWorkspaceCard(nonce, entry);
+    try {
+      const sent = await this.#bot.sendInteractionCard(target, card);
+      entry.messageId = Array.isArray(sent?.providerMessageIds) && sent.providerMessageIds.length > 0
+        ? String(sent.providerMessageIds[0])
+        : undefined;
+      await this.#activateWorkspaceCard(conversationKey, nonce);
+      return true;
+    } catch (error) {
+      this.#workspaceCards.delete(nonce);
+      this.#logger.warn?.(
+        `[dsh-im:${this.#descriptor.key}] unable to send the workspace picker; `
+        + 'falling back to the text list:',
+        error?.message ?? error,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Only one picker stays authoritative per conversation. The previous card's
+   * keyboard is retired as soon as its replacement exists, so an old "current"
+   * marker can never be pressed after a newer list is on screen.
+   */
+  async #activateWorkspaceCard(conversationKey, nonce) {
+    const previousNonce = this.#workspaceCardKeys.get(conversationKey);
+    this.#workspaceCardKeys.set(conversationKey, nonce);
+    if (!previousNonce || previousNonce === nonce) return;
+    const previous = this.#workspaceCards.get(previousNonce);
+    this.#workspaceCards.delete(previousNonce);
+    if (!previous?.messageId) return;
+    await this.#retireCardKeyboard(previous.target, previous.messageId, previousNonce);
+  }
+
+  /** Drop a card's keyboard in place; failures are diagnostics, never user-facing. */
+  async #retireCardKeyboard(target, messageId, nonce) {
+    if (!target || !messageId || typeof this.#bot.updateInteractionCard !== 'function') return;
+    try {
+      await this.#bot.updateInteractionCard(target, String(messageId), {
+        markup: { inline_keyboard: [] },
+      });
+    } catch (error) {
+      // "message is not modified" and "message to edit not found" are both fine here.
+      this.#logger.warn?.(
+        `[dsh-im:${this.#descriptor.key}] unable to retire a workspace picker${nonce ? ` (${nonce})` : ''}:`,
+        error?.message ?? error,
+      );
+    }
+  }
+
+  #rememberWorkspaceCard(nonce, entry) {
+    const now = Date.now();
+    for (const [key, stored] of this.#workspaceCards) {
+      if (now - stored.createdAt > WORKSPACE_CARD_TTL_MS) this.#workspaceCards.delete(key);
+    }
+    // Keep the caller's object identity: it is the same entry whose messageId is
+    // filled in once the Bot API answers, and retirement reads it from here.
+    this.#workspaceCards.set(nonce, entry);
+    while (this.#workspaceCards.size > MAX_WORKSPACE_CARDS) {
+      const oldest = this.#workspaceCards.keys().next().value;
+      if (oldest === undefined) break;
+      this.#workspaceCards.delete(oldest);
+    }
+  }
+
+  /** Answer a workspace press through the current card snapshot. */
+  async #handleWorkspaceCardPress(callback, key, press) {
+    if (this.#signal?.aborted) return;
+    const notice = (text) => this.#answerInteractionCallback(callback, text);
+    const expired = t('这个列表已过期，请重新发送 /ws。');
+    const entry = this.#workspaceCards.get(press.nonce);
+    if (!entry || entry.key !== key || Date.now() - entry.createdAt > WORKSPACE_CARD_TTL_MS) {
+      // A card this bridge can still identify gets its dead keyboard removed so
+      // the same press is not offered again; an unrecognized card is only toasted
+      // because editing an id we never issued is not a safe assumption.
+      if (entry && entry.key === key) {
+        this.#workspaceCards.delete(press.nonce);
+        if (this.#workspaceCardKeys.get(key) === press.nonce) this.#workspaceCardKeys.delete(key);
+        await this.#retireCardKeyboard(
+          callback.replyTarget ?? entry.target,
+          String(callback.providerMessageId),
+          press.nonce,
+        );
+      }
+      return notice(expired);
+    }
+    const kind = callback.kind === 'group' ? 'group' : 'direct';
+    // The card is a command surface: the same command-permission gate as typing
+    // the command applies to a press, otherwise a keyboard could bypass it.
+    const decision = evaluateInboundAccess(this.#accessPolicy, {
+      conversationType: kind,
+      senderIds: [cleanText(callback.senderId)].filter(Boolean),
+      isCommand: true,
+    });
+    if (!decision.allowed) return notice(t(COMMAND_PERMISSION_DENIED_MESSAGE));
+    const path = entry.listing?.paths?.[press.index];
+    if (typeof path !== 'string') return notice(expired);
+    // Claim synchronously, before the first await: a second press arriving
+    // while the switch is in flight must not switch a second time.
+    if (entry.submitting) return notice(t('正在切换工作区，请稍候。'));
+    // Idempotency follows the live authoritative current, not the snapshot: a
+    // typed /ws or another card may have switched since this one was sent.
+    let liveCurrent = null;
+    try {
+      if (typeof this.#harness.currentWorkspace === 'function') {
+        liveCurrent = this.#harness.currentWorkspace();
+      }
+    } catch {
+      // A failed read only loses the pre-check; the switch below still reports.
+    }
+    // The card's current marker is only a display snapshot; it cannot prove
+    // that another command or conversation has not changed the bot workspace.
+    if (path === liveCurrent) {
+      return notice(t('已经在工作区：{workspace}', { workspace: path }));
+    }
+    entry.submitting = true;
+    try {
+      const switched = await this.#harness.switchWorkspace(path);
+      const current = typeof switched === 'string' && switched ? switched : path;
+      // Keep the snapshot truthful: the next press compares against this value.
+      entry.listing = { ...entry.listing, current };
+      const card = this.#workspaceCard.render(entry.listing, { nonce: press.nonce });
+      if (card && typeof this.#bot.updateInteractionCard === 'function') {
+        try {
+          await this.#bot.updateInteractionCard(
+            callback.replyTarget ?? entry.target,
+            String(callback.providerMessageId),
+            { markup: card.markup },
+          );
+        } catch (error) {
+          this.#logger.warn?.(
+            `[dsh-im:${this.#descriptor.key}] unable to re-mark the workspace picker:`,
+            error?.message ?? error,
+          );
+        }
+      }
+      return await notice(t('工作区已切换为：{workspace}', { workspace: current }));
+    } catch (error) {
+      // Same classification as the typed command, so a card press and /ws N
+      // cannot word the same failure differently.
+      return notice(
+        workspaceSwitchFailureText(error) ?? t('暂时无法切换工作区，请稍后重试。'),
+      );
+    } finally {
+      entry.submitting = false;
+    }
   }
 
   async presentSessionSyncApproval(interaction, context, options = {}) {

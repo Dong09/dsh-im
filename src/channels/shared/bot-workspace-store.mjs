@@ -1855,7 +1855,7 @@ export function createBotWorkspaceScope(
   const dsBinding = (key) => workspaces.dsBotBindingFor?.(botId, key);
   const assertNoDsBinding = (key) => {
     if (dsBinding(key)) {
-      throw deliveryTargetError('ds-bot-bound', '请先在“绑定bot”中解除绑定，再切换会话或工作目录。');
+      throw deliveryTargetError('ds-bot-bound', t('请先在“绑定 DS Bot”中解除绑定，再切换会话或工作目录。'));
     }
   };
   const presetSettings = async (catalog = agentPresetCatalog) => {

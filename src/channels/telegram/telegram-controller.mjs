@@ -2,8 +2,13 @@ import { TokenBotController } from '../shared/token-bot-controller.mjs';
 import {
   deriveTelegramBotIdentity,
   maskTelegramBotId,
+  normalizeSendLimitPerMinute,
   normalizeTelegramAccessPolicy,
 } from './config-store.mjs';
+import {
+  normalizeThinkingIntervalSeconds,
+  normalizeThinkingNumbering,
+} from '../shared/thinking-cadence.mjs';
 import {
   GROUP_TRIGGER_VERSION,
   groupTriggersSettings,
@@ -54,7 +59,11 @@ export class TelegramController extends TokenBotController {
           accessPolicy,
           // Default ON; only an explicit false in the config opts out.
           thinkingTraces: config?.thinkingTraces !== false,
+          thinkingNumbering: normalizeThinkingNumbering(config?.thinkingNumbering),
+          // 0 means no pacing, which is also what an absent field means.
+          thinkingIntervalSeconds: normalizeThinkingIntervalSeconds(config?.thinkingIntervalSeconds),
           groupTriggers: normalizeGroupTriggers(config?.groupTriggers),
+          sendLimitPerMinute: normalizeSendLimitPerMinute(config?.sendLimitPerMinute),
         };
       }),
     };
@@ -70,6 +79,26 @@ export class TelegramController extends TokenBotController {
       ...config,
       thinkingTraces: value === true,
     }));
+  }
+
+  /**
+   * Persist trace numbering and pacing; the runtime restarts with the new
+   * values, so the next turn already follows them.
+   */
+  async setThinkingCadence(botId, { thinkingNumbering, thinkingIntervalSeconds } = {}) {
+    const numbering = normalizeThinkingNumbering(thinkingNumbering);
+    const interval = normalizeThinkingIntervalSeconds(thinkingIntervalSeconds);
+    return this.updateBotConfig(botId, (config) => ({
+      ...config,
+      thinkingNumbering: numbering,
+      thinkingIntervalSeconds: interval,
+    }));
+  }
+
+  /** Persist the per-chat send limit; the runtime restarts with the new value. */
+  async setSendLimitPerMinute(botId, value) {
+    const sendLimitPerMinute = normalizeSendLimitPerMinute(value);
+    return this.updateBotConfig(botId, (config) => ({ ...config, sendLimitPerMinute }));
   }
 
   /** Channels the bot has actually received messages from. */

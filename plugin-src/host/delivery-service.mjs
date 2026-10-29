@@ -357,6 +357,48 @@ export class DeliveryService {
     return targets;
   }
 
+  /** Offer a question to one unambiguous bound private chat, like synced approvals. */
+  async presentSessionSyncQuestion(sessionId, interaction, options = {}) {
+    const { signal } = options;
+    const targets = await this.listSessionSyncTargets(sessionId);
+    if (signal?.aborted || targets.length === 0) return false;
+    const candidates = new Map();
+    let unresolvedTarget = false;
+    for (const target of targets) {
+      try {
+        const adapter = await this.#adapterFor(target.botId);
+        if (typeof adapter.describeSessionSyncQuestionTarget !== 'function') {
+          unresolvedTarget = true;
+          continue;
+        }
+        const info = await adapter.describeSessionSyncQuestionTarget(target.botId, target.targetId, sessionId);
+        candidates.set(JSON.stringify([target.channel, target.botId, info.conversationKey]), { adapter, target });
+      } catch {
+        unresolvedTarget = true;
+      }
+    }
+    if (signal?.aborted) return false;
+    if (!unresolvedTarget && candidates.size === 1) {
+      const { adapter, target } = candidates.values().next().value;
+      try {
+        if (await adapter.presentSessionSyncQuestion?.(target.botId, target.targetId, sessionId, interaction, options)) {
+          return true;
+        }
+      } catch (error) {
+        if (!signal?.aborted) console.warn('[dsh-im] synced question unavailable:', error?.code ?? error?.name);
+      }
+    }
+    if (!signal?.aborted) {
+      const results = await Promise.allSettled(targets.map((target) => this.sendSessionSyncText(
+        target.botId, target.targetId, sessionId, t('本会话有问题等待回答，请在桌面端回答。'), { signal },
+      )));
+      if (results.every((result) => result.status === 'rejected')) {
+        console.warn('[dsh-im] synced question notice could not be delivered');
+      }
+    }
+    return false;
+  }
+
   /** Offer one existing bound private chat the same approval the Host is awaiting. */
   async presentSessionSyncApproval(sessionId, interaction, { signal, completion } = {}) {
     const targets = (await this.listSessionSyncTargets(sessionId))

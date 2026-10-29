@@ -6453,10 +6453,23 @@ test('workspace titles flow through both cards, refreshes, and path-based dropdo
   await bridge.waitForIdle();
   assert.deepEqual(selected, [paths[1]]);
   assert.equal(picker(JSON.parse(patches.at(-1).data.content)).options[0].text.content, '✓ 交流区');
+  assert.ok(sent.some((item) => item.msgType === 'text'
+    && JSON.parse(item.content).text === `工作区已切换为：${paths[1]}`));
 
   await send('/workspacelist');
   const list = buttonsFromCard(sent.at(-1).content).filter((button) => callbackAction(button).startsWith('workspace:'));
   assert.deepEqual(list.map((button) => button.text.content), ['1. 交流区（当前）', '2. 策略研究']);
+  // Merged command: the bare /workspace and /ws open the same picker card.
+  for (const alias of ['/ws', '/workspace']) {
+    await send(alias);
+    const aliased = buttonsFromCard(sent.at(-1).content)
+      .filter((button) => callbackAction(button).startsWith('workspace:'));
+    assert.deepEqual(
+      aliased.map((button) => button.text.content),
+      ['1. 交流区（当前）', '2. 策略研究'],
+      alias,
+    );
+  }
   await send('2');
   assert.deepEqual(selected, [paths[1], paths[0]]);
 
@@ -6473,6 +6486,51 @@ test('workspace titles flow through both cards, refreshes, and path-based dropdo
   assert.deepEqual(picker(sent.at(-1).content).options, [
     { text: { tag: 'plain_text', content: '✓ b' }, value: paths[1] },
   ]);
+});
+
+test('isolated Feishu workspace listings retain all while bare workspace commands stay disabled', async (t) => {
+  const root = realpathSync(await mkdtemp(join(tmpdir(), 'dsh-isolated-workspace-list-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const isolated = join(root, 'conv-generated');
+  mkdirSync(isolated);
+  let enabled = true;
+  const sent = [];
+  const bridge = new FeishuHarnessBridge({
+    client: cardClient(async (message) => sent.push(message)),
+    channel: {},
+    harness: {
+      ...sessionsHarness(0),
+      currentWorkspace: () => root,
+      conversationDirectoryConfig: () => ({ enabled }),
+      conversationDirectoryPaths: () => [isolated],
+      listWorkspaces: async () => [root, isolated],
+    },
+    state: stateFixture().state,
+    status: bridgeStatus(),
+    allowedSenderOpenIds: new Set(['ou_owner']),
+  });
+  let input = 0;
+  const send = async (text) => {
+    await bridge.accept(event(`isolation-list-${++input}`, text, { senderOpenId: 'ou_owner' }));
+    await bridge.waitForIdle();
+  };
+  const listed = () => buttonsFromCard(sent.at(-1).content)
+    .map(callbackAction).filter((action) => action.startsWith('workspace:'));
+
+  await send('/ws');
+  await send('/workspace');
+  assert.equal(sent.length, 0);
+  await send('/workspacelist');
+  assert.deepEqual(listed(), [`workspace:${root}`]);
+  await send('/workspacelist all');
+  assert.deepEqual(listed(), [`workspace:${root}`, `workspace:${isolated}`]);
+  enabled = false;
+  for (const command of ['/ws', '/workspace']) {
+    const before = sent.length;
+    await send(command);
+    assert.equal(sent.length, before + 1);
+    assert.deepEqual(listed(), [`workspace:${root}`]);
+  }
 });
 
 test('menu optional Host data is bounded by the card data timeout', async () => {
@@ -12862,7 +12920,7 @@ test('plain IM replies (stepPush off) register the in-flight turn and never open
 });
 
 // Topic deduplication must follow the real Harness session, not message parsing.
-function topicAnchorFixture({ mode = 'text', ...options } = {}) {
+function topicAnchorFixture({ mode = 'text', quotedFile = false, ...options } = {}) {
   const fixture = stateFixture();
   const asked = [];
   const reads = [];
@@ -12876,8 +12934,11 @@ function topicAnchorFixture({ mode = 'text', ...options } = {}) {
   client.im.v1.message.get = async (request) => {
     reads.push(request.path.message_id);
     return { code: 0, data: { items: [{
-      message_id: request.path.message_id, chat_id: 'oc_group', msg_type: 'text',
-      body: { content: JSON.stringify({ text: `REPORT:${request.path.message_id}` }) },
+      message_id: request.path.message_id, chat_id: 'oc_group',
+      msg_type: quotedFile ? 'file' : 'text',
+      body: { content: JSON.stringify(quotedFile
+        ? { file_key: 'quoted-file-key', file_name: 'quoted.txt' }
+        : { text: `REPORT:${request.path.message_id}` }) },
     }] } };
   };
   const harness = {
@@ -13046,6 +13107,27 @@ test('missing AI sessions and stale-workspace retries receive the topic anchor a
   };
   await f.send();
   assert.ok(hasAnchor(f.asked[2].text), 'replacement session must rebuild content with its anchor');
+});
+
+test('stale-workspace retries do not duplicate quoted files or current files', async () => {
+  const f = topicAnchorFixture({ quotedFile: true });
+  let stale = true;
+  const attemptFileCounts = [];
+  const ask = f.harness.ask;
+  f.harness.ask = async (...args) => {
+    attemptFileCounts.push(args[2]?.files?.length ?? 0);
+    assert.equal(attemptFileCounts.at(-1), 1, 'each attempt receives one quoted file');
+    if (stale) {
+      stale = false;
+      await f.state.clearSession('group:oc_group:thread:omt_anchor');
+      throw Object.assign(new Error('workspace moved'), { code: 'workspace-session-stale' });
+    }
+    return ask(...args);
+  };
+  await f.send();
+  assert.deepEqual(attemptFileCounts, [1, 1]);
+  assert.equal(f.asked.length, 1);
+  assert.equal(f.asked[0].options.files.length, 1);
 });
 
 test('topic anchors are isolated between bots and between topics', async () => {
@@ -13510,5 +13592,48 @@ for (const scenario of ['final rewrite', 'shrink and regrow', 'unchanged draft']
     for (let n = 0; n < 6; n++) assert.equal(delivered.join('\n').split(`### FINAL_T${n}`).length - 1, 1);
     assert.match(delivered.at(-1), /_已完成_/);
     assert.deepEqual(fx.text, []);
+  });
+}
+
+for (const mode of ['text', 'stream', 'fallback']) {
+  test(`corrupt Session recovery sends a Feishu notice before the answer (${mode})`, async () => {
+    const fixture = stateFixture([['p2p:ou_user', 'corrupt-session']]);
+    const sent = [];
+    let created = 0;
+    const status = bridgeStatus();
+    const bridge = new FeishuHarnessBridge({
+      client: textClient(message => sent.push(message.text)),
+      ...(mode === 'text' ? {} : { channel: { stream: async (_chatId, input) => {
+        if (mode === 'fallback') throw new Error('stream unavailable');
+        await input.markdown({ setContent: async text => sent.push(text) });
+        return { messageId: 'om_stream' };
+      } } }),
+      state: fixture.state, status,
+      allowedSenderOpenIds: new Set(['ou_user']),
+      harness: {
+        ensureRunning: async () => {},
+        sessionExists: async id => {
+          if (id === 'corrupt-session') throw Object.assign(new Error('unreadable'), { code: 'session-unreadable' });
+          return true;
+        },
+        createSession: async () => { created++; return 'replacement-session'; },
+        ask: async (id, text) => {
+          assert.equal(id, 'replacement-session');
+          assert.equal(text, 'recovery test');
+          assert.equal(sent.length, 1);
+          assert.match(sent[0], /日志已损坏.*新会话/u);
+          return 'RECOVERY_OK';
+        },
+      },
+      logger: { warn() {} },
+    });
+    bridge.accept(event(`om_corrupt_${mode}`, 'recovery test'));
+    await bridge.waitForIdle();
+    assert.equal(created, 1);
+    assert.equal(fixture.sessions.get('p2p:ou_user'), 'replacement-session');
+    assert.equal(sent.length, 2);
+    assert.equal(sent[1], 'RECOVERY_OK');
+    assert.equal(status.messagesReplied, 1);
+    assert.equal(status.lastError, null);
   });
 }

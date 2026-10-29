@@ -71,6 +71,7 @@ import {
   COMMAND_PERMISSION_DENIED_MESSAGE,
   evaluateInboundAccess,
 } from '../shared/inbound-access.mjs';
+import { ApiError } from '@tencent-connect/qqbot-nodejs';
 import { sendMarkdownReply } from './markdown-reply.mjs';
 import {
   isQqMenuCommand, parseQqMenuCommand, QqMenuStore,
@@ -267,6 +268,28 @@ export function qqInboundMessage(message, { fetchImpl = fetch } = {}) {
     files,
     ...(replyTo ? { replyTo } : {}),
   };
+}
+
+// QQ accepts passive replies to an inbound msg_id for a bounded window
+// (C2C 60 min, group 5 min). Proactive C2C/group sends are quota-limited and
+// are often refused, so a late result keeps the passive route while the
+// window is still open and only falls back to proactive delivery after it.
+const PASSIVE_REPLY_WINDOW_MS = Object.freeze({ c2c: 60 * 60_000, group: 5 * 60_000 });
+const PASSIVE_REPLY_MARGIN_MS = 30_000;
+
+function deferredQqTarget(message, target, acceptedAt) {
+  const route = { scope: target.scope, targetId: target.targetId };
+  const msgId = nonEmptyString(target.msgId);
+  if (!msgId || !PASSIVE_REPLY_WINDOW_MS[target.scope]) return route;
+  const sentAt = Date.parse(message?.timestamp ?? '');
+  return { ...route, msgId, receivedAt: Number.isFinite(sentAt) ? Math.min(sentAt, acceptedAt) : acceptedAt };
+}
+
+export function deferredDeliveryTarget(target, now = Date.now()) {
+  const route = { scope: target?.scope, targetId: target?.targetId };
+  const window = PASSIVE_REPLY_WINDOW_MS[target?.scope];
+  if (!nonEmptyString(target?.msgId) || !window || !Number.isFinite(target?.receivedAt)) return route;
+  return now - target.receivedAt < window - PASSIVE_REPLY_MARGIN_MS ? { ...route, msgId: target.msgId } : route;
 }
 
 function nonEmptyString(value) {
@@ -896,7 +919,22 @@ export class QqHarnessBridge {
   }
 
   async #deliverDeferredOutcome(entry, outcome) {
-    await sendMarkdownReply(this.#bot, entry.target, deferredOutcomeText(outcome), { logger: this.#logger });
+    const text = deferredOutcomeText(outcome);
+    const target = deferredDeliveryTarget(entry.target);
+    if (!target.msgId) {
+      await sendMarkdownReply(this.#bot, target, text, { logger: this.#logger });
+      return true;
+    }
+    try {
+      // The timeout notice already answered this msg_id once.
+      await sendMarkdownReply(this.#bot, target, text, { logger: this.#logger, passiveRepliesUsed: 1 });
+    } catch (error) {
+      // Nothing was sent and QQ definitely refused the passive reply (window
+      // closed early or budget spent), so the proactive route cannot duplicate it.
+      if (!(error instanceof ApiError) || !(error.httpStatus >= 400 && error.httpStatus < 500)) throw error;
+      this.#logger.warn?.('[dsh-im:qq] passive deferred reply was refused; retrying proactively:', error);
+      await sendMarkdownReply(this.#bot, { scope: target.scope, targetId: target.targetId }, text, { logger: this.#logger });
+    }
     return true;
   }
 
@@ -1155,6 +1193,7 @@ export class QqHarnessBridge {
     batchSubmission = null,
   } = {}) {
     if (this.#signal?.aborted) return;
+    const acceptedAt = Date.now();
     const messageId = nonEmptyString(message?.messageId);
     const sender = nonEmptyString(message?.senderId);
     if (!messageId || !sender || message.senderIsBot === true) return;
@@ -1272,7 +1311,8 @@ export class QqHarnessBridge {
         // already own.
         await this.#markPendingSubmitted(key, messageId);
         ({ answer, artifacts = [] } = await askInWorkspaceSession({
-          deferredDelivery: () => ({ coordinator: this.#deferred, target: { scope: target.scope, targetId: target.targetId } }),
+          onNotice: (notice) => this.#bot.sendText(target, notice),
+          deferredDelivery: () => ({ coordinator: this.#deferred, target: deferredQqTarget(message, target, acceptedAt) }),
           harness: this.#harness,
           state: this.#state,
           key,

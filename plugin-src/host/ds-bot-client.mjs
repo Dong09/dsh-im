@@ -20,6 +20,22 @@ function appearance(bot) {
 /** Read DS Bot through the current Host's registered route, without a second
  * runtime, credentials, or assumptions about its configured storage directory. */
 export function createDsBotClient(ctx) {
+  async function call(endpoint, payload = {}) {
+    const connection = ctx.connection;
+    if (typeof connection?.createSharedFetchHandler !== 'function') throw dsBotError();
+    const response = await connection.createSharedFetchHandler('/api').fetch(new Request(
+      'http://localhost/api/bot', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ endpoint, payload }), signal: AbortSignal.timeout(15_000),
+      },
+    ), harnessPeer(ctx));
+    if (!response.ok) throw dsBotError();
+    const result = await response.json();
+    if (result?.ok !== true) {
+      throw dsBotError(result?.error?.code === 'bot/stale' ? 'interaction-not-pending' : 'ds-bot-unavailable');
+    }
+    return result.value;
+  }
   async function status() {
     try {
       const manager = ctx.get?.('pluginManager');
@@ -29,26 +45,12 @@ export function createDsBotClient(ctx) {
         if (!bundle?.installed) return { state: 'missing', bots: [] };
         if (!bundle.enabled) return { state: 'disabled', bots: [] };
       }
-      const connection = ctx.connection;
-      if (typeof connection?.createSharedFetchHandler !== 'function') {
+      const value = await call('state');
+      if (!Array.isArray(value?.bots)) {
         return { state: 'unavailable', bots: [] };
       }
-      const response = await connection.createSharedFetchHandler('/api').fetch(new Request(
-        'http://localhost/api/bot',
-        {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ endpoint: 'state', payload: {} }),
-          signal: AbortSignal.timeout(15_000),
-        },
-      ), harnessPeer(ctx));
-      if (!response.ok) return { state: 'unavailable', bots: [] };
-      const result = await response.json();
-      if (result?.ok !== true || !Array.isArray(result.value?.bots)) {
-        return { state: 'unavailable', bots: [] };
-      }
-      if (result.value.readOnly) return { state: 'readonly', bots: [] };
-      const bots = result.value.bots.filter((bot) => (
+      if (value.readOnly) return { state: 'readonly', bots: [] };
+      const bots = value.bots.filter((bot) => (
         typeof bot.id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(bot.id)
         && typeof bot.sessionId === 'string' && Boolean(bot.sessionId)
         && typeof bot.name === 'string'
@@ -63,6 +65,17 @@ export function createDsBotClient(ctx) {
   }
   return Object.freeze({
     status,
+    async question(sessionId) {
+      const value = await call('state');
+      if (value?.readOnly) throw dsBotError();
+      if (!value?.bots?.some((bot) => bot.sessionId === sessionId)) return null;
+      const question = value.questions?.[sessionId];
+      return typeof question?.id === 'string' && typeof question.question === 'string'
+        && Array.isArray(question.options) ? question : null;
+    },
+    answerQuestion(sessionId, questionId, answer) {
+      return call('answer-question', { sessionId, questionId, answer });
+    },
     async resolve(id) {
       const result = await status();
       if (result.state !== 'ready') throw dsBotError();

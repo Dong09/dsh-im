@@ -94,13 +94,27 @@ test('/session N selects from the same effective workspace as /sessionlist', asy
   assert.equal(f.workspaces.conversationWorkspaceFor(f.botId, f.key), f.alternateWorkspace);
 });
 
-test('/conv N numbers workspaces from the conversation effective workspace', async (t) => {
-  const f = await fixture(t);
-  await f.command(`/conv ${f.alternateWorkspace}`);
-  const result = await f.command('/conv 1');
-  assert.match(result.message, new RegExp(f.alternateWorkspace.replaceAll('\\', '\\\\'), 'u'));
-  assert.equal(f.workspaces.conversationWorkspaceFor(f.botId, f.key), f.alternateWorkspace);
-});
+for (const listingCommand of ['/workspacelist', '/conv', '/ws']) {
+  for (const position of [1, 2]) {
+    test(`${listingCommand} and /conv ${position} agree after a conversation override`, async (t) => {
+      const f = await fixture(t);
+      await f.command(`/conv ${f.alternateWorkspace}`);
+      const listing = await f.command(listingCommand);
+      const paths = [f.defaultWorkspace, f.alternateWorkspace];
+      const numbered = listing.message.split('\n').filter((line) => /^\d+\. /u.test(line));
+      assert.equal(numbered.length, paths.length);
+      for (const [index, path] of paths.entries()) {
+        assert.ok(numbered[index].startsWith(`${index + 1}. ${path}`), listing.message);
+      }
+
+      await f.command(`/conv ${position}`);
+      assert.equal(f.workspaces.conversationWorkspaceFor(f.botId, f.key), paths[position - 1]);
+      await f.ask();
+      assert.equal(f.asked.at(-1).workspace, paths[position - 1]);
+      assert.equal(f.workspaces.workspaceFor(f.botId), f.defaultWorkspace);
+    });
+  }
+}
 
 test('/session N still follows the bot default without an override', async (t) => {
   const f = await fixture(t);
@@ -183,6 +197,8 @@ test('/workspacelist hides earlier per-session directories after a new session',
   assert.ok(!listing.includes(first.workspace));
   assert.ok(!listing.includes(second.workspace));
   assert.ok(listing.includes(f.defaultWorkspace));
+  const all = await f.command('/workspacelist all');
+  assert.deepEqual(all.listing.paths, [f.defaultWorkspace, first.workspace, second.workspace]);
 });
 
 test('/conv reports persisted explicit bindings and following the bot default', async (t) => {

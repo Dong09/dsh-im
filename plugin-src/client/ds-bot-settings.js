@@ -7,7 +7,7 @@ export const DS_BOT_MESSAGES = Object.freeze({
   disabled: 'DS Bot 尚未启用，请在 DSH 插件管理中启用后刷新。',
   unavailable: '暂时无法读取 DS Bot，请检查插件是否正常运行后重试。',
   readonly: 'DS Bot 当前由其他 Host 管理，请在运行它的 Host 中绑定。',
-  remote: '绑定bot仅支持当前 Host 的会话，请先检查机器人的 Harness 连接设置。',
+  remote: '绑定 DS Bot 仅支持当前 Host 的会话，请先检查机器人的 Harness 连接设置。',
 });
 
 export function dsBotErrorMessage(error) {
@@ -149,9 +149,9 @@ export function DsBotSettingsPage({ botId, rpcCall }) {
       setFeedbackTone('error'); setFeedback(dsBotErrorMessage(error));
     } finally { requests.current.busy = false; setBusy(false); }
   };
-  return h('section', { className: 'dim-deliveryTargets dim-dsBotSettings', 'aria-label': '绑定bot' },
+  return h('section', { className: 'dim-deliveryTargets dim-dsBotSettings', 'aria-label': '绑定 DS Bot' },
     h('div', { className: 'dim-deliverySectionHeading' },
-      h('div', null, h('h3', null, '绑定bot'), h('p', null, '选择 DS Bot 和私聊对象，直接使用 Bot 的会话。')),
+      h('div', null, h('h3', null, '绑定 DS Bot'), h('p', null, '选择 DS Bot 和私聊对象，直接使用 Bot 的会话。')),
       h('button', { className: 'dim-deliveryButton', type: 'button', disabled: busy || loading, onClick: () => void refresh() }, '刷新')),
     !status ? h('p', { className: 'dim-dsBotNotice', role: 'status' }, '正在检测 DS Bot…')
       : status.state !== 'ready' ? h('p', { className: 'dim-dsBotNotice', role: 'status' }, DS_BOT_MESSAGES[status.state] ?? DS_BOT_MESSAGES.unavailable)

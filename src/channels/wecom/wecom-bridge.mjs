@@ -1463,6 +1463,7 @@ export class WecomHarnessBridge {
       await this.#state.markSeen(messageId);
       promptRecorded = true;
       const { answer, artifacts = [] } = await askInWorkspaceSession({
+        onNotice: (notice) => this.#sendActive(chatId, notice),
         deferredDelivery: () => ({ coordinator: this.#deferred, target: { chatId } }),
         harness: this.#harness,
         state: this.#state,

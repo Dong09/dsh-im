@@ -713,6 +713,16 @@ export class FeishuRuntime {
     }, options);
   }
 
+  async presentSessionSyncQuestion(target, interaction, options = {}) {
+    if (!this.#status.ready || !this.#bridge || target?.kind !== 'user') return false;
+    const actor = nonEmptyString(target.route?.openId);
+    if (!actor) return false;
+    return this.#bridge.presentSessionSyncQuestion(interaction, {
+      key: options.key, actor, validate: options.validate,
+      chatId: actor, receiveIdType: 'open_id', requiresMention: false,
+    }, options);
+  }
+
   async sendProactiveText(target, text, { signal, format = 'plain', receipt = false } = {}) {
     if (!this.#status.ready || !this.#client) {
       const error = new Error('飞书机器人尚未连接');
@@ -938,7 +948,19 @@ export class FeishuRuntime {
     wsClient?.close({ force: true });
     const bridge = this.#bridge;
     this.#bridge = null;
-    if (bridge) await bridge.waitForIdle();
+    let timer;
+    try {
+      const idle = await Promise.race([
+        (bridge?.waitForIdle() ?? Promise.resolve()).then(() => true),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(false), 2_000);
+          timer.unref?.();
+        }),
+      ]);
+      if (!idle) this.#logger.warn?.('[dsh-feishu] bridge idle wait timed out after 2000ms; continuing cleanup');
+    } finally {
+      clearTimeout(timer);
+    }
     this.#client = null;
     this.#status.feishuLongConnectionState = preserveError ? 'failed' : 'idle';
     this.#status.slashCommandRegistration = 'idle';

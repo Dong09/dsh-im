@@ -146,6 +146,8 @@ const UNWATCH_COMMAND = /^\/unwatch(?:\s+([^\s]+))?$/i;
 const WATCHLIST_COMMAND = /^\/watchlist$/i;
 const SESSION_LIST_PREFIX = /^\/(?:sessionlist|sessions)(?:\s|$)/i;
 const WORKSPACE_LIST_COMMAND = /^\/(?:workspacelist|workspaces|wsl)(?:\s+all)?$/i;
+// After the merge a bare /workspace or /ws opens the same picker card.
+const BARE_WORKSPACE_COMMAND = /^\/(?:workspace|ws)$/i;
 const NUMBER_REPLY = /^\d{1,2}$/;
 /** A displayed menu stays number-tappable for this long. */
 const MENU_TTL_MS = 10 * 60_000;
@@ -1896,7 +1898,9 @@ export class FeishuHarnessBridge {
       );
       return;
     }
-    if (WORKSPACE_LIST_COMMAND.test(commandText)) {
+    if (BARE_WORKSPACE_COMMAND.test(commandText)
+      && this.#harness.conversationDirectoryConfig?.()?.enabled === true) return;
+    if (BARE_WORKSPACE_COMMAND.test(commandText) || WORKSPACE_LIST_COMMAND.test(commandText)) {
       await this.#showWorkspaces({ chatId: event.message.chat_id, key, replyTo: event.message.message_id }, {
         includeConversationDirectories: /\s+all$/iu.test(commandText),
       });
@@ -2020,7 +2024,12 @@ export class FeishuHarnessBridge {
       }
       throw error;
     } finally {
-      await this.#cancelPendingInteraction(key);
+      // Synced questions (including DS Bot's ask_user) outlive the turn that
+      // presented them. Only turn-owned questions belong to this cleanup;
+      // their failed-delivery/error paths must still resolve by cancellation.
+      if (this.#pendingInteractions.get(key)?.lifecycle !== 'session-sync') {
+        await this.#cancelPendingInteraction(key);
+      }
       await this.#approvals.closeRoute(key);
       this.#voiceTurns.delete(key);
     }
@@ -5382,10 +5391,15 @@ export class FeishuHarnessBridge {
 
   async #preparePrompt(event, key, message) {
     const snapshot = this.#acceptedMessageIds.get(event.message.message_id);
+    const originalFiles = Array.isArray(message.files) ? [...message.files] : [];
     const build = async (input) => {
       const rich = hasInboundImages(input) || hasReplyReference(input);
       const original = rich
-        ? await promptContentForInboundMessage(input, { signal: this.#signal, deferImages: true })
+        ? await promptContentForInboundMessage(input, {
+          signal: this.#signal,
+          deferImages: true,
+          originalFiles,
+        })
         : input.content;
       const enhanced = enhanceContextContent(original, snapshot, () => ({
         channel: 'feishu',
@@ -5407,7 +5421,12 @@ export class FeishuHarnessBridge {
       && (nonEmptyString(message.content) || hasInboundImages(message) || hasInboundFiles(message));
     if (!topicAnchor) return build(message);
 
-    const withoutAnchor = { ...message };
+    // Keep the temporary topic-root copy connected to the final request's
+    // attachment array. Reply resolution may append lazy files to it.
+    const withoutAnchor = {
+      ...message,
+      files: Array.isArray(message.files) ? message.files : (message.files = []),
+    };
     delete withoutAnchor.replyTo;
     const base = await build(withoutAnchor);
     let preparedSessionId;
@@ -5423,6 +5442,7 @@ export class FeishuHarnessBridge {
         }
         const prepared = await build({
           ...message,
+          files: message.files,
           replyTo: {
             ...message.replyTo,
             load: async (options) => {
@@ -5568,6 +5588,7 @@ export class FeishuHarnessBridge {
     let completed;
     try {
       completed = await askInWorkspaceSession({
+        onNotice: (notice) => this.#send(chatId, notice, { replyTo: messageId }),
       deferredDelivery: () => ({ coordinator: this.#deferred, chatId, replyToMessageId: messageId }),
       harness: this.#harness,
       state: this.#state,
@@ -5818,6 +5839,7 @@ export class FeishuHarnessBridge {
     const { content, contextEnhanced } = prompt;
     if (!this.#channel?.stream) {
       const { sessionId, answer, artifacts = [] } = await askInWorkspaceSession({
+        onNotice: (notice) => this.#send(chatId, notice, { replyTo: messageId }),
         deferredDelivery: () => ({ coordinator: this.#deferred, chatId, replyToMessageId: messageId }),
         harness: this.#harness,
         state: this.#state,
@@ -5901,6 +5923,7 @@ export class FeishuHarnessBridge {
             },
           };
           const completed = await askInWorkspaceSession({
+            onNotice: (notice) => this.#send(chatId, notice, { replyTo: messageId }),
             deferredDelivery: () => ({ coordinator: this.#deferred, chatId, replyToMessageId: messageId }),
             harness: this.#harness,
             state: this.#state,
@@ -5976,6 +5999,7 @@ export class FeishuHarnessBridge {
 
       this.#logger.warn?.('[dsh-feishu] native stream unavailable; using text fallback:', error.message);
       const { sessionId, answer, artifacts = [] } = await askInWorkspaceSession({
+        onNotice: (notice) => this.#send(chatId, notice, { replyTo: messageId }),
         deferredDelivery: () => ({ coordinator: this.#deferred, chatId, replyToMessageId: messageId }),
         harness: this.#harness,
         state: this.#state,
@@ -6082,6 +6106,7 @@ export class FeishuHarnessBridge {
       });
     }
     pending.chatId = event.message.chat_id;
+    pending.receiveIdType = 'chat_id';
     if (pending.needsPresentation) {
       try {
         await this.#presentInteraction(pending);
@@ -6137,9 +6162,17 @@ export class FeishuHarnessBridge {
   }
 
   async #submitQuestionAnswer(pending, answerText, { chatId, messageId, questionMessageId } = {}) {
+    const expectedIndex = pending.index;
+    try { if (pending.validate) await pending.validate(); }
+    catch {
+      if (chatId) await this.#send(chatId, INTERACTION_RESOLVED_TEXT(), { replyTo: messageId }).catch(() => undefined);
+      return;
+    }
+    if (pending.inactive || pending.submitting || pending.index !== expectedIndex) return;
     const question = pending.questions[pending.index];
     if (!question) return;
     pending.chatId = chatId ?? pending.chatId;
+    if (chatId) pending.receiveIdType = 'chat_id';
 
     // issue #162：已答状态卡以推进前的题号渲染，并整卡替换原提问卡。
     const answeredIndex = pending.index;
@@ -6274,12 +6307,72 @@ export class FeishuHarnessBridge {
     });
   }
 
+  /** Use the normal question/reply state machine without submitting a new IM prompt. */
+  async presentSessionSyncQuestion(interaction, context, { signal, completion } = {}) {
+    if (signal?.aborted || this.#signal?.aborted || this.#hasPendingInteraction(context.key)) return false;
+    let finished = false;
+    const cleanup = () => {
+      finished = true;
+      signal?.removeEventListener('abort', finish);
+      this.#signal?.removeEventListener('abort', onStop);
+    };
+    const finish = () => {
+      const pending = this.#pendingInteractions.get(context.key);
+      if (pending?.interactionId === interaction.interactionId) {
+        this.#rememberResolvedInteraction(context.key, pending);
+        this.#clearPendingInteraction(context.key, pending.interactionId);
+      }
+      cleanup();
+    };
+    const withdraw = async () => {
+      finish();
+      await interaction.withdraw?.();
+    };
+    const onStop = () => {
+      void withdraw().catch((error) => this.#logger.warn?.('[dsh-feishu] question withdrawal failed:', error?.code));
+    };
+    const validate = async () => {
+      try {
+        await context.validate?.();
+        if (finished || signal?.aborted || this.#signal?.aborted
+          || (!this.#accessPolicy && !this.#allowedSenderOpenIds.has('*')
+            && !this.#allowedSenderOpenIds.has(context.actor))
+          || !context.actor || !evaluateInboundAccess(this.#accessPolicy, {
+            conversationType: 'direct', senderIds: [context.actor], text: 'yes',
+          }).allowed) throw new Error('Question recipient is no longer available');
+      } catch (cause) {
+        await withdraw();
+        throw Object.assign(new Error('Question is no longer answerable', { cause }), { code: 'interaction-not-pending' });
+      }
+    };
+    signal?.addEventListener('abort', finish, { once: true });
+    this.#signal?.addEventListener('abort', onStop, { once: true });
+    Promise.resolve(completion).then(finish, finish);
+    try {
+      await validate();
+      await this.#handleInteraction(interaction, {
+        ...context, validate, onClear: cleanup, lifecycle: 'session-sync',
+      });
+      if (finished) finish(); // A completion during delivery must not leave a pending behind.
+      const available = !finished && this.#pendingInteractions.get(context.key)?.interactionId === interaction.interactionId;
+      if (!available) cleanup();
+      return available;
+    } catch (error) {
+      await withdraw();
+      throw error;
+    }
+  }
+
   async #handleInteraction(interaction, {
     key,
     actor,
     chatId,
     requiresMention,
     replyToMessageId,
+    receiveIdType,
+    validate,
+    onClear,
+    lifecycle = 'turn',
   }) {
     if (await this.#approvals.handleRequested(interaction, this.#approvalContext({
       key, actor, chatId, requiresMention, replyToMessageId,
@@ -6326,6 +6419,10 @@ export class FeishuHarnessBridge {
     }
     if (this.#interactionKeys.has(interactionId)) return;
     if (existing) {
+      if (interaction.withdraw) {
+        await interaction.withdraw();
+        return;
+      }
       await interaction.respond({
         ok: false,
         error: {
@@ -6350,6 +6447,10 @@ export class FeishuHarnessBridge {
       index: 0,
       chatId,
       replyToMessageId,
+      receiveIdType,
+      validate,
+      onClear,
+      lifecycle,
       queue: null,
       claimedReplyMessageId: null,
       submitting: false,
@@ -6375,6 +6476,8 @@ export class FeishuHarnessBridge {
   }
 
   async #presentInteraction(pending) {
+    if (pending.validate) await pending.validate();
+    if (pending.inactive) return;
     const question = pending.questions[pending.index];
     if (!question) return;
     const options = Array.isArray(question?.options) ? question.options : [];
@@ -6402,7 +6505,7 @@ export class FeishuHarnessBridge {
           index: pending.index,
           total: pending.questions.length,
         }),
-        { key: pending.key, replyTo: pending.replyToMessageId },
+        { key: pending.key, replyTo: pending.replyToMessageId, receiveIdType: pending.receiveIdType },
       ).then((sent) => {
         presentedAsCard = true;
         return sent;
@@ -6410,12 +6513,14 @@ export class FeishuHarnessBridge {
         // Fall back to the plain-text question if the card cannot be sent.
         // If the text send also fails, let the error propagate so the pending
         // question is not marked as presented and the existing retry logic runs.
+        if (pending.inactive) return null;
+        if (pending.validate) await pending.validate();
         return this.#send(
           pending.chatId,
           harnessQuestionText(question, pending.index, pending.questions.length, {
             requiresMention: pending.requiresMention,
           }),
-          { replyTo: pending.replyToMessageId },
+          { replyTo: pending.replyToMessageId, receiveIdType: pending.receiveIdType },
         );
       });
     } else {
@@ -6428,7 +6533,7 @@ export class FeishuHarnessBridge {
           pending.questions.length,
           { requiresMention: pending.requiresMention },
         ),
-        { replyTo: pending.replyToMessageId },
+        { replyTo: pending.replyToMessageId, receiveIdType: pending.receiveIdType },
       );
     }
     if (messageId) {
@@ -6482,6 +6587,7 @@ export class FeishuHarnessBridge {
     this.#pendingInteractions.delete(key);
     this.#interactionKeys.delete(pending.interactionId);
     pending.inactive = true;
+    pending.onClear?.();
     return pending;
   }
 
@@ -6494,6 +6600,13 @@ export class FeishuHarnessBridge {
     if (!pending || pending.kind !== 'question') return;
     this.#rememberResolvedInteraction(key, pending);
     try {
+      // A synced question is owned by its upstream provider, not this IM turn.
+      // Withdraw the IM route so the provider also releases its delivery state;
+      // DS Bot's answer endpoint does not accept a Harness cancellation answer.
+      if (pending.lifecycle === 'session-sync' && pending.interaction.withdraw) {
+        await pending.interaction.withdraw();
+        return;
+      }
       await pending.interaction.respond({
         ok: false,
         error: {
@@ -6538,7 +6651,7 @@ export class FeishuHarnessBridge {
     else processingReaction.success();
   }
 
-  async #send(chatId, text, { replyTo } = {}) {
+  async #send(chatId, text, { replyTo, receiveIdType = 'chat_id' } = {}) {
     const content = JSON.stringify({ text });
     if (replyTo) {
       try {
@@ -6567,7 +6680,7 @@ export class FeishuHarnessBridge {
       }
     }
     const response = await this.#client.im.v1.message.create({
-      params: { receive_id_type: 'chat_id' },
+      params: { receive_id_type: receiveIdType },
       data: {
         receive_id: chatId,
         msg_type: 'text',

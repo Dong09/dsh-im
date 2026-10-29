@@ -6,6 +6,115 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 ## [Unreleased]
 
+## [5.7.0] - 2026-10-28
+
+### Added / 新增
+
+- 投递目标设置支持邮箱渠道，可显式填写收件人地址；不会把邮箱会话的 Message-ID 或 Session ID 当作地址自动生成目标。（[#451](https://github.com/xmanrui/dsh-im/pull/451)）
+  Delivery target settings now support email with an explicit recipient address. Email Message-IDs and Session IDs are not treated as recipient addresses for automatic target suggestions. ([#451](https://github.com/xmanrui/dsh-im/pull/451))
+
+### Fixed / 修复
+
+- 飞书停止运行时，为桥接层空闲等待设置 2 秒上限，避免未结束任务无限阻塞后续清理。（[#465](https://github.com/xmanrui/dsh-im/pull/465)）
+  Feishu shutdown now limits the bridge idle wait to 2 seconds so unfinished tasks cannot block subsequent cleanup indefinitely. ([#465](https://github.com/xmanrui/dsh-im/pull/465))
+- 修复带渠道图标的会话标题在滚动展示时仍被预先截断的问题，使长标题能够完整展示。（[#455](https://github.com/xmanrui/dsh-im/pull/455)）
+  Fixed channel-marked session titles remaining pre-clipped during marquee scrolling, allowing the full title to become visible. ([#455](https://github.com/xmanrui/dsh-im/pull/455))
+- 串行处理同路径更新状态文件的读写，Windows 原子替换遇到临时 EPERM 时有限重试并保留旧文件，避免并发状态查询损坏更新记录；同步修正跨平台测试基线。（[#456](https://github.com/xmanrui/dsh-im/pull/456)）
+  Serialized update-state reads and writes per path, with bounded retries for transient Windows EPERM during atomic replacement while preserving the old file. Concurrent status reads no longer disrupt update journals; cross-platform test baselines were also corrected. ([#456](https://github.com/xmanrui/dsh-im/pull/456))
+
+- 企业微信机器人被服务端断开后，若「正在连接」连续超过 2 分钟无状态更新，则自动重启连接；存活不足 5 分钟即再次掉线的连接与启动失败按 bot 共享 1–10 分钟指数退避，连接持续稳定 5 分钟后清零。正常 SDK 重连不受影响，手动重连始终立即执行。（[#420](https://github.com/xmanrui/dsh-im/pull/420)）
+  WeCom bots recover automatically when a server-side disconnect leaves them in "connecting" without a state update for over 2 minutes. Connections that drop again within 5 minutes and failed starts share per-bot exponential backoff from 1 to 10 minutes, cleared after 5 minutes of stable connectivity. Active SDK retries are unchanged, and manual reconnects remain immediate. ([#420](https://github.com/xmanrui/dsh-im/pull/420))
+
+- QQ 回复超时后迟到的结果改为在 QQ 被动回复窗口内（私聊 60 分钟、群 5 分钟，各留 30 秒余量）带原消息 `msg_id` 被动回复，不再一律走常被平台拒绝的主动消息；超时提示已占用的一次被动额度会计入。窗口外或平台明确拒绝被动回复时，回退为一次主动发送。
+  A late QQ result after a reply timeout is now sent as a passive reply to the original `msg_id` while QQ's window is open (C2C 60 min, group 5 min, each minus a 30 s margin), instead of always going out as a proactive message that QQ often refuses. The passive slot used by the timeout notice is counted. Outside the window, or when QQ definitely refuses the passive reply, it falls back to one proactive send.
+
+- Slack 流式定稿在追加失败或最终文本被重写时，改用 `chat.update` 的 `markdown_text`，不再以 `parse: none` 发送原始 GFM。Markdown block 被拒绝时先重试 `markdown_text`；只有 Markdown 本身被拒绝时才按字面文本发送，避免把 `**` 和表格当成 mrkdwn。（[#466](https://github.com/xmanrui/dsh-im/issues/466)）
+  Slack stream finalization now updates with `markdown_text` when appending fails or the final text is rewritten, instead of sending raw GFM with `parse: none`. A rejected Markdown block retries `markdown_text`; literal text is used only when the Markdown itself is rejected, so `**` and tables are not parsed as mrkdwn. ([#466](https://github.com/xmanrui/dsh-im/issues/466))
+
+### Security / 安全
+
+- 更新构建锁中的 qs 从 6.16.0 至 6.17.0 并重新构建 Host，纳入逗号数组序列化触发未捕获异常的修复（[GHSA-6pq8-jhm2-2vcw](https://github.com/advisories/GHSA-6pq8-jhm2-2vcw)）。
+  Updated build-lock qs from 6.16.0 to 6.17.0 and rebuilt the Host to include the fix for uncaught exceptions during comma-array serialization ([GHSA-6pq8-jhm2-2vcw](https://github.com/advisories/GHSA-6pq8-jhm2-2vcw)).
+
+### Notes / 使用说明
+
+- 中英文 README 新增赞助展示。依赖声明、Node.js 要求及 DSH 兼容声明保持不变；升级后重启 Host 并刷新管理页面。
+  Added sponsor information to the Chinese and English READMEs. Dependency declarations, Node.js requirements, and DSH compatibility declarations remain unchanged. Restart the Host and refresh management pages after upgrading.
+
+## [5.6.0] - 2026-10-24
+
+### Added / 新增
+
+- Telegram 的 `/ws`（`/workspace`）无参数时显示工作区切换卡片，点击按钮即可切换并更新当前项；保留带序号或绝对路径的直接切换，以及 `/wsl`、`/workspaces`、`/workspacelist` 文本别名。过期卡片与重复点击安全处理，工作区列表变更时不会按旧序号误切，卡片不可用时回退文字列表。（[#432](https://github.com/xmanrui/dsh-im/pull/432)）
+  Telegram `/ws` (`/workspace`) without arguments now shows an inline workspace picker. Buttons switch workspaces and update the current selection; direct index/path switching and the `/wsl`, `/workspaces`, and `/workspacelist` aliases remain supported. Stale cards and duplicate clicks are handled safely, changed lists cannot redirect old indices, and unavailable cards fall back to text. ([#432](https://github.com/xmanrui/dsh-im/pull/432))
+- Telegram 投递失败或结果不确定时，将用户提示中的 `MF-…` 编号与发送尝试、分片回执、失败正文写入同一条本地日志，保留富文本回退及过程消息的投递证据，便于定位未送达内容。（[#442](https://github.com/xmanrui/dsh-im/pull/442)）
+  Telegram failed or unconfirmed deliveries now log the user-visible `MF-…` reference alongside send attempts, part acknowledgments, and undelivered text, retaining rich-text fallback and thinking-stream evidence for diagnosis. ([#442](https://github.com/xmanrui/dsh-im/pull/442))
+
+### Fixed / 修复
+
+- 确认普通绑定会话的日志损坏且消息尚未提交时，自动切换到新会话并提示后继续本条消息，最多恢复一次；保留原会话，不自动迁移历史上下文，不将归档、权限、临时故障或提交状态不确定的情况误判为损坏，也不替换 DS Bot 会话。（[#445](https://github.com/xmanrui/dsh-im/pull/445)）
+  Confirmed corrupt logs in ordinary bound sessions can recover once into a new session before prompt submission, with a notice before continuing. Original sessions remain intact and history is not migrated. Archived, inaccessible, transient, uncertain-submission, and DS Bot session failures do not trigger this replacement. ([#445](https://github.com/xmanrui/dsh-im/pull/445))
+- 修复运行时拼接文案仅显示英文或翻译不完整的问题，完善渠道状态、凭据绑定及管理设置中的动态英文、俄语翻译，并补充回归覆盖。（[#443](https://github.com/xmanrui/dsh-im/pull/443)）
+  Fixed incomplete or English-only runtime-composed messages, improving dynamic English and Russian localization across channel status, credential binding, and management settings with regression coverage. ([#443](https://github.com/xmanrui/dsh-im/pull/443))
+- 管理界面统一使用“绑定 DS Bot”等明确标签，避免与 IM 渠道机器人混淆。
+  Clarified DS Bot binding labels in management settings to distinguish DS Bot from IM channel bots.
+- 修复飞书私聊发起 DS Bot 提问后，回合收尾误取消新问题卡、点击提示“已在其他客户端处理”的问题；同步问题按自身生命周期结束，撤回时同步释放投递状态，保留普通 Harness 问答及发送失败时的取消清理。（[#447](https://github.com/xmanrui/dsh-im/issues/447)）
+  Fixed Feishu-initiated DS Bot questions being cancelled by turn cleanup immediately after delivery. Synced questions now retain their own lifetime and release upstream delivery state on withdrawal, while ordinary Harness questions and failed-delivery cancellation retain their existing cleanup. ([#447](https://github.com/xmanrui/dsh-im/issues/447))
+
+### Security / 安全
+
+- Undici 更新到 7.30.1，Nodemailer 最低版本提高至 10.1.4，Mailparser 最低版本提高至 3.9.43，纳入上游 HTTP 响应处理及邮件地址解析安全修复。（[Undici 公告](https://github.com/advisories/GHSA-xjj6-f33q-929c)、[Nodemailer 公告](https://github.com/advisories/GHSA-8c8m-p3m8-cjg8)）
+  Updated Undici to 7.30.1 and raised minimum versions to Nodemailer 10.1.4 and Mailparser 3.9.43, incorporating upstream HTTP response handling and email address parsing security fixes. ([Undici advisory](https://github.com/advisories/GHSA-xjj6-f33q-929c), [Nodemailer advisory](https://github.com/advisories/GHSA-8c8m-p3m8-cjg8))
+
+### Notes / 使用说明
+
+- Telegram 失败投递日志可能包含未送达的消息正文、聊天和话题标识；分享日志前请检查并脱敏。日志中的平台错误说明会过滤匹配的 Bot Token URL，但消息正文按原样记录。
+  Telegram delivery-failure logs can contain undelivered message text and chat/topic identifiers. Review and redact logs before sharing. Matching bot-token URLs are scrubbed from provider error descriptions, while message text is retained verbatim.
+- Node.js 要求及 DSH 兼容声明保持不变。升级后重启 Host 并刷新管理页面。感谢 [@wings1848](https://github.com/wings1848) 的工作区卡片贡献和 [@unera](https://github.com/unera) 的翻译及投递诊断改进。
+  Node.js requirements and DSH compatibility declarations are unchanged. Restart the Host and refresh management pages after upgrading. Thanks to [@wings1848](https://github.com/wings1848) for workspace cards and [@unera](https://github.com/unera) for localization and delivery diagnostics.
+
+## [5.5.0] - 2026-10-24
+
+### Added / 新增
+
+- Telegram 支持通过 Host 的 `speechToText` 服务转写语音及音频附件，再将转写文本交给会话处理；规范 WAV 可直接使用，其他格式通过本机 ffmpeg 转换。未配置服务、未选择提供方或转写失败时保留无文本语音提示，不虚构转写内容。（[#405](https://github.com/xmanrui/dsh-im/pull/405)）
+  Telegram can transcribe voice and audio attachments through the Host's `speechToText` service and pass the transcript to the conversation. Canonical WAV is used directly; other formats are converted with local ffmpeg. Missing services, unselected providers, and transcription failures retain a textless-voice notice without inventing a transcript. ([#405](https://github.com/xmanrui/dsh-im/pull/405))
+
+- Telegram 新增逐聊天发送预算，默认每分钟 15 条，可配置为 1–30 条；新消息等待可用额度，编辑、草稿、输入状态及表情不占用该队列。发送遇到 429 时按 `retry_after` 有限重试，最终无法投递时明确报告失败。（[#423](https://github.com/xmanrui/dsh-im/pull/423)）
+  Added a per-chat Telegram send budget, defaulting to 15 new messages per minute and configurable from 1 to 30. New sends wait for capacity; edits, drafts, typing actions, and reactions bypass that queue. Sends receiving 429 use bounded `retry_after` retries and report failure if delivery cannot complete. ([#423](https://github.com/xmanrui/dsh-im/pull/423))
+
+- Telegram 过程消息支持 0–60 秒发送间隔和可选编号，窗口内合并为最新进度，结束时先处理待发进度再发送答案；进度占位消息也显示编号，取消后清理待发帧与定时器。默认不节流、不编号。（[#425](https://github.com/xmanrui/dsh-im/pull/425)、[#426](https://github.com/xmanrui/dsh-im/pull/426)）
+  Telegram thinking traces support a 0–60-second cadence and optional numbering. Bursts coalesce to the latest progress, pending progress settles before the final answer, and placeholder progress is numbered too. Cancellation clears pending frames and timers. Pacing and numbering are off by default. ([#425](https://github.com/xmanrui/dsh-im/pull/425), [#426](https://github.com/xmanrui/dsh-im/pull/426))
+
+- 新增 Host 消息与设置界面的俄语翻译、客户端俄语语言包及翻译覆盖检查；中文语言标签继续使用中文，俄语使用俄语，其余语言回退到英文，俄语缺失条目先回退英文。（[#438](https://github.com/xmanrui/dsh-im/pull/438)、[#439](https://github.com/xmanrui/dsh-im/pull/439)、[#440](https://github.com/xmanrui/dsh-im/pull/440)）
+  Added Russian Host messages, settings translations, a client language pack, and dictionary coverage checks. Chinese locale tags retain Chinese, Russian selects Russian, and other locales fall back to English; missing Russian entries fall back to English first. ([#438](https://github.com/xmanrui/dsh-im/pull/438), [#439](https://github.com/xmanrui/dsh-im/pull/439), [#440](https://github.com/xmanrui/dsh-im/pull/440))
+
+- 同 Host 插件服务 `dshIm` 新增 `createTarget(botId, target)`，消费插件可把已知的会话路由注册成投递目标，注册后即可用 `targetId` 投递并出现在设置页目标列表；已存在的 `targetId` 以 `target-conflict` 拒绝。
+  The same-Host `dshIm` service now exposes `createTarget(botId, target)`, so a consumer plugin can register a known conversation route as a delivery target; the target is then addressable by `targetId` and listed in the settings panel. An existing `targetId` is rejected with `target-conflict`.
+
+### Fixed / 修复
+
+- 修复绑定 DS Bot 的飞书私聊提问与回答续跑同步，支持 Host 提问及 DS Bot 的待回答卡片，重启后恢复未答问题；桌面端和 IM 端先答者生效，绑定不明确时提示回到桌面回答。（[#428](https://github.com/xmanrui/dsh-im/pull/428)）
+  Fixed question delivery and answer continuation for Feishu private chats bound to DS Bot, including Host questions and pending DS Bot cards recovered after restart. The first desktop or IM answer wins; ambiguous bindings ask the user to answer on the desktop. ([#428](https://github.com/xmanrui/dsh-im/pull/428))
+- Telegram 最终答案独立发送，不再只编辑进度占位消息，并在回合结束后清理状态表情；避免最终答案缺少新消息通知及遗留处理中标记。（[#412](https://github.com/xmanrui/dsh-im/pull/412)、[#414](https://github.com/xmanrui/dsh-im/pull/414)）
+  Telegram sends final answers as separate messages instead of only editing progress placeholders, and clears status reactions after a turn finishes, avoiding missing new-message notifications and stale processing indicators. ([#412](https://github.com/xmanrui/dsh-im/pull/412), [#414](https://github.com/xmanrui/dsh-im/pull/414))
+- 统一识别不同 Host 的缺失会话错误码，恢复失效会话绑定并改进相关命令的错误提示；不将权限错误误判为会话缺失。（[#444](https://github.com/xmanrui/dsh-im/pull/444)）
+  Recognize missing-session errors across Host error codes, recover stale session bindings, and improve related command guidance without treating permission failures as missing sessions. ([#444](https://github.com/xmanrui/dsh-im/pull/444))
+
+### Security / 安全
+
+- 将构建锁中的 ip-address 从 10.7.2 更新到 10.7.4，并重新生成 Host 产物，纳入 IPv6 地址解析可能阻塞进程的修复（[GHSA-rxp7-6hxx-x8q5](https://github.com/advisories/GHSA-rxp7-6hxx-x8q5)）。保留旧间接依赖锁的已有安装仍需刷新依赖解析。
+  Updated build-lock ip-address from 10.7.2 to 10.7.4 and rebuilt the Host artifact with the IPv6 parsing denial-of-service fix ([GHSA-rxp7-6hxx-x8q5](https://github.com/advisories/GHSA-rxp7-6hxx-x8q5)). Existing installations retaining old transitive dependency locks must refresh their resolution.
+
+### Notes / 使用说明
+
+- Telegram 语音转写需安装并配置 Host 的语音识别服务，非规范 WAV 转换需本机可用的 ffmpeg；本包不会自动安装 ffmpeg。发送预算是本地节流，不保证完全避免 Telegram 服务端限流。
+  Telegram transcription requires a configured Host speech-to-text service; noncanonical WAV conversion requires locally available ffmpeg, which this package does not install. The send budget is local pacing, not a guarantee against Telegram server-side limits.
+- 完善完整包名与 Desktop/Web 安装说明。依赖声明、Node.js 要求和 DSH 兼容声明保持不变；升级后重启 Host 并刷新管理页面。
+  Clarified the full package name and Desktop/Web installation instructions. Dependency declarations, Node.js requirements, and DSH compatibility declarations are unchanged. Restart the Host and refresh the management page after upgrading.
+- 感谢 [@unera](https://github.com/unera) 的 Telegram、俄语及测试贡献，以及 [@wanchun](https://github.com/wanchun) 的 `createTarget` 服务扩展。
+  Thanks to [@unera](https://github.com/unera) for Telegram, Russian localization, and test contributions, and [@wanchun](https://github.com/wanchun) for the `createTarget` service extension.
+
 ## [5.4.0] - 2026-10-21
 
 ### Added / 新增
@@ -1966,7 +2075,14 @@ Thanks to [@Dong09](https://github.com/Dong09) for the Matrix conversation-conte
 - 改进 npm 发布包结构，保留 CLI 入口并避免安装脚本拦截。
   Improved npm package contents to preserve the CLI entry point and avoid install-script blocking.
 
-[Unreleased]: https://github.com/xmanrui/dsh-im/compare/v5.0.3...HEAD
+[Unreleased]: https://github.com/xmanrui/dsh-im/compare/v5.7.0...HEAD
+[5.7.0]: https://github.com/xmanrui/dsh-im/compare/v5.6.0...v5.7.0
+[5.6.0]: https://github.com/xmanrui/dsh-im/compare/v5.5.0...v5.6.0
+[5.5.0]: https://github.com/xmanrui/dsh-im/compare/v5.4.0...v5.5.0
+[5.4.0]: https://github.com/xmanrui/dsh-im/compare/v5.3.0...v5.4.0
+[5.3.0]: https://github.com/xmanrui/dsh-im/compare/v5.2.0...v5.3.0
+[5.2.0]: https://github.com/xmanrui/dsh-im/compare/v5.1.0...v5.2.0
+[5.1.0]: https://github.com/xmanrui/dsh-im/compare/v5.0.3...v5.1.0
 [5.0.3]: https://github.com/xmanrui/dsh-im/compare/v5.0.2...v5.0.3
 [5.0.2]: https://github.com/xmanrui/dsh-im/compare/v5.0.1...v5.0.2
 [5.0.1]: https://github.com/xmanrui/dsh-im/compare/v5.0.0...v5.0.1
