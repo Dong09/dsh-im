@@ -26,6 +26,11 @@ const PROVIDER_FAILURES = Object.freeze({
   UNSUPPORTED_CONTENT: 'MODEL_CONFIG',
 });
 
+// 提交超时（stage=prompt.submit 且 harness-timeout）单列文案：与「已提交、结果
+// 未知」区分，明确「提交请求本身超时、是否送达未知」，避免用户误以为任务已运行。
+const PROMPT_SUBMIT_UNCONFIRMED_MESSAGE =
+  '消息提交请求超时，未能确认消息是否已送达 DSH。请稍后到 DSH 查看该会话状态，不要立即重复提交；若持续发生，请将参考号提供给管理员。';
+
 const FAILURE_MESSAGES = Object.freeze({
   HARNESS_INTERACTION_TIMEOUT:
     '与 DSH 的交互通道在 30 秒内未就绪，本条消息尚未提交执行。请稍后重试。',
@@ -230,6 +235,9 @@ export function classifyMessageFailure(error, {
   if (code === 'REQUEST_TIMEOUT' || code === 'NETWORK_ERROR') details.hint = connectionHint(details);
   if (details.stage || details.submissionState) Object.assign(details, runtimeDiagnosticDetails());
   let message = FAILURE_MESSAGES[code];
+  if (code === 'HARNESS_RESULT_UNCERTAIN' && error?.code === 'harness-timeout' && details.stage === 'prompt.submit') {
+    message = PROMPT_SUBMIT_UNCONFIRMED_MESSAGE;
+  }
   if (['INTERNAL_UNKNOWN', 'REQUEST_TIMEOUT', 'NETWORK_ERROR'].includes(code)) {
     if (details.submissionState === 'not-submitted') {
       message = code === 'REQUEST_TIMEOUT'

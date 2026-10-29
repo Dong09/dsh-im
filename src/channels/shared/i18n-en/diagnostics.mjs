@@ -28,6 +28,8 @@ export default Object.freeze({
     'Message preparation failed before submission. It has not been submitted for execution. Try again; if this persists, share the reference with your administrator.',
   '消息已尝试提交，但任务结果尚未确认。请先到 DSH 查看状态，不要立即重复提交；若持续发生，请将参考号提供给管理员。':
     'Message submission was attempted, but the task outcome is unconfirmed. Check its status in DSH before resubmitting; if this persists, share the reference with your administrator.',
+  '消息提交请求超时，未能确认消息是否已送达 DSH。请稍后到 DSH 查看该会话状态，不要立即重复提交；若持续发生，请将参考号提供给管理员。':
+    'The message submission request timed out and delivery to DSH could not be confirmed. Check the session status in DSH before resubmitting; if this persists, share the reference with your administrator.',
   "DSH 版本": "DSH version",
   "依赖版本": "Dependency versions",
   "代理已配置": "Proxy configured",

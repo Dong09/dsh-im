@@ -64,6 +64,25 @@ test('known business failures and explicit input guidance keep priority over tra
   }).code, 'INPUT_INVALID');
 });
 
+test('prompt-submit timeouts keep a distinct submission-timeout notice', () => {
+  const failure = classifyMessageFailure({
+    code: 'harness-timeout', method: 'session.prompt',
+    details: { stage: 'prompt.submit', submissionState: 'unknown' },
+  }, options);
+  assert.equal(failure.code, 'HARNESS_RESULT_UNCERTAIN');
+  assert.match(failure.message, /提交请求超时/u);
+  assert.match(failure.message, /不要立即重复提交/u);
+  assert.doesNotMatch(failure.message, /任务可能已经开始/u);
+
+  const replyStage = classifyMessageFailure({
+    code: 'harness-timeout', method: 'session.history',
+    details: { stage: 'reply.wait', submissionState: 'accepted' },
+  }, options);
+  assert.equal(replyStage.code, 'HARNESS_RESULT_UNCERTAIN');
+  assert.match(replyStage.message, /任务可能已经开始/u);
+  assert.doesNotMatch(replyStage.message, /提交请求超时/u);
+});
+
 test('uncertain Telegram delivery does not become a safe-to-retry timeout', () => {
   const failure = classifyMessageFailure({
     code: 'telegram-timeout', deliveryOutcome: 'unknown',

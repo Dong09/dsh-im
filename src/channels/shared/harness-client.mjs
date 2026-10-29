@@ -891,6 +891,16 @@ export class HarnessTransportError extends Error {
   }
 }
 
+/**
+ * session.prompt 提交超时（30 秒窗口到期）只说明应答迟到，不代表提交失败：
+ * 单进程 Host 忙碌时 prompt 往往已入队。这类错误需要先回查持久账本再定性。
+ */
+function isPromptSubmitTimeout(error) {
+  return error instanceof HarnessTransportError
+    && error.code === 'harness-timeout'
+    && error.method === 'session.prompt';
+}
+
 export class HarnessHealthError extends Error {
   constructor(cause) {
     super('Harness health RPC was rejected', { cause });
@@ -1432,6 +1442,46 @@ export class HarnessClient {
       }
       throw error;
     }
+  }
+
+  /**
+   * 提交超时后的入库确认：session.history 是持久账本，按 promptRpcId 找回我们的
+   * 持久化痕迹（已执行的 user/message，或已入队待执行的 agent/inbox/spliced
+   * 回执）即视为提交已成功，让 ask() 继续等回复而不是误报失败。
+   * 确认探测自身的失败一律吞掉——它们不能掩盖或改变原始提交超时的定性；
+   * 唯独取消例外：取消原因必须优先于超时透出。
+   */
+  async #confirmPromptSubmit(sessionId, promptRpcId, { signal } = {}) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      if (signal?.aborted) return false;
+      try {
+        const history = await this.#sessionRpc('session.history', {
+          sessionId,
+          maxMessages: 50,
+        }, 30_000, { signal });
+        const confirmed = (history?.events ?? []).some((entry) => {
+          const event = entry?.event ?? entry;
+          if (event?.type === 'user/message') {
+            return event?.data?.source?.rpcId === promptRpcId;
+          }
+          // queue 模式下消息可能已持久入队但尚未产生 user/message：
+          // agent/inbox/spliced 的 inserted[].source.rpcId 就是入队回执。
+          if (event?.type === 'agent/inbox/spliced') {
+            return (event?.data?.inserted ?? [])
+              .some((message) => message?.source?.rpcId === promptRpcId);
+          }
+          return false;
+        });
+        if (confirmed) return true;
+      } catch (probeError) {
+        // 取消优先于超时定性：最后一次探测期间被取消时，循环后面没有
+        // sleep 再检查 abort，必须在这里把取消原因抛出，不能被超时覆盖。
+        if (signal?.aborted) throw signal.reason ?? probeError;
+        // 其余账本探测失败不改变定性：本轮未确认，继续轮询或最终按原超时上报。
+      }
+      if (attempt < 4) await sleep(2_000, signal);
+    }
+    return false;
   }
 
   async sessionExists(sessionId, options = {}) {
@@ -2037,8 +2087,28 @@ export class HarnessClient {
           ...timeZoneFields,
         }, 30_000, { rpcId: promptRpcId, signal });
       };
+      // 30 秒提交窗口到期只说明 Host 忙到没来得及应答，prompt 可能早已入队。
+      // 先按 promptRpcId 回查持久账本，确认入库就继续等回复；确认不到才把
+      // 原始超时错误向上抛，由文案层标注「提交请求超时、是否送达未知」。
+      const submitPrompt = async (promptContent) => {
+        try {
+          await sendPrompt(promptContent);
+        } catch (error) {
+          if (!isPromptSubmitTimeout(error) || signal?.aborted) throw error;
+          let confirmed = false;
+          try {
+            confirmed = await this.#confirmPromptSubmit(sessionId, promptRpcId, { signal });
+          } catch (confirmError) {
+            // 确认途中被取消时恢复调用方的取消语义（与图片暂存路径一致）。
+            if (signal?.aborted) throw signal.reason ?? confirmError;
+            throw error;
+          }
+          if (!confirmed) throw error;
+          diagnostic.submissionState = 'accepted';
+        }
+      };
       try {
-        await sendPrompt(content);
+        await submitPrompt(content);
       } catch (error) {
         // The Host refuses image blocks for a non-vision model before any
         // durable user message exists. Re-deliver the same bytes the way
@@ -2073,7 +2143,7 @@ export class HarnessClient {
           ...contentWithoutImages(baseContent),
           { type: 'text', text: t(isModelImageRejection(error) ? IMAGE_FILE_FALLBACK_PROMPT : IMAGE_HOST_LIMIT_FALLBACK_PROMPT) },
         ], { files: stagedBatches.flatMap((batch) => batch?.files ?? []) });
-        await sendPrompt(fallbackPrompt);
+        await submitPrompt(fallbackPrompt);
       }
       promptAccepted = true;
       diagnostic.submissionState = 'accepted';
