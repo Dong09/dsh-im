@@ -5385,10 +5385,15 @@ export class FeishuHarnessBridge {
 
   async #preparePrompt(event, key, message) {
     const snapshot = this.#acceptedMessageIds.get(event.message.message_id);
+    const originalFiles = Array.isArray(message.files) ? [...message.files] : [];
     const build = async (input) => {
       const rich = hasInboundImages(input) || hasReplyReference(input);
       const original = rich
-        ? await promptContentForInboundMessage(input, { signal: this.#signal, deferImages: true })
+        ? await promptContentForInboundMessage(input, {
+          signal: this.#signal,
+          deferImages: true,
+          originalFiles,
+        })
         : input.content;
       const enhanced = enhanceContextContent(original, snapshot, () => ({
         channel: 'feishu',
@@ -5410,7 +5415,12 @@ export class FeishuHarnessBridge {
       && (nonEmptyString(message.content) || hasInboundImages(message) || hasInboundFiles(message));
     if (!topicAnchor) return build(message);
 
-    const withoutAnchor = { ...message };
+    // Keep the temporary topic-root copy connected to the final request's
+    // attachment array. Reply resolution may append lazy files to it.
+    const withoutAnchor = {
+      ...message,
+      files: Array.isArray(message.files) ? message.files : (message.files = []),
+    };
     delete withoutAnchor.replyTo;
     const base = await build(withoutAnchor);
     let preparedSessionId;
@@ -5426,6 +5436,7 @@ export class FeishuHarnessBridge {
         }
         const prepared = await build({
           ...message,
+          files: message.files,
           replyTo: {
             ...message.replyTo,
             load: async (options) => {
