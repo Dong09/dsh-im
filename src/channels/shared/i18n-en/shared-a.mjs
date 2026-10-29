@@ -1,5 +1,10 @@
 // English translations (shared-a area). Keys are exact Chinese literals passed to t().
 export default {
+  '请发送你的问题。': 'Please send your question.',
+  '会话目录未生效：无法创建目录（权限或磁盘空间不足）；本次仍在原工作区运行。':
+    'Conversation directory isolation did not take effect: the directory could not be created. This session will use the original workspace.',
+  '会话目录未生效：无法切换目录；本次仍在原工作区运行。':
+    'Conversation directory isolation did not take effect: the directory could not be selected. This session will use the original workspace.',
   '这个问题已在其他客户端处理，无需再次回答。':
     'This question has already been answered from another client; no further reply is needed.',
   '任务已完成。': 'Task completed.',
@@ -80,8 +85,8 @@ export default {
     'The model reached its output limit without producing a displayable result. Reduce the task scope and try again.',
   '本轮处理被阻止，未能完成。请在 DSH 中查看会话状态和相关提示。':
     'This turn was blocked and did not finish. Check the Session status and related notices in DSH.',
-  '当前会话已归档，无法继续处理。请在 DSH 中取消归档，或发送 /new 创建新会话。':
-    'The current Session is archived and cannot continue. Unarchive it in DSH, or send /new to create a new Session.',
+  '当前会话已归档，无法继续处理。有命令权限时可发送 /new 创建新会话；否则请联系管理员在 DSH 中取消归档，或为你开启命令权限。':
+    'The current Session is archived and cannot continue. If you have command permission, send /new to create a new Session. Otherwise, ask an administrator to unarchive it in DSH or grant you command permission.',
   '本条消息可能仍在会话队列中，请先到 DSH 查看状态，避免重复提交。':
     'This message may still be queued in the Session. Check its status in DSH before submitting it again.',
   '任务被意外中断，本次未完成。请重试。':

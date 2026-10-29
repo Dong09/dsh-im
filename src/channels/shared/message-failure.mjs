@@ -1,6 +1,7 @@
+import { isSessionNotFound } from './session-error.mjs';
 import { connectionHint, extractConnectionEvidence, messageDiagnosticError, runtimeDiagnosticDetails } from './connection-error.mjs';
+import { createFailureReferenceId } from './delivery-failure-log.mjs';
 import { diagnosticFields } from './diagnostic-details.mjs';
-import { randomUUID } from 'node:crypto';
 
 import { t } from './i18n.mjs';
 
@@ -79,8 +80,10 @@ const FAILURE_MESSAGES = Object.freeze({
     '任务被意外中断，本次未完成。请重试。',
   SESSION_NOT_FOUND:
     '当前会话已不存在。请发送 /new 创建新会话后重试。',
+  SESSION_UNREADABLE:
+    '当前会话日志已损坏，无法继续读取。请先到 DSH 查看任务状态，再发送 /new 创建新会话；原会话记录会保留。',
   SESSION_ARCHIVED:
-    '当前会话已归档，无法继续处理。请在 DSH 中取消归档，或发送 /new 创建新会话。',
+    '当前会话已归档，无法继续处理。有命令权限时可发送 /new 创建新会话；否则请联系管理员在 DSH 中取消归档，或为你开启命令权限。',
   SESSION_BUSY:
     '当前会话仍在处理上一项任务。请等待完成，或发送 /stop 后重试。',
   SESSION_STALE:
@@ -150,7 +153,8 @@ function failureCode(error, details) {
   if (code === 'model-max-tokens') return 'MODEL_OUTPUT_LIMIT';
   if (code === 'turn-blocked') return 'TURN_BLOCKED';
   if (['turn-interrupted', 'turn-aborted'].includes(code)) return 'TURN_INTERRUPTED';
-  if (code === 'session-not-found') return 'SESSION_NOT_FOUND';
+  if (isSessionNotFound(code)) return 'SESSION_NOT_FOUND';
+  if (code === 'session-unreadable') return 'SESSION_UNREADABLE';
   if (code === 'session-archived') return 'SESSION_ARCHIVED';
   if (code === 'agent-busy') return 'SESSION_BUSY';
   if (code === 'workspace-session-stale') return 'SESSION_STALE';
@@ -202,7 +206,7 @@ function transportFailureCode(error, details) {
 function safeReferenceId(value) {
   return typeof value === 'string' && /^[A-Z0-9-]{6,40}$/u.test(value)
     ? value
-    : `MF-${randomUUID().slice(0, 8).toUpperCase()}`;
+    : createFailureReferenceId();
 }
 
 function safeFailureReason(value) {
