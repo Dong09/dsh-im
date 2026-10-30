@@ -419,13 +419,12 @@ dsh web --trusted-host dsh.example.com
 
 ## 联系方式
 
-欢迎加入企业微信群，或通过邮箱、微信、小红书或 WhatsApp 联系我。
+欢迎加入 QQ群，或通过邮箱、小红书或 WhatsApp 联系我。
 
 <table>
   <tr>
     <th align="center">邮箱</th>
-    <th align="center">企业微信群</th>
-    <th align="center">微信</th>
+    <th align="center">QQ群</th>
     <th align="center">小红书</th>
     <th align="center">WhatsApp</th>
   </tr>
@@ -434,10 +433,7 @@ dsh web --trusted-host dsh.example.com
       <a href="mailto:longmanr307@gmail.com">longmanr307@gmail.com</a>
     </td>
     <td align="center" valign="top">
-      <a href="docs/images/wecom.png"><img src="docs/images/wecom.png" alt="dsh-im 企业微信群二维码" width="240"></a>
-    </td>
-    <td align="center" valign="top">
-      <a href="docs/images/weixin.jpg"><img src="docs/images/weixin.jpg" alt="微信二维码" width="240"></a>
+      <a href="docs/images/QQ.png"><img src="docs/images/QQ.png" alt="dsh-im QQ群二维码" width="240"></a>
     </td>
     <td align="center" valign="top">
       <a href="docs/images/xhs.jpg"><img src="docs/images/xhs.jpg" alt="小红书二维码" width="240"></a>

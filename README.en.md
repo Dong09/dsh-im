@@ -416,13 +416,12 @@ To pin one language regardless of who is reading the interface, set `language` i
 
 ## Contact
 
-Join the WeCom community group, or reach me by email, WeChat, Xiaohongshu, or WhatsApp.
+Join the QQ community group, or reach me by email, Xiaohongshu, or WhatsApp.
 
 <table>
   <tr>
     <th align="center">Email</th>
-    <th align="center">WeCom Group</th>
-    <th align="center">WeChat</th>
+    <th align="center">QQ Group</th>
     <th align="center">Xiaohongshu</th>
     <th align="center">WhatsApp</th>
   </tr>
@@ -431,10 +430,7 @@ Join the WeCom community group, or reach me by email, WeChat, Xiaohongshu, or Wh
       <a href="mailto:longmanr307@gmail.com">longmanr307@gmail.com</a>
     </td>
     <td align="center" valign="top">
-      <a href="docs/images/wecom.png"><img src="docs/images/wecom.png" alt="dsh-im WeCom group QR code" width="240"></a>
-    </td>
-    <td align="center" valign="top">
-      <a href="docs/images/weixin.jpg"><img src="docs/images/weixin.jpg" alt="WeChat QR code" width="240"></a>
+      <a href="docs/images/QQ.png"><img src="docs/images/QQ.png" alt="dsh-im QQ group QR code" width="240"></a>
     </td>
     <td align="center" valign="top">
       <a href="docs/images/xhs.jpg"><img src="docs/images/xhs.jpg" alt="Xiaohongshu QR code" width="240"></a>
