@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { normalizeDeliveryTarget } from './delivery-adapter.mjs';
+import { normalizeDeliveryTarget, normalizeScheduledDeliveryTarget, normalizeScheduledDeliveryPart } from './delivery-adapter.mjs';
+import { isMatrixEventId } from '../../src/channels/matrix/matrix-identifiers.mjs';
 import { COMPETITIVE_APPROVAL_CHANNELS } from '../../src/channels/shared/harness-approval.mjs';
 import { t } from '../../src/channels/shared/i18n.mjs';
 
@@ -145,6 +146,7 @@ function sessionSyncState(value, available) {
 export class DeliveryService {
   #adapters = new Map();
   #unavailableSessionSyncChannels;
+  #scheduledAuthorizations = new WeakMap();
   dsBot;
 
   constructor({ unavailableSessionSyncChannels = [], dsBot } = {}) {
@@ -257,6 +259,32 @@ export class DeliveryService {
       }
     }
     return bots;
+  }
+
+  /** Read current Session destinations without enabling sync or creating saved targets. */
+  async listConversationBindings(botId) {
+    const id = botIdOf(botId);
+    const registration = await this.#checkedRegistrationFor(id);
+    const { adapter } = registration;
+    if (typeof adapter.listConversationBindings !== 'function') throw deliveryError('capability-unavailable');
+    try {
+      const bindings = await adapter.listConversationBindings(id);
+      this.#assertRegistered(registration);
+      if (!Array.isArray(bindings)) throw new TypeError('Adapter returned invalid conversation bindings');
+      return {
+        botId: id,
+        channel: adapter.channel,
+        bindings: bindings.map(({ sessionId, kind, route }) => {
+          if (typeof sessionId !== 'string' || !sessionId || sessionId.trim() !== sessionId) {
+            throw new TypeError('Adapter returned an invalid Session id');
+          }
+          return { sessionId, ...normalizeDeliveryTarget(adapter.channel, { kind, route }, { targetIdRequired: false }) };
+        }),
+      };
+    } catch (error) {
+      this.#assertRegistered(registration);
+      throw publicOperationError(error);
+    }
   }
 
   async listSuggestions(botId) {
@@ -597,6 +625,87 @@ export class DeliveryService {
         throw deliveryError('send-result-unknown');
       return { sent: true, receipt: { version: 1, messageId: result.receipt.messageId, conversationId: result.receipt.conversationId } };
     } catch (error) { throw publicOperationError(error); }
+  }
+
+  /**
+   * Host-internal admission snapshot, never exposed through the IM facade/HTTP/RPC.
+   * The opaque handle binds this service, exact bot/room/thread, live account and
+   * adapter registration; neither a saved target edit nor reconnect can retarget it.
+   */
+  async authorizeScheduledTarget(botId, target, { signal } = {}) {
+    const id = botIdOf(botId);
+    const frozenTarget = normalizeScheduledDeliveryTarget(target);
+    cancellation(signal);
+    const registration = await this.#checkedRegistrationFor(id);
+    const fingerprint = await this.#scheduledAccount(registration, id, signal);
+    const authorization = Object.freeze(Object.create(null));
+    this.#scheduledAuthorizations.set(authorization, Object.freeze({
+      botId: id, target: frozenTarget, registration, fingerprint, signal,
+    }));
+    return authorization;
+  }
+
+  async #scheduledAccount(registration, botId, signal, expectedFingerprint) {
+    this.#assertRegistered(registration);
+    cancellation(signal);
+    const { adapter } = registration;
+    if (adapter.channel !== 'matrix' || this.#unavailableSessionSyncChannels.has('matrix')
+      || typeof adapter.sendScheduledPart !== 'function' || typeof adapter.describeAccount !== 'function') {
+      throw deliveryError('capability-unavailable');
+    }
+    if (!await adapter.ownsBot(botId)) throw deliveryError('unknown-bot');
+    this.#assertRegistered(registration);
+    cancellation(signal);
+    const account = await adapter.describeAccount(botId);
+    this.#assertRegistered(registration);
+    cancellation(signal);
+    if (account?.version !== 1 || account.botId !== botId || account.channel !== 'matrix'
+      || !account.capabilities?.includes('scheduled-part-delivery')) throw deliveryError('capability-unavailable');
+    if (account.connected !== true) throw deliveryError('bot-not-connected');
+    const fingerprint = account.account?.fingerprint;
+    if (!/^[a-f0-9]{64}$/.test(fingerprint ?? '')) throw deliveryError('account-unverified');
+    if (expectedFingerprint !== undefined && fingerprint !== expectedFingerprint) throw deliveryError('account-changed');
+    return fingerprint;
+  }
+
+  /**
+   * Send exactly one required part. Preconditions reject before side effects;
+   * actual attempts return explicit outcomes, not boolean `sent` or notice IDs.
+   * No checkpoint callback is accepted. The relay owns all persistence outside
+   * provider closures. Abort revokes future effects, not a confirmed remote send.
+   */
+  async sendScheduledPart(botId, target, part, { authorization, signal, format = 'plain' } = {}) {
+    const id = botIdOf(botId);
+    const normalizedTarget = normalizeScheduledDeliveryTarget(target);
+    const normalizedPart = normalizeScheduledDeliveryPart(part);
+    if (!['plain', 'markdown'].includes(format)) throw deliveryError('bad-request');
+    const snapshot = this.#scheduledAuthorizations.get(authorization);
+    if (!snapshot) throw deliveryError('capability-unavailable');
+    if (snapshot.botId !== id || JSON.stringify(snapshot.target) !== JSON.stringify(normalizedTarget)) {
+      throw deliveryError('target-changed');
+    }
+    const combined = AbortSignal.any([snapshot.registration.controller.signal, snapshot.signal, signal].filter(Boolean));
+    const beforeSend = () => this.#scheduledAccount(snapshot.registration, id, combined, snapshot.fingerprint);
+    await beforeSend();
+    const result = await snapshot.registration.adapter.sendScheduledPart(id, snapshot.target, normalizedPart, {
+      signal: combined, format, expectedFingerprint: snapshot.fingerprint, beforeSend,
+    });
+    // Do not recheck abort/registration here: replacement or shutdown after a
+    // native acknowledgement cannot erase that acknowledgement or trigger retry.
+    const providerMessageIds = [...new Set((Array.isArray(result?.providerMessageIds) ? result.providerMessageIds : []).filter(isMatrixEventId))];
+    const artifactResults = normalizedPart.kind === 'artifact' ? result?.artifacts : null;
+    const validArtifact = normalizedPart.kind !== 'artifact' || (Array.isArray(artifactResults)
+      && artifactResults.length === 1 && artifactResults[0].artifactId === normalizedPart.artifact.artifactId
+      && artifactResults[0].outcome === 'sent');
+    const deliveryOutcome = ['sent', 'failed', 'unknown'].includes(result?.deliveryOutcome)
+      && (result.deliveryOutcome !== 'sent' || (providerMessageIds.length > 0 && validArtifact))
+      ? result.deliveryOutcome : 'unknown';
+    return {
+      ...(result && typeof result === 'object' ? result : {}),
+      deliveryOutcome,
+      providerMessageIds,
+      ...(deliveryOutcome !== result?.deliveryOutcome ? { reason: 'send-result-unknown', errorCode: 'send-result-unknown' } : {}),
+    };
   }
 
   async send(botId, targetIdOrDraft, text, { signal, format = 'plain' } = {}) {

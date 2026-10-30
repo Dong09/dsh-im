@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { OutboundArtifactRegistry } from '../src/channels/shared/semantic/artifact.mjs';
 
 import { createDeliveryAdapter } from '../plugin-src/host/delivery-adapter.mjs';
 import { createDeliveryService } from '../plugin-src/host/delivery-service.mjs';
@@ -305,6 +309,164 @@ test('DeliveryService marks explicit remote Harness channels unavailable for Ses
     enabled: false, state: 'off',
   });
   assert.deepEqual(calls, [['bot_one', 'direct', false]]);
+});
+
+function scheduledFixture(options = {}) {
+  const service = createDeliveryService(options);
+  const adapter = memoryAdapter({ channel: 'matrix' });
+  const calls = [];
+  const account = { version: 1, botId: 'bot_one', channel: 'matrix', connected: true,
+    capabilities: ['scheduled-part-delivery'], account: { fingerprint: 'a'.repeat(64) } };
+  adapter.describeAccount = async () => structuredClone(account);
+  adapter.sendScheduledPart = async (...args) => {
+    await args[3].beforeSend();
+    calls.push(args);
+    return { deliveryOutcome: 'sent', providerMessageIds: ['$scheduled:example.org'] };
+  };
+  const dispose = service.registerAdapter(adapter);
+  return { service, adapter, calls, account, dispose };
+}
+
+async function scheduledArtifact(t) {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-service-scheduled-'));
+  const registry = new OutboundArtifactRegistry();
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  t.after(() => registry.clear());
+  const session = { header: { id: 'scheduled-service', cwd: directory }, events: [
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'user/message', data: { turn: 1, source: { rpcId: 'rpc-scheduled' } } },
+  ] };
+  t.after(registry.openConsumer('scheduled-service', 'rpc-scheduled'));
+  for (const event of session.events) registry.observeSessionEvent(session, event);
+  await writeFile(join(directory, 'original.png'), Buffer.from([0, 2, 255]));
+  const staged = await registry.stage({ path: 'original.png' }, { agent: { session }, callId: 'return-file' });
+  registry.commit(staged);
+  return registry.take('scheduled-service', 1)[0];
+}
+
+const scheduledRoom = () => ({ kind: 'room', route: { roomId: '!r:example.org' } });
+
+test('scheduled admission freezes the exact Matrix bot room/thread and keeps its authorization opaque', async () => {
+  const fx = scheduledFixture();
+  for (const target of [scheduledRoom(), { kind: 'thread', route: {
+    roomId: '!KplB3ESm99I-4PaRdWxDUKr0Sia5nRhRtykpfs1VloM', threadId: '$thread:example.org',
+  } }]) {
+    const original = structuredClone(target);
+    const authorization = await fx.service.authorizeScheduledTarget('bot_one', target);
+    assert.deepEqual(Object.keys(authorization), []);
+    assert.equal(Object.isFrozen(authorization), true);
+    target.route.roomId = '!elsewhere:example.org';
+    const receipt = await fx.service.sendScheduledPart('bot_one', original, { kind: 'text', text: '**prepared**' }, { authorization, format: 'markdown' });
+    assert.deepEqual(receipt, { deliveryOutcome: 'sent', providerMessageIds: ['$scheduled:example.org'] });
+    assert.deepEqual(fx.calls.at(-1).slice(0, 3), ['bot_one', original, { kind: 'text', text: '**prepared**' }]);
+    assert.equal(fx.calls.at(-1)[3].format, 'markdown');
+    assert.equal(fx.calls.at(-1)[3].expectedFingerprint, 'a'.repeat(64));
+    assert.equal(Object.isFrozen(fx.calls.at(-1)[1].route), true);
+    await assert.rejects(fx.service.sendScheduledPart('bot_one', target, { kind: 'text', text: 'not retargeted' }, { authorization }), { code: 'target-changed' });
+    await assert.rejects(fx.service.sendScheduledPart('other_bot', original, { kind: 'text', text: 'not borrowed' }, { authorization }), { code: 'target-changed' });
+    await assert.rejects(fx.service.sendScheduledPart('bot_one', original, { kind: 'text', text: 'not cloned' }, { authorization: structuredClone(authorization) }), { code: 'capability-unavailable' });
+  }
+  assert.equal(fx.calls.length, 2);
+});
+
+test('scheduled capability is optional, Matrix-only, local-only and never grants DM or saved aliases', async () => {
+  const fx = scheduledFixture();
+  for (const target of [{ kind: 'dm', route: { userId: '@u:example.org' } },
+    { ...scheduledRoom(), targetId: 'saved' }, { ...scheduledRoom(), name: 'not part of identity' },
+    { kind: 'room', route: { roomId: '#alias:example.org' } }]) {
+    await assert.rejects(fx.service.authorizeScheduledTarget('bot_one', target), { code: 'invalid-target' });
+  }
+  for (const channel of ['telegram', 'feishu']) {
+    const adapter = memoryAdapter({ channel });
+    const other = createDeliveryService();
+    other.registerAdapter(adapter); // no newly required adapter methods
+    await assert.rejects(other.authorizeScheduledTarget('bot_one', scheduledRoom()), { code: 'capability-unavailable' });
+  }
+  delete fx.adapter.sendScheduledPart;
+  await assert.rejects(fx.service.authorizeScheduledTarget('bot_one', scheduledRoom()), { code: 'capability-unavailable' });
+  const remote = scheduledFixture({ unavailableSessionSyncChannels: ['matrix'] });
+  await assert.rejects(remote.service.authorizeScheduledTarget('bot_one', scheduledRoom()), { code: 'capability-unavailable' });
+  assert.equal(fx.calls.length, 0);
+});
+
+test('scheduled parts reject paths URLs bytes and reconstructed artifacts without dropping real object identity', async (t) => {
+  const fx = scheduledFixture();
+  const target = scheduledRoom();
+  const authorization = await fx.service.authorizeScheduledTarget('bot_one', target);
+  const artifact = await scheduledArtifact(t);
+  for (const part of [{ kind: 'text', text: 'ok', path: 'secret' }, { kind: 'text', text: '' },
+    { kind: 'artifact', path: 'original.png' }, { kind: 'artifact', artifact: { ...artifact } },
+    { kind: 'artifact', artifact: { path: 'original.png' } }, { kind: 'artifact', artifact: 'https://example.org/file' },
+    { kind: 'artifact', artifact: Buffer.from([1]) }, { kind: 'artifact', artifact, bytes: [1] }]) {
+    await assert.rejects(fx.service.sendScheduledPart('bot_one', target, part, { authorization }), { code: 'bad-request' });
+  }
+  fx.adapter.sendScheduledPart = async (_bot, _target, part) => {
+    assert.equal(part.artifact, artifact);
+    return { deliveryOutcome: 'failed', providerMessageIds: [], artifacts: [{ artifactId: artifact.artifactId, outcome: 'failed', reason: 'artifact-provider-failed' }],
+      failureNotice: { deliveryOutcome: 'sent', providerMessageIds: ['$notice:example.org'] } };
+  };
+  const result = await fx.service.sendScheduledPart('bot_one', target, { kind: 'artifact', artifact }, { authorization });
+  assert.equal(result.deliveryOutcome, 'failed');
+  assert.deepEqual(result.providerMessageIds, []);
+  assert.deepEqual(result.failureNotice.providerMessageIds, ['$notice:example.org']);
+});
+
+test('each scheduled part rechecks the original registration and current account instead of selecting another bot', async () => {
+  for (const change of ['account', 'removed', 'registration', 'disposal', 'cancelled']) {
+    const fx = scheduledFixture();
+    const abort = new AbortController();
+    const target = scheduledRoom();
+    const authorization = await fx.service.authorizeScheduledTarget('bot_one', target, { signal: abort.signal });
+    if (change === 'account') fx.account.account.fingerprint = 'b'.repeat(64);
+    if (change === 'removed') fx.adapter.ownsBot = () => false;
+    if (change === 'registration') fx.service.registerAdapter(fx.adapter);
+    if (change === 'disposal') fx.dispose();
+    if (change === 'cancelled') abort.abort();
+    await assert.rejects(fx.service.sendScheduledPart('bot_one', target, { kind: 'text', text: 'stop' }, { authorization }),
+      { code: { account: 'account-changed', removed: 'unknown-bot', registration: 'capability-unavailable', disposal: 'capability-unavailable', cancelled: 'cancelled' }[change] });
+    assert.equal(fx.calls.length, 0, change);
+  }
+});
+
+test('scheduled authorization fails closed on replacement during asynchronous identity verification', async () => {
+  const fx = scheduledFixture();
+  const describe = fx.adapter.describeAccount;
+  fx.adapter.describeAccount = async () => { fx.service.registerAdapter(fx.adapter); return describe(); };
+  await assert.rejects(fx.service.authorizeScheduledTarget('bot_one', scheduledRoom()), { code: 'capability-unavailable' });
+  assert.equal(fx.calls.length, 0);
+});
+
+test('scheduled receipts never infer completion from boolean sent, notice visibility or a single ID', async () => {
+  const fx = scheduledFixture();
+  const target = scheduledRoom();
+  const authorization = await fx.service.authorizeScheduledTarget('bot_one', target);
+  for (const value of [true, { sent: true }, { providerMessageIds: ['$only:example.org'] },
+    { userVisible: true, failureNoticeVisible: true }, { deliveryOutcome: 'sent', providerMessageIds: ['bad-id'] }]) {
+    fx.adapter.sendScheduledPart = async () => value;
+    const result = await fx.service.sendScheduledPart('bot_one', target, { kind: 'text', text: 'one part' }, { authorization });
+    assert.equal(result.deliveryOutcome, 'unknown');
+    assert.equal(result.reason, 'send-result-unknown');
+  }
+  fx.adapter.sendScheduledPart = async () => ({ deliveryOutcome: 'unknown', providerMessageIds: ['$partial:example.org'], reason: 'matrix-delivery-uncertain' });
+  const result = await fx.service.sendScheduledPart('bot_one', target, { kind: 'text', text: 'partial' }, { authorization });
+  assert.equal(result.deliveryOutcome, 'unknown');
+  assert.deepEqual(result.providerMessageIds, ['$partial:example.org']);
+});
+
+test('scheduled send preserves a trustworthy acknowledgement racing cancellation and adapter replacement', async () => {
+  const fx = scheduledFixture();
+  const abort = new AbortController();
+  const target = scheduledRoom();
+  const authorization = await fx.service.authorizeScheduledTarget('bot_one', target, { signal: abort.signal });
+  fx.adapter.sendScheduledPart = async (_bot, _target, _part, options) => {
+    await options.beforeSend();
+    abort.abort();
+    fx.service.registerAdapter(fx.adapter);
+    return { deliveryOutcome: 'sent', providerMessageIds: ['$acknowledged:example.org'] };
+  };
+  assert.deepEqual(await fx.service.sendScheduledPart('bot_one', target, { kind: 'text', text: 'ack' }, { authorization }), {
+    deliveryOutcome: 'sent', providerMessageIds: ['$acknowledged:example.org'],
+  });
 });
 
 function checkedFixture() {

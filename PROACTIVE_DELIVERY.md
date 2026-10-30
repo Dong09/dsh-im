@@ -6,6 +6,22 @@
 
 九个内置渠道均支持主动投递：微信、飞书、钉钉、企业微信、QQ、Slack、Telegram、Discord 和 WhatsApp。
 
+## Matrix 群聊定时回复（默认开启）
+
+Matrix 群或线程的 Session 中，原生定时任务正常完成后，dsh-im 自动把最终回答发回原处。触发与发送之间包含模型生成最终回答的时间。房间和线程 ID 与 Matrix 渠道共用校验，支持经典格式及 v12 哈希房间 ID。无需安装额外插件、填写 Room ID、保存投递目标或开启会话同步；下方的手动目标步骤用于其他应用主动发送，不是群聊提醒的前置条件。
+
+适用于群成员只通过 Matrix 使用 bot、一个群或线程使用一个独立 Session 的场景。从 Web 在同一 Session 创建的提醒也会回该群。真实定时输入在首个模型步骤前获得仅属于本轮的附件权限；运行时、时间快照、技能目录和本插件上下文通知不算用户插话。混入真人输入或未知来源会撤销本轮自动回群权限，普通 IM 仍走原回复链。无绑定、私聊、其他渠道及多个目标共用 Session 时均不开定时附件权限。
+
+模型须调用 `dsh_im_return_file` 显式登记已有图片或文件；成功仅表示“已登记待发送”，不等于 Matrix 已送达。原文件不为发送重新生成或改名；Web 展示卡片、Markdown 路径、失败工具及失败 Code Mode 外层不会被扫描补登记。正常完成后先尝试最终文字，再按登记顺序发送附件；只有附件没有文字也能发送。文字失败不会吞掉仍可发送的文件，但取消、路由失效或检查点写盘失败会停止后续发送。图片明确失败最多转文件一次；超时、网络故障、5xx 或缺少有效原生事件回执均视为未知，不换类型重发。已知加密房间缺少可用加密能力时在上传前拒绝，不明文降级。
+
+已记录的旧 Session 回复位置会保留到 `/new` 之后。状态保存在 Matrix `dshHome` 下的 `integrations/dsh-matrix/schedule-replies.json`。version 2 保留目的地、冲突、最近尝试 turn 和不可变部分清单：文字及每个附件分别有状态、可用 `providerMessageIds` 与安全错误码；附件失败通知单独记录，不算附件成功。只有所有必需部分均确认成功才是整轮 `sent`；存在 `sending`/`unknown` 时整体为 `unknown`，其余未确认或失败部分使整体为 `failed`。查看 Host 的 `[schedule-im-relay]` 诊断和该 Session 的 `lastAttempt.parts`，不能用一条文字或通知已可见判断文件全部送达。状态不保存凭据、文件字节或本地绝对路径。
+
+有效 version 1 状态可读取，旧的四种尝试状态均继续防重；首次 v2 写入前在原文件旁保留逐字节 `.v1.bak`，再原子升级。损坏、未来版本或备份/写盘失败明确拒绝，不按空库继续发送。重复完成事件、重启、发送后写盘失败均不自动重开已尝试回合；历史 `pending`、`sending`、`unknown`、`failed` 也不会恢复附件快照或从旧路径补发，需要用户提出新的明确请求。上线不补发旧任务。
+
+不要把 v2 文件交给只读 v1 的旧版本，也不要删除状态后重启。降级前先关闭定时回群并停止当前 Host；优先保留新状态、关闭功能并修复前滚。若必须恢复备份，先在隔离副本核验，并禁用所有在新版开始过的任务，保留 v2 状态人工核对，避免旧备份缺少高水位导致重发。测试读写只使用隔离 `dshHome`，不操作生产状态。加载更新后的 dsh-im Host 产物才生效，浏览器刷新不能替换 Node 已导入模块；远程 Harness 模式不启用本地回合监听。
+
+可在 dsh-im 的 `matrix` 配置中设置 `scheduleReplies: false` 关闭；`scheduleReplyTimeoutMs` 默认 60000 毫秒，只约束发送调用，不限制模型执行时间。删除原生提醒可停止其后续触发，不改变其他聊天行为。
+
 ## 快速开始
 
 1. 打开「设置 → IM机器人」，找到需要发消息的机器人。
@@ -223,6 +239,15 @@ const bots = await ctx.dshIm.listBots();
 // [{ botId, channel }, ...]
 ```
 返回值只包含稳定的公开元数据，不包含凭据、平台路由或目标内容。
+
+同 Host 插件还可通过 `listConversationBindings(botId)` 查询当前 Session 与平台目标的对应关系；它不创建目标，也不开启同步：
+
+```js
+const { channel, bindings } = await ctx.dshIm.listConversationBindings(botId);
+// bindings: [{ sessionId, kind, route }, ...]
+```
+
+查询只返回已记录且可解析的地址和 Session ID，不返回凭据、消息正文或内部会话键；同一 Session 的多个地址原样保留，由调用方处理歧义。读取失败会拒绝，不伪装成空列表；旧适配器不支持时返回 `capability-unavailable`。此接口仅用于同 Host 插件，不新增 HTTP 或浏览器 RPC。已知地址可通过现有 `send(botId, { kind, route }, text)` 临时路由发送，无需先保存目标。
 
 调用失败时 Promise 会拒绝，`error.code` 使用本文后面的公共错误码。
 

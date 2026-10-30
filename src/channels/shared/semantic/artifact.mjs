@@ -268,11 +268,21 @@ function cleanupArtifactStorage(artifact) {
   void unlink(storage.path).catch(() => undefined);
 }
 
+/** Only the original, still-live managed snapshot is an internal delivery capability. */
+export function isManagedOutboundArtifact(value) {
+  const storage = artifactStorage.get(value);
+  return Boolean(storage && !storage.releaseRequested);
+}
+
 /**
- * Holds successful tool results until the channel that owns the Session Turn
- * collects them. It does not decide which files a user may send.
+ * Holds two-phase tool results for their exact in-process delivery owner.
+ * RPC consumers bind only when their queued request is actually claimed. A
+ * trusted scheduled relay may instead open an observed Turn lease, without
+ * inventing an RPC source. Neither API decides which files a user may send.
  */
 export class OutboundArtifactRegistry {
+  // All file collections and cancellation listeners are keyed by owner identity,
+  // not just Session/Turn: an old owner's late cleanup cannot touch its successor.
   #turns = new Map();
   #stagedTurns = new Map();
   #claimedTurns = new Map();
@@ -281,6 +291,7 @@ export class OutboundArtifactRegistry {
   #consumersByPrompt = new Map();
   #consumersByTurn = new Map();
   #openTurns = new Map();
+  #disposedSessions = new Set();
   #uuid;
 
   constructor({ uuid = randomUUID } = {}) {
@@ -289,8 +300,9 @@ export class OutboundArtifactRegistry {
   }
 
   /**
-   * Bind one channel delivery consumer to the Turn its request starts.
-   * Only this consumer can retain files for delivery after the Turn ends.
+   * Register a queued ordinary RPC consumer. Opening it does not take over an
+   * active Turn; the Host's claim binds it. The returned close is owner-scoped
+   * and idempotent. Already claimed files belong to the provider pipeline.
    */
   openConsumer(sessionId, promptRpcId) {
     if (typeof sessionId !== 'string' || !sessionId
@@ -298,29 +310,58 @@ export class OutboundArtifactRegistry {
       throw new TypeError('sessionId and promptRpcId are required');
     }
     const key = promptKey(sessionId, promptRpcId);
+    const previous = this.#consumersByPrompt.get(key);
+    if (previous) this.#closeConsumer(previous);
     const consumer = {
       sessionId,
       promptRpcId,
-      turn: null,
-      released: false,
+      owner: null,
+      released: this.#disposedSessions.has(sessionId),
     };
-    this.#consumersByPrompt.set(key, consumer);
-    return () => {
-      if (consumer.released) return;
-      consumer.released = true;
-      if (this.#consumersByPrompt.get(key) === consumer) {
-        this.#consumersByPrompt.delete(key);
-      }
-      if (consumer.turn !== null) {
-        const keyForTurn = turnKey(sessionId, consumer.turn);
-        if (this.#consumersByTurn.get(keyForTurn) === consumer) {
-          this.#consumersByTurn.delete(keyForTurn);
-        }
-        // Claimed artifacts have already crossed into the provider pipeline and
-        // are released there. discard() only removes unclaimed work.
-        this.discard(sessionId, consumer.turn);
-      }
-    };
+    if (!consumer.released) this.#consumersByPrompt.set(key, consumer);
+    return () => this.#closeConsumer(consumer);
+  }
+
+  /**
+   * Open an internal non-RPC lease only for the currently observed live Turn.
+   * Refuse an existing owner, an unobserved/future/closed Turn or disposed
+   * Session. Authorization/routing is the relay's responsibility. The lease
+   * cannot select another Session/Turn or be serialized into a capability.
+   *
+   * active remains true after turn/end so the relay can first take() and then
+   * close(). close() discards only this owner's unclaimed files; taken files
+   * retain their original identity and must be released by their recipient.
+   * @returns {null | { readonly active: boolean, take(options?: {signal?: AbortSignal}): object[], close(): void }}
+   */
+  openTurnConsumer(sessionId, turn) {
+    if (typeof sessionId !== 'string' || !sessionId
+      || !Number.isInteger(turn) || turn < 0
+      || this.#disposedSessions.has(sessionId)
+      || this.#openTurns.get(sessionId) !== turn
+      || this.#consumerForTurn(sessionId, turn)) return null;
+    const owner = { kind: 'turn', sessionId, turn, released: false };
+    this.#consumersByTurn.set(turnKey(sessionId, turn), owner);
+    return Object.freeze({
+      get active() { return !owner.released; },
+      take: ({ signal } = {}) => this.#take(owner, signal),
+      close: () => this.#closeOwner(owner),
+    });
+  }
+
+  #closeConsumer(consumer) {
+    if (consumer.released) return;
+    consumer.released = true;
+    const key = promptKey(consumer.sessionId, consumer.promptRpcId);
+    if (this.#consumersByPrompt.get(key) === consumer) this.#consumersByPrompt.delete(key);
+    if (consumer.owner) this.#closeOwner(consumer.owner);
+  }
+
+  #closeOwner(owner) {
+    if (owner.released) return;
+    owner.released = true;
+    const key = turnKey(owner.sessionId, owner.turn);
+    if (this.#consumersByTurn.get(key) === owner) this.#consumersByTurn.delete(key);
+    this.#discardOwner(owner);
   }
 
   /** The Host claims input before assembling the first step's prompt. */
@@ -335,14 +376,22 @@ export class OutboundArtifactRegistry {
     if (typeof rpcId !== 'string' || !rpcId) return;
     const consumer = this.#consumersByPrompt.get(promptKey(sessionId, rpcId));
     if (!consumer || consumer.released) return;
-    consumer.turn = turn;
-    this.#consumersByTurn.set(turnKey(sessionId, turn), consumer);
+    const previous = this.#consumerForTurn(sessionId, turn);
+    if (previous && previous === consumer.owner) return;
+    // Preserve ordinary RPC queue/claim order. A real claim, not merely a
+    // pending RPC, revokes a schedule and removes its staged/committed files.
+    if (previous) this.#closeOwner(previous);
+    if (consumer.owner) this.#closeOwner(consumer.owner);
+    const owner = { kind: 'rpc', sessionId, turn, consumer, released: false };
+    consumer.owner = owner;
+    this.#consumersByTurn.set(turnKey(sessionId, turn), owner);
   }
 
   /** Observe durable Session events to bind delivery ownership and clean up. */
   observeSessionEvent(session, event, { logger } = {}) {
     const sessionId = sessionIdOf(session);
-    if (!sessionId || !event || typeof event !== 'object') return;
+    if (!sessionId || this.#disposedSessions.has(sessionId)
+      || !event || typeof event !== 'object') return;
     if (event.type === 'turn/start') {
       const turn = event.data?.turn;
       if (Number.isInteger(turn) && turn >= 0) this.#openTurns.set(sessionId, turn);
@@ -351,7 +400,8 @@ export class OutboundArtifactRegistry {
     if (event.type === 'user/message') {
       const rpcId = event.data?.source?.rpcId;
       const turn = this.#currentTurn(session);
-      if (typeof rpcId !== 'string' || !rpcId || !Number.isInteger(turn)) return;
+      if (typeof rpcId !== 'string' || !rpcId || !Number.isInteger(turn)
+        || (Number.isInteger(event.data?.turn) && event.data.turn !== turn)) return;
       this.#openTurns.set(sessionId, turn);
       this.#bindConsumer(sessionId, rpcId, turn);
       return;
@@ -362,11 +412,12 @@ export class OutboundArtifactRegistry {
     // Retain the observed closed state so a stale Session snapshot cannot
     // reopen a Turn while its consumer is still waiting to claim the files.
     if (this.#currentTurn(session) === turn) this.#openTurns.set(sessionId, null);
-    if (!this.#consumerForTurn(sessionId, turn)) {
-      const keyForTurn = turnKey(sessionId, turn);
-      const artifactCount = (this.#turns.get(keyForTurn)?.size ?? 0)
-        + (this.#stagedTurns.get(keyForTurn)?.size ?? 0);
-      this.discard(sessionId, turn);
+    for (const owner of new Set([...this.#turns.keys(), ...this.#stagedTurns.keys()])) {
+      if (owner.sessionId !== sessionId || owner.turn !== turn
+        || this.#consumerForTurn(sessionId, turn) === owner) continue;
+      const artifactCount = (this.#turns.get(owner)?.size ?? 0)
+        + (this.#stagedTurns.get(owner)?.size ?? 0);
+      this.#closeOwner(owner);
       if (artifactCount > 0) {
         logger?.warn?.('[dsh-im] discarded files without an active IM delivery consumer:', {
           sessionId, turn, artifactCount,
@@ -377,16 +428,20 @@ export class OutboundArtifactRegistry {
 
   #currentTurn(session) {
     const sessionId = sessionIdOf(session);
+    if (this.#disposedSessions.has(sessionId)) return null;
     return this.#openTurns.has(sessionId)
       ? this.#openTurns.get(sessionId)
       : currentTurn({ session });
   }
 
   #consumerForTurn(sessionId, turn) {
-    const consumer = this.#consumersByTurn.get(turnKey(sessionId, turn));
-    return consumer && !consumer.released && consumer.turn === turn
+    const owner = this.#consumersByTurn.get(turnKey(sessionId, turn));
+    if (!owner || owner.released) return null;
+    if (owner.kind === 'turn') return owner;
+    const consumer = owner.consumer;
+    return !consumer.released && consumer.owner === owner
       && this.#consumersByPrompt.get(promptKey(sessionId, consumer.promptRpcId)) === consumer
-      ? consumer : null;
+      ? owner : null;
   }
 
   /** Prompt guidance follows the active Turn's actual delivery owner. */
@@ -396,29 +451,18 @@ export class OutboundArtifactRegistry {
       && this.#consumerForTurn(sessionIdOf(session), turn) !== null;
   }
 
-  /** A disposed Session cannot have another channel consumer claim its files. */
+  /** Dispose only this Session's unclaimed work, never another delivery job. */
   disposeSession(session) {
     const sessionId = sessionIdOf(session);
     if (!sessionId) return;
-    const prefix = `${sessionId}\u0000`;
-    const artifacts = new Set();
-    for (const entries of [this.#turns, this.#stagedTurns]) {
-      for (const [key, turnArtifacts] of entries) {
-        if (!key.startsWith(prefix)) continue;
-        for (const artifact of turnArtifacts.values()) artifacts.add(artifact);
-        entries.delete(key);
-      }
+    this.#disposedSessions.add(sessionId);
+    for (const consumer of this.#consumersByPrompt.values()) {
+      if (consumer.sessionId === sessionId) this.#closeConsumer(consumer);
     }
-    for (const [key, consumer] of this.#consumersByPrompt) {
-      if (!key.startsWith(prefix)) continue;
-      consumer.released = true;
-      this.#consumersByPrompt.delete(key);
-    }
-    for (const key of this.#consumersByTurn.keys()) {
-      if (key.startsWith(prefix)) this.#consumersByTurn.delete(key);
+    for (const owner of [...this.#consumersByTurn.values()]) {
+      if (owner.sessionId === sessionId) this.#closeOwner(owner);
     }
     this.#openTurns.delete(sessionId);
-    for (const artifact of artifacts) cleanupArtifactStorage(artifact);
   }
 
   async stage(args, exec) {
@@ -478,81 +522,101 @@ export class OutboundArtifactRegistry {
     });
     artifactStorage.set(artifact, {
       path: storagePath,
+      owner: consumer,
       materializing: 0,
       materialized: false,
       releaseRequested: false,
       cleanupRequested: false,
       cleanupDeferred: false,
-      onCleanup: () => this.#forgetArtifact(artifact),
+      onCleanup: () => this.#forgetArtifact(artifact, consumer),
     });
-    const keyForTurn = turnKey(sessionId, turn);
-    let staged = this.#stagedTurns.get(keyForTurn);
+    let staged = this.#stagedTurns.get(consumer);
     if (!staged) {
       staged = new Map();
-      this.#stagedTurns.set(keyForTurn, staged);
+      this.#stagedTurns.set(consumer, staged);
     }
     staged.set(artifactKey(artifact), artifact);
     return artifact;
   }
 
+  /** Commit only this registry's staged file while its original owner is live. */
   commit(artifact) {
-    if (artifact?.kind !== ARTIFACT_KIND || !artifactStorage.has(artifact)) return null;
-    const keyForTurn = turnKey(artifact.origin.sessionId, artifact.origin.turn);
-    const key = artifactKey(artifact);
-    const staged = this.#stagedTurns.get(keyForTurn);
+    const owner = artifactStorage.get(artifact)?.owner;
+    const key = artifactKey(artifact ?? {});
+    const staged = this.#stagedTurns.get(owner);
     if (staged?.get(key) !== artifact) return null;
+    if (!isManagedOutboundArtifact(artifact)
+      || this.#consumerForTurn(owner.sessionId, owner.turn) !== owner) {
+      cleanupArtifactStorage(artifact);
+      return null;
+    }
     staged.delete(key);
-    if (staged.size === 0) this.#stagedTurns.delete(keyForTurn);
-    let committed = this.#turns.get(keyForTurn);
+    if (staged.size === 0) this.#stagedTurns.delete(owner);
+    let committed = this.#turns.get(owner);
     if (!committed) {
       committed = new Map();
-      this.#turns.set(keyForTurn, committed);
+      this.#turns.set(owner, committed);
     }
     committed.set(key, artifact);
     return publicArtifact(artifact);
   }
 
   release(artifact) {
-    if (artifact?.kind !== ARTIFACT_KIND) return;
-    const keyForTurn = turnKey(artifact.origin.sessionId, artifact.origin.turn);
-    const key = artifactKey(artifact);
-    const staged = this.#stagedTurns.get(keyForTurn);
-    if (staged?.get(key) === artifact) staged.delete(key);
-    if (staged?.size === 0) this.#stagedTurns.delete(keyForTurn);
     cleanupArtifactStorage(artifact);
   }
 
-  take(sessionId, turn, { signal } = {}) {
-    const keyForTurn = turnKey(sessionId, turn);
-    const committed = this.#turns.get(keyForTurn);
-    this.#turns.delete(keyForTurn);
+  /**
+   * Collect ordinary RPC files. HarnessClient supplies promptRpcId so a stale
+   * request cannot collect its successor's files. Omission retains the legacy
+   * ordinary-consumer API; non-RPC files are accessible only via their lease.
+   */
+  take(sessionId, turn, { signal, promptRpcId } = {}) {
+    const owner = this.#rpcOwner(sessionId, turn, promptRpcId);
+    return owner ? this.#take(owner, signal) : [];
+  }
+
+  #rpcOwner(sessionId, turn, promptRpcId) {
+    const owner = this.#consumerForTurn(sessionId, turn);
+    return owner?.kind === 'rpc'
+      && (promptRpcId === undefined || promptRpcId === owner.consumer.promptRpcId)
+      ? owner : null;
+  }
+
+  #take(owner, signal) {
+    if (this.#consumerForTurn(owner.sessionId, owner.turn) !== owner) return [];
+    const committed = this.#turns.get(owner);
+    this.#turns.delete(owner);
     if (!committed) return [];
     if (signal?.aborted) {
       for (const artifact of committed.values()) cleanupArtifactStorage(artifact);
       return [];
     }
-    const claimed = this.#claimedTurns.get(keyForTurn) ?? new Map();
-    this.#claimedTurns.set(keyForTurn, claimed);
+    const claimed = this.#claimedTurns.get(owner) ?? new Map();
+    this.#claimedTurns.set(owner, claimed);
     const artifacts = [];
     for (const [key, artifact] of committed) {
-      if (!artifactStorage.has(artifact)) continue;
+      if (!isManagedOutboundArtifact(artifact) || artifactStorage.get(artifact).owner !== owner) continue;
       claimed.set(key, artifact);
       artifacts.push(artifact);
     }
-    if (claimed.size === 0) this.#claimedTurns.delete(keyForTurn);
-    else if (!this.#bindClaimSignal(keyForTurn, signal)) return [];
+    if (claimed.size === 0) this.#claimedTurns.delete(owner);
+    else if (!this.#bindClaimSignal(owner, signal)) return [];
     return artifacts;
   }
 
-  discard(sessionId, turn) {
-    if (typeof sessionId !== 'string' || !Number.isInteger(turn)) return;
-    const keyForTurn = turnKey(sessionId, turn);
+  /** Discard unclaimed ordinary RPC files, with the same identity check as take(). */
+  discard(sessionId, turn, { promptRpcId } = {}) {
+    const owner = this.#rpcOwner(sessionId, turn, promptRpcId);
+    if (owner) this.#discardOwner(owner);
+  }
+
+  #discardOwner(owner) {
     const artifacts = new Set([
-      ...this.#turns.get(keyForTurn)?.values() ?? [],
-      ...this.#stagedTurns.get(keyForTurn)?.values() ?? [],
+      ...this.#turns.get(owner)?.values() ?? [],
+      ...this.#stagedTurns.get(owner)?.values() ?? [],
     ]);
-    this.#turns.delete(keyForTurn);
-    this.#stagedTurns.delete(keyForTurn);
+    this.#turns.delete(owner);
+    this.#stagedTurns.delete(owner);
     for (const artifact of artifacts) cleanupArtifactStorage(artifact);
   }
 
@@ -571,22 +635,24 @@ export class OutboundArtifactRegistry {
     this.#turns.clear();
     this.#stagedTurns.clear();
     this.#claimedTurns.clear();
-    for (const turnKey of this.#claimSignals.keys()) this.#releaseClaimSignal(turnKey);
+    for (const owner of this.#claimSignals.keys()) this.#releaseClaimSignal(owner);
     for (const consumer of this.#consumersByPrompt.values()) consumer.released = true;
+    for (const owner of this.#consumersByTurn.values()) owner.released = true;
     this.#consumersByPrompt.clear();
     this.#consumersByTurn.clear();
     this.#openTurns.clear();
+    this.#disposedSessions.clear();
   }
 
-  #bindClaimSignal(turnKey, signal) {
+  #bindClaimSignal(owner, signal) {
     if (!signal) return true;
-    this.#releaseClaimSignal(turnKey);
+    this.#releaseClaimSignal(owner);
     let claim = this.#signalClaims.get(signal);
     if (!claim) {
-      claim = { turnKeys: new Set(), onAbort: null };
+      claim = { owners: new Set(), onAbort: null };
       claim.onAbort = () => {
-        for (const claimedTurnKey of [...claim.turnKeys]) {
-          for (const artifact of this.#claimedTurns.get(claimedTurnKey)?.values() ?? []) {
+        for (const claimedOwner of [...claim.owners]) {
+          for (const artifact of this.#claimedTurns.get(claimedOwner)?.values() ?? []) {
             cleanupArtifactStorage(artifact);
           }
         }
@@ -594,8 +660,8 @@ export class OutboundArtifactRegistry {
       this.#signalClaims.set(signal, claim);
       signal.addEventListener('abort', claim.onAbort, { once: true });
     }
-    claim.turnKeys.add(turnKey);
-    this.#claimSignals.set(turnKey, signal);
+    claim.owners.add(owner);
+    this.#claimSignals.set(owner, signal);
     if (signal.aborted) {
       claim.onAbort();
       return false;
@@ -603,33 +669,26 @@ export class OutboundArtifactRegistry {
     return true;
   }
 
-  #releaseClaimSignal(turnKey) {
-    const signal = this.#claimSignals.get(turnKey);
+  #releaseClaimSignal(owner) {
+    const signal = this.#claimSignals.get(owner);
     if (!signal) return;
-    this.#claimSignals.delete(turnKey);
+    this.#claimSignals.delete(owner);
     const claim = this.#signalClaims.get(signal);
-    claim?.turnKeys.delete(turnKey);
-    if (claim?.turnKeys.size === 0) {
+    claim?.owners.delete(owner);
+    if (claim?.owners.size === 0) {
       signal.removeEventListener('abort', claim.onAbort);
       this.#signalClaims.delete(signal);
     }
   }
 
-  #forgetArtifact(artifact) {
-    const keyForTurn = turnKey(artifact.origin.sessionId, artifact.origin.turn);
+  #forgetArtifact(artifact, owner) {
     const key = artifactKey(artifact);
-    const committed = this.#turns.get(keyForTurn);
-    if (committed?.get(key) === artifact) committed.delete(key);
-    if (committed?.size === 0) this.#turns.delete(keyForTurn);
-    const staged = this.#stagedTurns.get(keyForTurn);
-    if (staged?.get(key) === artifact) staged.delete(key);
-    if (staged?.size === 0) this.#stagedTurns.delete(keyForTurn);
-    const claimed = this.#claimedTurns.get(keyForTurn);
-    if (claimed?.get(key) === artifact) claimed.delete(key);
-    if (claimed?.size === 0) {
-      this.#claimedTurns.delete(keyForTurn);
-      this.#releaseClaimSignal(keyForTurn);
+    for (const collection of [this.#turns, this.#stagedTurns, this.#claimedTurns]) {
+      const entries = collection.get(owner);
+      if (entries?.get(key) === artifact) entries.delete(key);
+      if (entries?.size === 0) collection.delete(owner);
     }
+    if (!this.#claimedTurns.has(owner)) this.#releaseClaimSignal(owner);
   }
 
 }
@@ -753,7 +812,7 @@ export async function materializeOutboundArtifact(artifact, {
     signal.throwIfAborted();
   }
   if (artifact?.kind !== ARTIFACT_KIND || artifact.schemaVersion !== 1
-    || !artifactStorage.has(artifact)
+    || !isManagedOutboundArtifact(artifact)
     || typeof artifact.digest !== 'string'
     || !Number.isSafeInteger(artifact.size) || artifact.size < 0) {
     throw artifactError('artifact-invalid', 'The file registration is invalid.');

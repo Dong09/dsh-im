@@ -306,7 +306,7 @@ test('Session title injection returns a valid Cordis startup effect', async () =
     },
   };
   const internals = Object.fromEntries(CHANNELS.map(([, applyName]) => [applyName, async () => {}]));
-  Object.assign(internals, { installSessionSyncCoordinator: () => {} });
+  Object.assign(internals, { installSessionSyncCoordinator: () => {}, installScheduleRelay: async () => {} });
   await createImHostPlugin(internals).apply(ctx);
   assert.equal(installed, true);
   for (const dispose of effects.reverse()) dispose?.();

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -19,6 +19,7 @@ import {
   createDeliveryAdapter,
   normalizeDeliveryTarget,
 } from '../plugin-src/host/delivery-adapter.mjs';
+import { OutboundArtifactRegistry } from '../src/channels/shared/semantic/artifact.mjs';
 import {
   deliverySuggestionsFromSessions,
   privateDeliverySuggestionFromConversationKey,
@@ -163,6 +164,55 @@ const PRIVATE_TARGETS = {
     targetId: 'private', kind: 'user', route: { jid: '16505550123@s.whatsapp.net' },
   },
 };
+
+test('only the Matrix adapter offers optional scheduled parts and reports missing controller capability', async () => {
+  for (const channel of ['telegram', 'feishu', 'slack', 'matrix']) {
+    const adapter = createDeliveryAdapter({ channel, workspaces: {}, coreController: {}, stateFor: () => ({}) });
+    assert.equal(typeof adapter.sendScheduledPart, channel === 'matrix' ? 'function' : 'undefined');
+    if (channel === 'matrix') {
+      await assert.rejects(adapter.sendScheduledPart('bot', { kind: 'room', route: { roomId: '!room:example.org' } },
+        { kind: 'text', text: 'internal' }), { code: 'capability-unavailable' });
+    }
+  }
+});
+
+test('Matrix scheduled adapter forwards full receipts and original managed artifact, not a cloned path/bytes value', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-adapter-scheduled-'));
+  const registry = new OutboundArtifactRegistry();
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  t.after(() => registry.clear());
+  const session = { header: { id: 'adapter-session', cwd: directory }, events: [
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'user/message', data: { turn: 1, source: { rpcId: 'adapter-rpc' } } },
+  ] };
+  t.after(registry.openConsumer('adapter-session', 'adapter-rpc'));
+  for (const event of session.events) registry.observeSessionEvent(session, event);
+  await writeFile(join(directory, 'unchanged.png'), Buffer.from([2, 0, 255]));
+  const staged = await registry.stage({ path: 'unchanged.png' }, { agent: { session }, callId: 'adapter-call' });
+  registry.commit(staged);
+  const artifact = registry.take('adapter-session', 1)[0];
+  const target = { kind: 'thread', route: { roomId: '!room:example.org', threadId: '$thread:example.org' } };
+  const options = { signal: new AbortController().signal, expectedFingerprint: 'a'.repeat(64) };
+  const receipt = { deliveryOutcome: 'failed', providerMessageIds: [], artifacts: [{ artifactId: artifact.artifactId, outcome: 'failed' }],
+    artifactDelivery: { userVisible: false }, failureNotice: { deliveryOutcome: 'sent', providerMessageIds: ['$notice:example.org'] } };
+  const calls = [];
+  const adapter = createDeliveryAdapter({ channel: 'matrix', workspaces: {}, stateFor: () => ({}),
+    coreController: { sendScheduledPart: async (...args) => { calls.push(args); return receipt; } } });
+  assert.equal(await adapter.sendScheduledPart('bot', target, { kind: 'artifact', artifact }, options), receipt);
+  assert.equal(calls[0][2].artifact, artifact);
+  assert.deepEqual(calls[0][1], target);
+  assert.equal(calls[0][3], options);
+  for (const part of [{ kind: 'artifact', artifact: { ...artifact } }, { kind: 'artifact', artifact: { path: 'unchanged.png' } },
+    { kind: 'artifact', artifact: 'https://example.org/a.png' }, { kind: 'artifact', artifact: Buffer.from([1]) },
+    { kind: 'artifact', artifact, fileName: 'renamed.png' }, { kind: 'text', text: 'ok', files: ['path'] }]) {
+    await assert.rejects(adapter.sendScheduledPart('bot', target, part, options), { code: 'bad-request' });
+  }
+  for (const invalid of [{ kind: 'dm', route: { userId: '@u:example.org' } }, { ...target, targetId: 'saved-alias' },
+    { kind: 'room', route: { roomId: '!room:example.org', threadId: '$unrequested:example.org' } }]) {
+    await assert.rejects(adapter.sendScheduledPart('bot', invalid, { kind: 'text', text: 'no' }, options), { code: 'invalid-target' });
+  }
+  assert.equal(calls.length, 1);
+});
 
 test('all ten delivery adapters validate and forward one stable target', async () => {
   for (const [channel, target] of Object.entries(TARGETS)) {

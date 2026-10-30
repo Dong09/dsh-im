@@ -67,7 +67,7 @@ Host 主动投递与建议支持 v12 实际房间 ID、旧式房间 ID 和合法
 - [原设计](<../../../../docs/superpowers/specs/2026-10-27-matrix-non-e2ee-mainline-design.md>) 和 [五任务计划](<../../../../docs/superpowers/plans/2026-10-27-matrix-non-e2ee-mainline.md>) 保留为需求和执行记录；本文集中保存长期取舍与安全要求，不复制实施流水账。
 - [生命周期消融与简化提案](<../../proposed/simplification/2026-10-28-matrix-lifecycle-ablation.md>) 保留为 proposed。它评估本实现中重复机制的合并，没有授权取消任务排空或错误语义，也没有改变本文所记录的当前实现。
 
-本次没有旧决策被完全取代，不归档或删除既有记录。
+[定时附件所有权与逐部分防重](2026-10-29-matrix-scheduled-artifact-delivery.md)复用本文的单一回退、未知结果与排空规则，增加非 RPC lease、内部桥与独立 checkpoint；不替换本文决定。本次没有旧决策被完全取代，不归档或删除既有记录。
 
 ## Alternatives considered
 

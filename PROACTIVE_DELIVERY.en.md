@@ -6,6 +6,22 @@ Proactive delivery lets an application send a text message through a bot connect
 
 All nine built-in channels support proactive delivery: Weixin, Feishu, DingTalk, WeCom, QQ, Slack, Telegram, Discord, and WhatsApp.
 
+## Matrix scheduled room replies (enabled by default)
+
+After a native scheduled task completes normally in a Matrix room or thread Session, dsh-im returns the final answer to that destination. Time between triggering and sending includes model generation of the final answer. Room and thread IDs share the Matrix channel's validation, supporting legacy and v12 hash room IDs. No separate plugin, manual Room ID, saved target, or Session sync switch is required. The manual-target steps below are for other applications sending proactively, not prerequisites for room reminders.
+
+This assumes members use Matrix and each room or thread owns a separate Session. A reminder created from Web in that same Session also returns to the room. A genuine scheduled input receives turn-scoped file permission before the first model step. Runtime and time snapshots, the skill catalog, and this plugin's context notices are not human interruptions. Human or unknown-source input revokes automatic delivery for that turn; ordinary IM keeps its original reply path. Missing bindings, DMs, other channels and conflicting destinations do not gain scheduled attachment permission.
+
+The model must explicitly register an existing image or file with `dsh_im_return_file`. Success means queued, not delivered to Matrix. Sending does not regenerate or rename the source; Web cards, Markdown paths, failed tools and failed enclosing Code Mode calls are not scanned for files. After normal completion, final text is attempted first, followed by files in registration order; attachment-only turns also work. Text failure does not discard otherwise deliverable files, but cancellation, an invalid route or checkpoint failure stops later sends. An explicitly rejected image may fall back to a file once. Timeouts, network failures, 5xx responses and missing valid native event receipts are unknown outcomes and never trigger a new file event. Known encrypted rooms without usable encryption reject before uploading and never downgrade to plaintext.
+
+Recorded old Session destinations survive `/new`. State is kept under the Matrix `dshHome` at `integrations/dsh-matrix/schedule-replies.json`. Version 2 retains destinations, conflicts, the attempted-turn high water and an immutable part manifest. Text and each attachment have separate states, available `providerMessageIds` and safe error codes. Failure notices are recorded separately and never count as attachment success. The whole attempt is `sent` only when every required part is confirmed sent; any `sending`/`unknown` makes it `unknown`, otherwise unconfirmed or failed parts make it `failed`. Check Host `[schedule-im-relay]` diagnostics and the Session's `lastAttempt.parts`: one visible text or notice is not proof that all files arrived. State contains no credentials, file bytes or absolute local paths.
+
+Valid version 1 state remains readable and all four old attempt states still prevent replay. Before the first atomic v2 commit, the original bytes are saved beside the state as `.v1.bak`. Corruption, future versions, backup failures and write failures reject instead of starting an empty database. Duplicate completion, restart and post-send checkpoint failure do not reopen attempted turns. Historical `pending`, `sending`, `unknown` and `failed` parts do not restore snapshots or resend from old paths; the user must make a new explicit request. Deployment does not backfill old tasks.
+
+Never hand v2 state to a v1-only reader or delete the state and restart. Before downgrading, disable scheduled replies and stop the current Host. Prefer retaining new state, disabling the feature and fixing forward. If restoring a backup is unavoidable, verify an isolated copy first, disable all tasks started under the new version, and retain v2 state for manual reconciliation so a missing high water cannot replay sends. Test reads and writes only with an isolated `dshHome`, not production state. Load the rebuilt dsh-im Host artifact for changes to take effect; refreshing the browser does not replace Node's imported Host modules. Remote-Harness mode does not attach a local turn observer.
+
+Set `scheduleReplies: false` in dsh-im's `matrix` configuration to disable replies. `scheduleReplyTimeoutMs` defaults to 60000 milliseconds and bounds sending, not model execution. Delete a native reminder to stop future triggers without changing ordinary chat behavior.
+
 ## Quick start
 
 1. Open **Settings → IM Bot** and find the bot that should send the message.
@@ -223,6 +239,15 @@ const bots = await ctx.dshIm.listBots();
 // [{ botId, channel }, ...]
 ```
 The result contains stable public metadata only; it never includes credentials, platform routes, or target data.
+
+A same-Host plugin may query current Session destinations with `listConversationBindings(botId)`, without creating targets or enabling sync:
+
+```js
+const { channel, bindings } = await ctx.dshIm.listConversationBindings(botId);
+// bindings: [{ sessionId, kind, route }, ...]
+```
+
+The query returns recorded, parseable destinations and Session IDs, never credentials, message content, or internal conversation keys. Multiple destinations for one Session remain separate so the caller can handle ambiguity. Read failures reject rather than becoming an empty list; unsupported legacy adapters return `capability-unavailable`. This is a same-Host interface, not a new HTTP or browser RPC endpoint. A known destination can use the existing draft route `send(botId, { kind, route }, text)` without saving a target first.
 
 On failure, the Promise rejects with an Error whose `code` is one of the public error codes below.
 

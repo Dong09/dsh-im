@@ -9,6 +9,7 @@ import {
   OutboundArtifactRegistry,
   createOutboundArtifactTool,
   installOutboundArtifactTool,
+  isManagedOutboundArtifact,
   materializeOutboundArtifact,
   readExactArtifactFile,
   releaseOutboundArtifact,
@@ -576,7 +577,7 @@ test('an observed Turn end overrides a stale open Session snapshot', async (t) =
   );
 });
 
-test('ending a turn logs and releases files whose consumer was replaced', async (t) => {
+test('replacing a consumer immediately releases its files before turn end', async (t) => {
   const fx = await fixture(t);
   await writeFile(join(fx.workspace, 'orphan.txt'), 'keep the original');
   const artifact = await fx.registry.stage(
@@ -584,15 +585,15 @@ test('ending a turn logs and releases files whose consumer was replaced', async 
   );
   fx.registry.commit(artifact);
   t.after(fx.registry.openConsumer('session-artifact', 'rpc-artifact'));
+  assert.equal(isManagedOutboundArtifact(artifact), false);
+  await assert.rejects(materializeOutboundArtifact(artifact), { code: 'artifact-invalid' });
   const warnings = [];
   const logger = { warn: (...args) => warnings.push(args) };
 
   fx.registry.observeSessionEvent(fx.agent.session,
     { type: 'turn/end', data: { turn: 7 } }, { logger });
 
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0][0], /without an active IM delivery consumer/);
-  assert.deepEqual(warnings[0][1], { sessionId: 'session-artifact', turn: 7, artifactCount: 1 });
+  assert.deepEqual(warnings, [], 'the replaced owner was already cleaned, not orphaned until turn/end');
   assert.deepEqual(fx.registry.take('session-artifact', 7), []);
   await assert.rejects(materializeOutboundArtifact(artifact), { code: 'artifact-invalid' });
   assert.equal(await readFile(join(fx.workspace, 'orphan.txt'), 'utf8'), 'keep the original');
@@ -605,4 +606,90 @@ test('an ordinary Web turn without files does not emit a warning', async (t) => 
     { type: 'turn/end', data: { turn: 7 } },
     { logger: { warn: (...args) => warnings.push(args) } });
   assert.deepEqual(warnings, []);
+});
+
+test('managed artifact validation accepts only the live private identity, not shape or serialization', async (t) => {
+  const fx = await fixture(t);
+  await writeFile(join(fx.workspace, 'identity.txt'), 'identity');
+  const artifact = await fx.registry.stage({ path: 'identity.txt' }, execution(fx.agent, 'identity'));
+  assert.equal(isManagedOutboundArtifact(artifact), true);
+  for (const forged of [
+    null, undefined, 0, 'artifact', {}, { ...artifact },
+    structuredClone(artifact), JSON.parse(JSON.stringify(artifact)),
+    Object.create(artifact), new Proxy(artifact, {}),
+  ]) {
+    assert.equal(isManagedOutboundArtifact(forged), false);
+    await assert.rejects(materializeOutboundArtifact(forged), { code: 'artifact-invalid' });
+  }
+  fx.registry.commit(artifact);
+  assert.deepEqual(fx.registry.take('session-artifact', 7, { promptRpcId: 'rpc-artifact' }), [artifact]);
+  releaseOutboundArtifact(artifact);
+  assert.equal(isManagedOutboundArtifact(artifact), false);
+  await assert.rejects(materializeOutboundArtifact(artifact), { code: 'artifact-invalid' });
+});
+
+for (const outerError of [false, true]) {
+  test(`a scheduled Code Mode file stays staged until the outer result ${outerError ? 'fails' : 'succeeds'}`, async (t) => {
+    const fx = await fixture(t, { consumer: false });
+    fx.agent.session.events = [{ type: 'turn/start', data: { turn: 7 } }];
+    fx.registry.observeSessionEvent(fx.agent.session, fx.agent.session.events[0]);
+    const lease = fx.registry.openTurnConsumer('session-artifact', 7);
+    t.after(() => lease.close());
+    await writeFile(join(fx.workspace, 'nested-schedule.txt'), 'native schedule');
+    const tool = createOutboundArtifactTool({ registry: fx.registry });
+    let stagedArtifact;
+    const stage = fx.registry.stage.bind(fx.registry);
+    t.mock.method(fx.registry, 'stage', async (...args) => {
+      stagedArtifact = await stage(...args);
+      return stagedArtifact;
+    });
+    const rootToken = Symbol('scheduled-root');
+    const nestedToken = Symbol('scheduled-nested');
+    const nested = execution(fx.agent, 'scheduled-child', { parent: nestedToken });
+    const registered = await tool.definition.execute({ path: 'nested-schedule.txt' }, nested);
+    tool.onResult(nested, { isError: false });
+    tool.onResult({ name: 'nested_code', token: nestedToken, parent: rootToken }, { isError: false });
+    assert.deepEqual(lease.take(), []);
+    tool.onResult({ name: 'run_code', token: rootToken }, { isError: outerError });
+    const artifacts = lease.take();
+    if (outerError) {
+      assert.deepEqual(artifacts, []);
+      assert.equal(isManagedOutboundArtifact(stagedArtifact), false);
+      await assert.rejects(materializeOutboundArtifact(stagedArtifact), { code: 'artifact-invalid' });
+    } else {
+      assert.equal(artifacts.length, 1);
+      assert.equal(artifacts[0].artifactId, registered.artifactId);
+      assert.equal((await materializeOutboundArtifact(artifacts[0])).bytes.toString(), 'native schedule');
+      releaseOutboundArtifact(artifacts[0]);
+    }
+    lease.close();
+    assert.deepEqual(lease.take(), []);
+  });
+}
+
+test('late successful native and Code Mode results cannot register a revoked schedule file', async (t) => {
+  const fx = await fixture(t, { consumer: false });
+  fx.registry.observeSessionEvent(fx.agent.session, { type: 'turn/start', data: { turn: 7 } });
+  const lease = fx.registry.openTurnConsumer('session-artifact', 7);
+  const tool = createOutboundArtifactTool({ registry: fx.registry });
+  await writeFile(join(fx.workspace, 'late.txt'), 'late schedule');
+  const rootToken = Symbol('late-root');
+  const native = execution(fx.agent, 'native-late');
+  const child = execution(fx.agent, 'child-late', { parent: rootToken });
+  await tool.definition.execute({ path: 'late.txt' }, native);
+  await tool.definition.execute({ path: 'late.txt' }, child);
+  tool.onResult(child, { isError: false });
+  t.after(fx.registry.openConsumer('session-artifact', 'ordinary-rpc'));
+  fx.registry.observeClaimedMessage(fx.agent.session, { source: { rpcId: 'ordinary-rpc' } }, 7);
+  await writeFile(join(fx.workspace, 'late.txt'), 'ordinary result');
+  const ordinary = await fx.registry.stage({ path: 'late.txt' }, execution(fx.agent, 'ordinary'));
+  fx.registry.commit(ordinary);
+
+  tool.onResult(native, { isError: false });
+  tool.onResult({ name: 'run_code', token: rootToken }, { isError: false });
+  lease.close();
+  assert.deepEqual(lease.take(), []);
+  assert.deepEqual(fx.registry.take('session-artifact', 7, { promptRpcId: 'ordinary-rpc' }), [ordinary]);
+  assert.equal((await materializeOutboundArtifact(ordinary)).bytes.toString(), 'ordinary result');
+  releaseOutboundArtifact(ordinary);
 });

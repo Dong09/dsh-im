@@ -1,4 +1,8 @@
 import { connectionTestMessage } from '../shared/connection-test.mjs';
+import { deliverOutboundArtifacts } from '../shared/semantic/artifact-delivery.mjs';
+import { createArtifactFailureReceipt } from '../shared/semantic/delivery.mjs';
+import { isManagedOutboundArtifact } from '../shared/semantic/artifact.mjs';
+import { isMatrixEventId } from './matrix-identifiers.mjs';
 import { publicMessageFailure } from '../shared/message-failure.mjs';
 import { t } from '../shared/i18n.mjs';
 import { deriveMatrixBotIdentity, maskMatrixBotId } from './matrix-config-store.mjs';
@@ -30,6 +34,30 @@ function cleanupFailures(results, stages) {
 
 function runtimeConnected(state) {
   return state?.ready === true && state.connectionState === 'connected' && state.harnessReachable !== false;
+}
+
+function scheduledFailure(error) {
+  const code = /^[a-z][a-z0-9-]{0,79}$/.test(error?.code ?? '') ? error.code
+    : error?.name === 'AbortError' ? 'cancelled' : 'delivery-failed';
+  return { deliveryOutcome: ['matrix-delivery-uncertain', 'artifact-delivery-uncertain', 'send-result-unknown'].includes(code)
+    ? 'unknown' : 'failed', reason: code, errorCode: code,
+  providerMessageIds: (Array.isArray(error?.providerMessageIds) ? error.providerMessageIds : []).filter(isMatrixEventId) };
+}
+
+function scheduledTextReceipt(result) {
+  const providerMessageIds = [...new Set((Array.isArray(result?.providerMessageIds) ? result.providerMessageIds : []).filter(isMatrixEventId))];
+  const outcome = ['failed', 'unknown'].includes(result?.deliveryOutcome) ? result.deliveryOutcome
+    : providerMessageIds.length ? 'sent' : 'unknown';
+  return { deliveryOutcome: outcome, providerMessageIds,
+    ...(outcome !== 'sent' ? { reason: outcome === 'unknown' ? 'send-result-unknown' : 'delivery-failed',
+      errorCode: outcome === 'unknown' ? 'send-result-unknown' : 'delivery-failed' } : {}) };
+}
+
+function scheduledArtifactFailureText(artifact, error) {
+  const name = String(artifact.fileName).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 255);
+  return error?.code === 'artifact-delivery-uncertain'
+    ? t('结果文件「{name}」的发送结果未能确认，请先检查聊天内是否已收到，不要立即重试。', { name })
+    : t('结果文件「{name}」已生成，但当前渠道暂时未能发送，请稍后重试。', { name });
 }
 
 export class MatrixController {
@@ -265,6 +293,107 @@ export class MatrixController {
       throw new Error('Matrix bot is not connected for proactive delivery');
     }
     return await runtime.sendProactiveText(target, String(text ?? ''), options);
+  }
+
+  /** Describe only the account already authenticated by the connected runtime. */
+  describeDeliveryAccount(botId) {
+    this.#assertOpen();
+    this.#requireId(botId);
+    const runtime = this.#runtimes.get(botId);
+    const config = this.#configStore.get(botId);
+    if (!config) throw operationError('unknown-bot', 'Unknown Matrix bot');
+    if (this.#errors.has(botId) || !runtimeConnected(runtime?.status)) {
+      throw operationError('bot-not-connected', 'Matrix bot is not connected');
+    }
+    if (typeof runtime.describeDeliveryAccount !== 'function') {
+      throw operationError('capability-unavailable', 'Verified Matrix delivery account is unavailable');
+    }
+    const account = runtime.describeDeliveryAccount();
+    if (account?.homeserver !== config.homeserver || account?.userId !== config.userId
+      || (config.deviceId && account?.deviceId !== config.deviceId)) {
+      throw operationError('account-changed', 'Authenticated Matrix account changed');
+    }
+    if (!/^[a-f0-9]{64}$/.test(account?.fingerprint ?? '')) {
+      throw operationError('account-unverified', 'Matrix account has not been verified');
+    }
+    return { version: 1, botId, channel: 'matrix', connected: true,
+      account: { fingerprint: account.fingerprint },
+      capabilities: typeof runtime.sendProactiveImage === 'function' && typeof runtime.sendProactiveFile === 'function'
+        && typeof runtime.sendProactiveText === 'function' ? ['scheduled-part-delivery'] : [] };
+  }
+
+  /**
+   * Internal single-part bridge. Keep rebind/delete behind this bot's transition
+   * until the provider settles; close still aborts and drains the runtime. The
+   * only fallback owner is deliverOutboundArtifacts, never a checkpoint writer.
+   */
+  async sendScheduledPart(botId, target, part, options = {}) {
+    this.#assertOpen();
+    this.#requireId(botId);
+    if (!['room', 'thread'].includes(target?.kind)
+      || !['text', 'artifact'].includes(part?.kind)
+      || (part.kind === 'text' ? typeof part.text !== 'string' || !part.text.trim() : !isManagedOutboundArtifact(part.artifact))) {
+      throw operationError('bad-request', 'Invalid internal Matrix scheduled part');
+    }
+    if (!/^[a-f0-9]{64}$/.test(options.expectedFingerprint ?? '')) {
+      throw operationError('capability-unavailable', 'A frozen Matrix account authorization is required');
+    }
+    return this.#withBotTransition(botId, async () => {
+      const runtime = this.#runtimes.get(botId);
+      const beforeSend = async () => {
+        this.#assertOpen();
+        options.signal?.throwIfAborted();
+        const account = this.describeDeliveryAccount(botId);
+        if (this.#runtimes.get(botId) !== runtime || account.account.fingerprint !== options.expectedFingerprint) {
+          throw operationError('account-changed', 'Authenticated Matrix account changed');
+        }
+        await options.beforeSend?.();
+        this.#assertOpen();
+        options.signal?.throwIfAborted();
+      };
+      await beforeSend();
+      const sendOptions = { signal: options.signal, format: options.format ?? 'plain', beforeSend };
+      if (part.kind === 'text') {
+        try { return scheduledTextReceipt(await runtime.sendProactiveText(target, part.text, sendOptions)); }
+        catch (error) { return scheduledFailure(error); }
+      }
+      const artifact = part.artifact;
+      let failure;
+      let artifactDelivery;
+      try {
+        artifactDelivery = await deliverOutboundArtifacts({
+          artifacts: [artifact], channelKey: 'matrix', signal: options.signal,
+          preserveConfirmedResultOnAbort: true,
+          sendImage: (file) => runtime.sendProactiveImage(target, { ...file, name: file.fileName }, sendOptions),
+          sendFile: (file) => runtime.sendProactiveFile(target, { ...file, name: file.fileName }, sendOptions),
+          onFailure: (_artifact, error) => { failure = error; }, logger: this.#logger,
+        });
+      } catch (error) {
+        failure = error;
+        const failed = scheduledFailure(error);
+        artifactDelivery = { receipt: createArtifactFailureReceipt({ artifactId: artifact.artifactId,
+          deliveryId: artifact.deliveryKey, error: failed.reason }), userVisible: failed.deliveryOutcome === 'unknown',
+        failureNoticeVisible: false, artifactsSent: 0, artifactSendErrors: 1 };
+      }
+      const receipt = artifactDelivery.receipt;
+      const result = receipt?.artifacts?.find((entry) => entry.artifactId === artifact.artifactId);
+      const providerMessageIds = (receipt?.providerMessageIds ?? []).filter(isMatrixEventId);
+      const deliveryOutcome = result?.outcome === 'sent' && providerMessageIds.length ? 'sent'
+        : result?.outcome === 'unknown' || result?.outcome === 'sent' ? 'unknown' : 'failed';
+      const reason = deliveryOutcome === 'sent' ? undefined : result?.reason ?? 'send-result-unknown';
+      // A diagnostic is an independent send, not proof that the file arrived.
+      // Do not begin a notice after cancellation and do not send it inside the
+      // image/file closure (where its failure could trigger media fallback).
+      let failureNotice = null;
+      if (failure && !options.signal?.aborted) {
+        try {
+          failureNotice = scheduledTextReceipt(await runtime.sendProactiveText(target,
+            scheduledArtifactFailureText(artifact, failure), { ...sendOptions, notice: true }));
+        } catch (error) { failureNotice = scheduledFailure(error); }
+      }
+      return { ...receipt, deliveryOutcome, providerMessageIds, artifactDelivery, failureNotice,
+        ...(reason ? { reason, errorCode: reason } : {}) };
+    });
   }
 
   async presentSessionSyncApproval(botId, target, interaction, options = {}) {

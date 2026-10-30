@@ -110,6 +110,40 @@ test('delivery RPC rejects unknown, missing, and extra fields before calling the
   assert.deepEqual(calls, []);
 });
 
+test('delivery RPC whitelist rejects scheduled entry names and external file data', async () => {
+  const { service, calls } = serviceFixture();
+  let internalCalls = 0;
+  service.authorizeScheduledTarget = async () => { internalCalls++; };
+  service.sendScheduledPart = async () => { internalCalls++; };
+  const handle = createDeliveryRpcHandler(service);
+  for (const endpoint of ['authorizeScheduledTarget', 'sendScheduledPart', 'scheduled.authorize', 'scheduled.part.send', 'message.sendScheduledPart']) {
+    assert.equal((await handle(endpoint, { botId: 'bot_one', target: { kind: 'room', route: { roomId: '!r:example.org' } },
+      part: { kind: 'text', text: 'no' } })).error.code, 'bad-request');
+  }
+  for (const extra of [{ path: 'private.png' }, { files: ['private.png'] }, { bytes: [1] },
+    { part: { kind: 'artifact', artifact: { path: 'private.png' } } }, { authorization: {} }]) {
+    assert.equal((await handle('message.send', { botId: 'bot_one', targetId: 'daily', text: 'text only', ...extra })).error.code, 'bad-request');
+  }
+  assert.equal(internalCalls, 0);
+  assert.deepEqual(calls, []);
+});
+
+test('published IM facade omits both scheduled internal entry points', async () => {
+  const { createImHostPlugin } = await import('../plugin-src/host/index.mjs');
+  const { service } = serviceFixture();
+  service.authorizeScheduledTarget = () => {};
+  service.sendScheduledPart = () => {};
+  let facade;
+  await createImHostPlugin({ createDeliveryService: () => service }).apply({
+    provide(name, value) { assert.equal(name, 'dshIm'); facade = value; },
+    inject() {},
+  });
+  assert.equal(typeof facade.send, 'function');
+  assert.equal(Object.isFrozen(facade), true);
+  assert.equal(Object.hasOwn(facade, 'authorizeScheduledTarget'), false);
+  assert.equal(Object.hasOwn(facade, 'sendScheduledPart'), false);
+});
+
 test('delivery RPC returns only stable public errors and handles pre-cancelled calls', async () => {
   const { service } = serviceFixture();
   service.listTargets = async () => {

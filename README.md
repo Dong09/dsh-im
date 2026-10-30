@@ -97,6 +97,8 @@
 
 Connect IM bots to DeepSeek Harness by scanning a QR code, using an App Manifest, or entering existing bot credentials, and let the local Harness connect outward to a public AI Office. One plugin and one settings entry manage the built-in IM channels and the AI Office Connector.
 
+渠道共用的 Harness 通信适配器与调用身份由所有使用它们的插件上下文共同持有；卸载一个渠道不会关闭其他渠道的事件订阅。最后一个使用者卸载后，旧适配器拒绝继续接收请求，不再将已失效的连接报告为正常。
+
 ## 界面
 
 ![IM 机器人页面](docs/images/imbot.png)

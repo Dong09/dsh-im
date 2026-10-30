@@ -4,6 +4,7 @@ import { activeHarnessInteractionOwner, clearModelCatalogCache, hasActiveHarness
 import { extractConnectionEvidence } from '../../src/channels/shared/connection-error.mjs';
 import { harnessPeer } from './harness-peer.mjs';
 import { sameWorkspacePath } from '../../src/channels/shared/default-workspace.mjs';
+import { sharedHostResource } from './shared-host-resource.mjs';
 
 const modernApis = new WeakMap();
 
@@ -216,53 +217,53 @@ class ModernHarnessApi {
   #disposers = [];
   #disposed = false;
 
-  constructor(ctx, gateway, scope) {
+  constructor(ctx, gateway, scope, peer) {
     this.#gateway = gateway;
     this.#scope = scope;
-    this.#peer = harnessPeer(ctx);
+    this.#peer = peer;
 
     this.host = Object.freeze({
-      describe: (request) => rpcResult(request, () => ({ ready: true, transport: 'typert' })),
+      describe: (request) => this.#result(request, () => ({ ready: true, transport: 'typert' })),
     });
     this.workspace = Object.freeze({
-      list: (request, signal) => rpcResult(request, () => this.#workspaceList(signal)),
-      create: (request, signal) => rpcResult(request, () => this.#invoke(
+      list: (request, signal) => this.#result(request, () => this.#workspaceList(signal)),
+      create: (request, signal) => this.#result(request, () => this.#invoke(
         'workspace', 'create', { request: request.payload }, signal,
       )),
     });
     this.sessions = Object.freeze({
-      list: (request, signal) => rpcResult(request, () => this.#invoke(
+      list: (request, signal) => this.#result(request, () => this.#invoke(
         'session', 'list', { _request: request.payload }, signal,
       )),
-      create: (request, signal) => rpcResult(request, () => this.#invoke(
+      create: (request, signal) => this.#result(request, () => this.#invoke(
         'session', 'create', { request: request.payload }, signal,
       )),
-      adopt: (request, signal) => rpcResult(request, () => this.#adoptSession(request.payload, signal)),
-      history: (request, signal) => rpcResult(request, () => this.#history(request.payload, signal)),
-      prompt: (request, signal) => rpcResult(request, () => this.#invoke(
+      adopt: (request, signal) => this.#result(request, () => this.#adoptSession(request.payload, signal)),
+      history: (request, signal) => this.#result(request, () => this.#history(request.payload, signal)),
+      prompt: (request, signal) => this.#result(request, () => this.#invoke(
         'session',
         'prompt',
         { request: { requestId: request.rpcId, ...request.payload } },
         signal,
       )),
-      rename: (request, signal) => rpcResult(request, () => this.#invoke(
+      rename: (request, signal) => this.#result(request, () => this.#invoke(
         'session', 'rename', { request: request.payload }, signal,
       )),
-      cancel: (request, signal) => rpcResult(request, () => this.#invoke(
+      cancel: (request, signal) => this.#result(request, () => this.#invoke(
         'session', 'cancel', { request: { sessionId: request.payload.sessionId } }, signal,
       )),
-      models: (request, signal) => rpcResult(request, () => this.#sessionModels(
+      models: (request, signal) => this.#result(request, () => this.#sessionModels(
         request.payload.sessionId, signal,
       )),
-      permissions: (request, signal) => rpcResult(request, () => this.#sessionPermissions(
+      permissions: (request, signal) => this.#result(request, () => this.#sessionPermissions(
         request.payload.sessionId, signal,
       )),
-      selectModel: (request, signal) => rpcResult(request, () => this.#invoke(
+      selectModel: (request, signal) => this.#result(request, () => this.#invoke(
         'session', 'selectModel', { request: request.payload }, signal,
       )),
     });
     this.llm = Object.freeze({
-      models: (request, signal) => rpcResult(request, async () => {
+      models: (request, signal) => this.#result(request, async () => {
         const catalog = await this.#modelCatalog(signal);
         return { groups: catalog.groups, failures: catalog.failures };
       }),
@@ -270,7 +271,10 @@ class ModernHarnessApi {
     this.events = Object.freeze({
       mux: (_request, signal) => this.#openMux(signal),
     });
-    this.respond = (message) => Promise.resolve(this.#respond(message));
+    this.respond = (message) => Promise.resolve().then(() => {
+      this.#assertActive();
+      return this.#respond(message);
+    });
 
     if (typeof ctx?.on === 'function') {
       this.#disposers.push(ctx.on('session/event', (session, event) => {
@@ -303,11 +307,27 @@ class ModernHarnessApi {
     if (service) this.#deliveryService = service;
   }
 
+  #assertActive() {
+    if (!this.#disposed) return;
+    const error = new Error('The shared Harness adapter has been disposed. Reconnect the IM channel.');
+    error.failure = { code: 'harness-adapter-disposed', message: error.message, details: {} };
+    throw error;
+  }
+
+  #result(request, operation) {
+    return rpcResult(request, () => {
+      this.#assertActive();
+      return operation();
+    });
+  }
+
   async #invoke(namespace, method, args, signal) {
+    this.#assertActive();
     return this.#gateway.invoke(remoteRequest(namespace, method, args, signal, this.#peer));
   }
 
   async #streamFirst(namespace, method, args, signal) {
+    this.#assertActive();
     const controller = new AbortController();
     const streamSignal = signal
       ? AbortSignal.any([signal, controller.signal])
@@ -507,6 +527,7 @@ class ModernHarnessApi {
   }
 
   #openMux(signal) {
+    this.#assertActive();
     let subscription;
     subscription = new MuxSubscription(signal, () => this.#mux.delete(subscription));
     this.#mux.add(subscription);
@@ -953,29 +974,23 @@ class ModernHarnessApi {
   }
 }
 
-/** Create one modern compatibility API per Cordis Host root. */
+/** Retain the Host's shared API until every consuming context unloads. */
 export function modernHarnessApi(ctx, { deliveryService } = {}) {
   const scope = ctx?.root ?? ctx;
-  if (!scope || !['object', 'function'].includes(typeof scope)) {
-    throw new TypeError('dsh-im requires a Cordis Host context');
-  }
-  const cached = modernApis.get(scope);
-  if (cached) {
-    cached.setDeliveryService(deliveryService);
-    return cached;
-  }
-  const gateway = ctx?.typertGateway;
+  const host = typeof scope?.on === 'function' ? scope : ctx;
+  const gateway = host?.typertGateway;
   if (!gateway || typeof gateway.invoke !== 'function' || typeof gateway.stream !== 'function') {
     throw new TypeError('dsh-im requires the modern Host Typert gateway');
   }
-  const api = new ModernHarnessApi(ctx, gateway, scope);
+  // Every API consumer also retains its caller identity, including cache hits.
+  const peer = harnessPeer(ctx);
+  const api = sharedHostResource(modernApis, ctx, {
+    create: (scope) => new ModernHarnessApi(
+      typeof scope.on === 'function' ? scope : ctx, gateway, scope, peer,
+    ),
+    dispose: (value) => value.dispose(),
+    label: 'dsh-im: modern Harness compatibility API',
+  });
   api.setDeliveryService(deliveryService);
-  modernApis.set(scope, api);
-  if (typeof ctx.effect === 'function') {
-    ctx.effect(() => () => {
-      if (modernApis.get(scope) === api) modernApis.delete(scope);
-      return api.dispose();
-    }, 'dsh-im: modern Harness compatibility API');
-  }
   return api;
 }
