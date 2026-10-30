@@ -1,5 +1,8 @@
 import test from 'node:test';
-import { deepStrictEqual, ok, throws } from 'node:assert';
+import { deepStrictEqual, equal, ok, rejects, throws } from 'node:assert';
+import { createDeliveryAdapter } from '../../../plugin-src/host/delivery-adapter.mjs';
+import { createDeliveryService } from '../../../plugin-src/host/delivery-service.mjs';
+import { controllerFixture, runtimeStub } from './fixtures/controller-fixture.mjs';
 
 import {
   deliverySuggestionFromConversationKey,
@@ -99,6 +102,64 @@ test('the delivery adapter enforces the matrix target grammar', async () => {
     () => normalizeDeliveryTarget('matrix', target, { targetIdRequired: false }),
     `${label} must be rejected`,
   )));
+});
+
+async function frozenControllerDelivery(t) {
+  const calls = [];
+  const account = { homeserver: 'https://matrix.example.org', userId: '@bot:example.org', deviceId: 'DEVICE', fingerprint: 'a'.repeat(64) };
+  const runtime = runtimeStub({
+    describeDeliveryAccount: () => ({ ...account }),
+    sendProactiveImage() {}, sendProactiveFile() {},
+    async sendProactiveText(target, text, options) {
+      await options.beforeSend();
+      calls.push({ target, text });
+      return { providerMessageIds: [`$frozen-${calls.length}:example.org`] };
+    },
+  });
+  const fx = await controllerFixture(t, { createRuntime: () => runtime });
+  await fx.controller.initialize();
+  const sessions = { 'room:!old:example.org$$old-thread:example.org': 'old-session' };
+  const adapter = createDeliveryAdapter({ channel: 'matrix', coreController: fx.controller,
+    workspaces: { has: (botId) => Boolean(fx.configStore.get(botId)), listBotIds: () => [fx.identity.botId] },
+    stateFor: () => ({ snapshot: () => ({ sessions }) }) });
+  const service = createDeliveryService();
+  service.registerAdapter(adapter);
+  const target = { kind: 'thread', route: { roomId: '!old:example.org', threadId: '$old-thread:example.org' } };
+  const authorization = await service.authorizeScheduledTarget(fx.identity.botId, target);
+  return { ...fx, runtime, account, calls, sessions, adapter, service, target, authorization,
+    send: (text) => service.sendScheduledPart(fx.identity.botId, target, { kind: 'text', text }, { authorization }) };
+}
+
+test('Matrix scheduled old-session route stays in its original thread after a room switches Session', async (t) => {
+  const f = await frozenControllerDelivery(t);
+  f.sessions['room:!old:example.org$$old-thread:example.org'] = 'new-session';
+  deepStrictEqual(await f.send('old scheduled result'), { deliveryOutcome: 'sent', providerMessageIds: ['$frozen-1:example.org'] });
+  deepStrictEqual(f.calls, [{ target: f.target, text: 'old scheduled result' }]);
+});
+
+test('Matrix scheduled parts reject removed account changed identity and replacement registration without retargeting', async (t) => {
+  for (const change of ['removed', 'account', 'registration', 'configured-device']) {
+    const f = await frozenControllerDelivery(t);
+    await f.send('first part');
+    if (change === 'removed') await f.controller.deleteBot(f.identity.botId);
+    if (change === 'account') f.account.fingerprint = 'b'.repeat(64);
+    if (change === 'registration') f.service.registerAdapter(f.adapter);
+    if (change === 'configured-device') await f.configStore.save({ ...f.configStore.get(f.identity.botId), deviceId: 'REPLACED' });
+    await rejects(f.send('never reroute'), { code: { removed: 'unknown-bot', account: 'account-changed',
+      registration: 'capability-unavailable', 'configured-device': 'account-changed' }[change] });
+    equal(f.calls.length, 1, change);
+    deepStrictEqual(f.calls[0].target, f.target);
+  }
+});
+
+test('Matrix scheduled account discovery rejects unverified runtime identities and incomplete media capability', async (t) => {
+  const f = await frozenControllerDelivery(t);
+  f.account.userId = '@someone-else:example.org';
+  await rejects(f.service.authorizeScheduledTarget(f.identity.botId, f.target), { code: 'account-changed' });
+  equal(f.calls.length, 0);
+  f.account.userId = '@bot:example.org';
+  f.runtime.sendProactiveImage = undefined;
+  await rejects(f.service.authorizeScheduledTarget(f.identity.botId, f.target), { code: 'capability-unavailable' });
 });
 
 const V12_ROOM = '!KplB3ESm99I-4PaRdWxDUKr0Sia5nRhRtykpfs1VloM';

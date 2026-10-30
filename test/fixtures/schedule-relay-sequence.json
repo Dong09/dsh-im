@@ -1,0 +1,12 @@
+{
+  "description": "Sanitized existing-file reproduction: native reminder (no rpcId), Host runtime/time snapshots, first return-file call, completed turn. Events are observed from the real Host, never injected from this fixture.",
+  "coreInputKinds": ["schedule", "runtime-context", "time-context"],
+  "imageBase64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l2UAAAAASUVORK5CYII=",
+  "fileText": "Existing scheduled report.\nDo not regenerate or rename for delivery.\n",
+  "cases": [
+    { "id": "room-image", "input": "schedule", "kind": "room", "roomId": "!original-room:example.invalid", "fileName": "existing-cat.png", "mediaType": "image/png", "eventId": "$scheduled-room-image", "textEventId": "$scheduled-room-text" },
+    { "id": "thread-image", "input": "schedule", "kind": "thread", "roomId": "!original-room:example.invalid", "threadId": "$original-thread", "fileName": "existing-thread-cat.png", "mediaType": "image/png", "eventId": "$scheduled-thread-image", "textEventId": "$scheduled-thread-text" },
+    { "id": "room-file", "input": "schedule", "kind": "room", "roomId": "!original-room:example.invalid", "fileName": "existing-report.txt", "mediaType": "text/plain", "eventId": "$scheduled-room-file", "textEventId": "$scheduled-file-text" },
+    { "id": "direct-im", "input": "rpc", "kind": "room", "roomId": "!original-room:example.invalid", "fileName": "existing-direct-cat.png", "mediaType": "image/png", "eventId": "$direct-im-image", "textEventId": "$direct-im-text" }
+  ]
+}

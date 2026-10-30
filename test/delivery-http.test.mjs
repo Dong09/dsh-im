@@ -172,6 +172,26 @@ test('delivery HTTP maps only stable delivery errors to HTTP status codes', asyn
   });
 });
 
+test('delivery HTTP never dispatches internal scheduled authorization or file-shaped requests', async () => {
+  const { service, calls } = serviceFixture();
+  service.authorizeScheduledTarget = async () => { throw new Error('must not be exposed'); };
+  service.sendScheduledPart = async () => { throw new Error('must not be exposed'); };
+  await withServer(createDeliveryHttpHandler(service), async (url) => {
+    const base = { botId: 'bot_one', targetId: 'daily', text: 'text only' };
+    for (const extra of [{ path: 'private.png' }, { files: ['private.png'] }, { bytes: [1, 2, 3] },
+      { artifact: { kind: 'dsh-im-outbound-artifact' } }, { authorization: {} },
+      { endpoint: 'sendScheduledPart' }, { part: { kind: 'artifact', artifact: { path: 'private.png' } } }]) {
+      const result = await request(url, { body: JSON.stringify({ ...base, ...extra }) });
+      assert.equal(result.status, 400);
+      assert.equal(result.body.error.code, 'bad-request');
+    }
+    const internal = await request(url, { body: JSON.stringify({ botId: 'bot_one',
+      target: { kind: 'room', route: { roomId: '!room:example.org' } }, part: { kind: 'text', text: 'no' } }) });
+    assert.equal(internal.status, 400);
+  });
+  assert.deepEqual(calls, []);
+});
+
 test('delivery HTTP installs one exact WebServer route with Cordis lifecycle ownership', () => {
   const { service } = serviceFixture();
   const registrations = [];

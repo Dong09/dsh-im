@@ -378,7 +378,7 @@ for (const outcome of ['failed', 'stopped']) {
       context.harness.ask = originalAsk;
       context.fake.pushEvents([groupMessage({ body: '/new' })]);
       await eventually(() => sentRoomMessages(context.fake).some((call) =>
-        call.content.body.includes('已开启新会话')), 'a fresh session releases previous answer provenance');
+        call.content.body.includes('已开启全新 Harness 会话')), 'a fresh session releases previous answer provenance');
       context.fake.pushEvents([groupMessage({ body: addressedBody('新会话正常提问'), content: mentionContent() })]);
       await context.waitForPromptCount(2);
       const prompt = context.harness.prompts[1];

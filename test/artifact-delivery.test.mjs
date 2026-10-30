@@ -345,6 +345,52 @@ test('mixed artifacts preserve order and merge existing receipt semantics', asyn
   await assertReleased(file);
 });
 
+test('scheduled single-artifact mode preserves explicit native success despite a simultaneous abort', async (t) => {
+  const artifact = await committedArtifact(t, 'confirmed.png', Buffer.from([3, 4, 5]));
+  const controller = new AbortController();
+  let fileCalls = 0;
+  const delivery = await deliverOutboundArtifacts({ artifacts: [artifact], channelKey: 'matrix',
+    signal: controller.signal, preserveConfirmedResultOnAbort: true,
+    sendImage: async () => {
+      controller.abort();
+      return { deliveryOutcome: 'sent', providerMessageIds: ['$confirmed:example.org'] };
+    }, sendFile: async () => { fileCalls++; },
+  });
+  assert.equal(delivery.artifactsSent, 1);
+  assert.deepEqual(delivery.receipt.providerMessageIds, ['$confirmed:example.org']);
+  assert.deepEqual(delivery.receipt.artifacts, [{ artifactId: artifact.artifactId, outcome: 'sent' }]);
+  assert.equal(fileCalls, 0);
+  await assertReleased(artifact);
+});
+
+test('scheduled single-artifact mode preserves uncertain native dispatch when abort races it', async (t) => {
+  const artifact = await committedArtifact(t, 'unknown.png', Buffer.from([1]));
+  const controller = new AbortController();
+  let files = 0;
+  const delivery = await deliverOutboundArtifacts({ artifacts: [artifact], channelKey: 'matrix',
+    signal: controller.signal, preserveConfirmedResultOnAbort: true,
+    sendImage: async () => { controller.abort(); throw rejected('artifact-delivery-uncertain'); },
+    sendFile: async () => { files++; },
+  });
+  assert.equal(files, 0);
+  assert.equal(delivery.artifactsSent, 0);
+  assert.equal(delivery.receipt.artifacts[0].outcome, 'unknown');
+  assert.equal(delivery.receipt.artifacts[0].reason, 'artifact-delivery-uncertain');
+  await assertReleased(artifact);
+});
+
+test('scheduled mode does not invent acknowledgement from a boolean or ID-only result after abort', async (t) => {
+  for (const result of [{ sent: true }, { providerMessageIds: ['$unproven:example.org'] }, { deliveryOutcome: 'sent', providerMessageIds: [] }]) {
+    const artifact = await committedArtifact(t, 'unproven.txt', 'text');
+    const controller = new AbortController();
+    await assert.rejects(deliverOutboundArtifacts({ artifacts: [artifact], channelKey: 'matrix',
+      signal: controller.signal, preserveConfirmedResultOnAbort: true,
+      sendFile: async () => { controller.abort(); return result; },
+    }), { name: 'AbortError' });
+    await assertReleased(artifact);
+  }
+});
+
 test('a definitively failed base delivery is not treated as user-visible', async () => {
   const delivery = await deliverOutboundArtifacts({
     baseReceipt: createDeliveryReceipt({

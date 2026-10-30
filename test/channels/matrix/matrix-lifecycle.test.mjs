@@ -204,6 +204,85 @@ test('matrix lifecycle stop waits for an admitted room send and preserves its kn
   assert.deepEqual(await sending, { providerMessageIds: ['$committed:example.org'] });
 });
 
+test('matrix lifecycle proactive media load is cancelled and drained before dependencies are released', { timeout: 5_000 }, async (t) => {
+  const entered = deferred(), gate = deferred();
+  let loadSignal;
+  const f = fixture(t, { cleanup: () => gate.resolve(Buffer.from([1])) });
+  let uploads = 0;
+  f.api.uploadMedia = async () => { uploads++; return 'mxc://example.org/upload'; };
+  await f.runtime.start();
+  const sending = f.runtime.sendProactiveImage({ kind: 'thread', route: { roomId: ROOM, threadId: '$thread:example.org' } }, {
+    name: 'original.png', mediaType: 'image/png', load: async ({ signal }) => { loadSignal = signal; entered.resolve(); return gate.promise; },
+  }).catch((error) => error);
+  await entered.promise;
+  let stopped = false;
+  const stopping = f.runtime.stop().then(() => { stopped = true; });
+  await turn();
+  assert.equal(stopped, false);
+  assert.equal(loadSignal.aborted, true);
+  gate.resolve(Buffer.from([1]));
+  await stopping;
+  assert.equal((await sending).name, 'AbortError');
+  assert.equal(uploads, 0);
+  assert.equal(f.calls.filter(({ op }) => op === 'send').length, 0);
+});
+
+test('matrix lifecycle proactive upload receives caller and runtime abort and cannot dispatch a late event', { timeout: 5_000 }, async (t) => {
+  const entered = deferred(), gate = deferred();
+  let uploadSignal;
+  const caller = new AbortController();
+  const f = fixture(t, { cleanup: () => gate.resolve('mxc://example.org/upload') });
+  f.api.uploadMedia = async (_bytes, _metadata, options) => { uploadSignal = options.signal; entered.resolve(); return gate.promise; };
+  await f.runtime.start();
+  const sending = f.runtime.sendProactiveFile({ kind: 'room', route: { roomId: ROOM } }, {
+    name: 'original.txt', mediaType: 'text/plain', bytes: Buffer.from('original'),
+  }, { signal: caller.signal }).catch((error) => error);
+  await entered.promise;
+  caller.abort();
+  assert.equal(uploadSignal.aborted, true);
+  let stopped = false;
+  const stopping = f.runtime.stop().then(() => { stopped = true; });
+  await turn();
+  assert.equal(stopped, false);
+  gate.resolve('mxc://example.org/upload');
+  await stopping;
+  assert.equal((await sending).name, 'AbortError');
+  assert.equal(f.calls.filter(({ op }) => op === 'send').length, 0);
+});
+
+for (const acknowledged of [true, false]) {
+  test(`matrix lifecycle proactive media ${acknowledged ? 'acknowledgement survives' : 'unknown dispatch stays unknown during'} stop`, { timeout: 5_000 }, async (t) => {
+    const entered = deferred(), gate = deferred();
+    let nativeSignal;
+    const f = fixture(t, { sendEvent: (_room, _type, _content, options) => {
+      nativeSignal = options.signal; entered.resolve(); return gate.promise;
+    }, cleanup: () => gate.resolve({ event_id: '$remote:example.org' }) });
+    let uploads = 0;
+    f.api.uploadMedia = async () => { uploads++; return 'mxc://example.org/upload'; };
+    await f.runtime.start();
+    const sending = f.runtime.sendProactiveImage({ kind: 'thread', route: { roomId: ROOM, threadId: '$thread:example.org' } }, {
+      name: 'original.png', mediaType: 'image/png', bytes: Buffer.from([0, 1, 2]),
+    }).catch((error) => error);
+    await entered.promise;
+    let stopped = false;
+    const stopping = f.runtime.stop().then(() => { stopped = true; });
+    await turn();
+    assert.equal(stopped, false);
+    assert.equal(nativeSignal.aborted, true);
+    if (acknowledged) gate.resolve({ event_id: '$remote:example.org' });
+    else gate.reject(new DOMException('late abort without an acknowledgement', 'AbortError'));
+    const result = await sending;
+    await stopping;
+    if (acknowledged) assert.deepEqual(result, { deliveryOutcome: 'sent', providerMessageIds: ['$remote:example.org'], msgtype: 'm.image' });
+    else assert.equal(result.code, 'artifact-delivery-uncertain');
+    assert.equal(uploads, 1);
+    const sends = f.calls.filter(({ op }) => op === 'send');
+    assert.equal(sends.length, 1);
+    assert.equal(sends[0].content.msgtype, 'm.image');
+    assert.equal(sends[0].content['m.relates_to'].event_id, '$thread:example.org');
+  });
+}
+
 test('matrix lifecycle stop drains an invitation without recording its late join response', { timeout: 5_000 }, async (t) => {
   const entered = deferred(), gate = deferred();
   const invited = '!invited:example.org';

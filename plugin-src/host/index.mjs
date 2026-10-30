@@ -28,6 +28,7 @@ import { installInjectedContext } from './injected-context.mjs';
 import { installSessionSyncCoordinator } from './session-sync-coordinator.mjs';
 import { deliverySwitchesOff } from '../../src/channels/shared/delivery-sync-settings.mjs';
 import { getDeliverySyncSettingsStore } from '../../src/channels/shared/delivery-sync-settings-store.mjs';
+import { installScheduleRelay } from './schedule-relay.mjs';
 import { installSessionTitlePrefix } from './session-title-prefix.mjs';
 import { installUpdateRpc } from './update-rpc.mjs';
 
@@ -38,7 +39,7 @@ export const inject = [
   'typertGateway',
 ];
 
-function channelConfig(config, name, deliveryService) {
+function channelConfig(config, name, deliveryService, beforeClose) {
   const channel = {
     ...(config.dshHome ? { dshHome: config.dshHome } : {}),
     ...(config.groupByAgentPreset === undefined ? {} : { groupByAgentPreset: config.groupByAgentPreset }),
@@ -47,7 +48,7 @@ function channelConfig(config, name, deliveryService) {
   const withAuthority = config.rpcAuthority === undefined
     ? channel
     : { ...channel, rpcAuthority: config.rpcAuthority };
-  return name === 'office' ? withAuthority : { ...withAuthority, deliveryService };
+  return name === 'office' ? withAuthority : { ...withAuthority, deliveryService, ...(beforeClose ? { beforeClose } : {}) };
 }
 
 export function createImHostPlugin(internals = {}) {
@@ -62,6 +63,7 @@ export function createImHostPlugin(internals = {}) {
   const startDeliveryHttp = internals.installDeliveryHttp ?? installDeliveryHttp;
   const startSessionSync = internals.installSessionSyncCoordinator
     ?? installSessionSyncCoordinator;
+  const startScheduleRelay = internals.installScheduleRelay ?? installScheduleRelay;
   const makeDeliveryService = internals.createDeliveryService ?? createDeliveryService;
   const startFeishu = internals.applyFeishu ?? applyFeishu;
   const startWeixin = internals.applyWeixin ?? applyWeixin;
@@ -156,6 +158,7 @@ export function createImHostPlugin(internals = {}) {
           listTargets: async (botId) => (await deliveryService.listTargets(botId)).targets,
           createTarget: (botId, target) => deliveryService.createTarget(botId, target),
           listBots: () => deliveryService.listBots(),
+          listConversationBindings: (botId) => deliveryService.listConversationBindings(botId),
         }));
       }
       const activate = async (readyCtx) => {
@@ -179,6 +182,12 @@ export function createImHostPlugin(internals = {}) {
   });
 
   async function activateChannels(ctx, config, deliveryService) {
+    let scheduleRelayReady = Promise.resolve(null);
+    const beforeMatrixClose = async () => {
+      // Activation reports failures; a failed initializer has no relay to drain.
+      const relay = await scheduleRelayReady.catch((error) => { void error; return null; });
+      await relay?.close();
+    };
     // Bind the bot message language before any channel connects, so the first
     // command menu a platform stores is already in the interface language.
     const hostLanguage = startHostLanguage(ctx, config);
@@ -248,7 +257,7 @@ export function createImHostPlugin(internals = {}) {
     // Start them together so a slow channel cannot leave later routes absent.
     await Promise.all(channels.map(async ([channel, start]) => {
       try {
-        await start(ctx, channelConfig(config, channel, deliveryService));
+        await start(ctx, channelConfig(config, channel, deliveryService, channel === 'matrix' ? beforeMatrixClose : undefined));
       } catch (error) {
         failures.push(error);
         logger.error?.(`[dsh-im] failed to activate ${channel}; continuing with the remaining channels`, error);
@@ -263,10 +272,27 @@ export function createImHostPlugin(internals = {}) {
           logger,
           inputScope: ctx.root ?? ctx,
           config,
+          resolveAnswerDestination: async (sessionId, turn, event) => {
+            const relay = await scheduleRelayReady.catch(() => null);
+            return relay?.deliveryDestinationFor?.(sessionId, turn, event) ?? null;
+          },
         });
         installDsBotQuestionSync(ctx, deliveryService, { logger });
       } catch (error) {
         logger.error?.('[dsh-im] failed to activate Session sync; continuing with channels', error);
+      }
+      if (typeof ctx?.effect === 'function' && config.matrix?.scheduleReplies !== false
+        && config.matrix?.harnessBaseUrl === undefined) {
+        try {
+          scheduleRelayReady = Promise.resolve(startScheduleRelay(ctx, deliveryService, {
+            dshHome: config.matrix?.dshHome ?? config.dshHome,
+            sendTimeoutMs: config.matrix?.scheduleReplyTimeoutMs,
+            logger,
+          }));
+          await scheduleRelayReady;
+        } catch (error) {
+          logger.error?.('[dsh-im] failed to activate Matrix scheduled replies; ordinary chat remains available', error);
+        }
       }
     }
   }

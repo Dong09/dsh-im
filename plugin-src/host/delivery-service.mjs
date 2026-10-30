@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
-import { normalizeDeliveryTarget } from './delivery-adapter.mjs';
+import { normalizeDeliveryTarget, normalizeScheduledDeliveryTarget, normalizeScheduledDeliveryPart, matchesScheduledDestination } from './delivery-adapter.mjs';
 import { deliverySuggestionFromConversationKey } from './delivery-suggestions.mjs';
+import { isMatrixEventId } from '../../src/channels/matrix/matrix-identifiers.mjs';
 import { COMPETITIVE_APPROVAL_CHANNELS } from '../../src/channels/shared/harness-approval.mjs';
 import { t } from '../../src/channels/shared/i18n.mjs';
 import { parseConversationKey } from '../../src/channels/shared/conversation/describe.mjs';
@@ -148,6 +149,7 @@ export class DeliveryService {
   #adapters = new Map();
   #unavailableSessionSyncChannels;
   #logger;
+  #scheduledAuthorizations = new WeakMap();
   dsBot;
 
   constructor({ unavailableSessionSyncChannels = [], dsBot, logger = console } = {}) {
@@ -261,6 +263,32 @@ export class DeliveryService {
       }
     }
     return bots;
+  }
+
+  /** Read current Session destinations without enabling sync or creating saved targets. */
+  async listConversationBindings(botId) {
+    const id = botIdOf(botId);
+    const registration = await this.#checkedRegistrationFor(id);
+    const { adapter } = registration;
+    if (typeof adapter.listConversationBindings !== 'function') throw deliveryError('capability-unavailable');
+    try {
+      const bindings = await adapter.listConversationBindings(id);
+      this.#assertRegistered(registration);
+      if (!Array.isArray(bindings)) throw new TypeError('Adapter returned invalid conversation bindings');
+      return {
+        botId: id,
+        channel: adapter.channel,
+        bindings: bindings.map(({ sessionId, kind, route }) => {
+          if (typeof sessionId !== 'string' || !sessionId || sessionId.trim() !== sessionId) {
+            throw new TypeError('Adapter returned an invalid Session id');
+          }
+          return { sessionId, ...normalizeDeliveryTarget(adapter.channel, { kind, route }, { targetIdRequired: false }) };
+        }),
+      };
+    } catch (error) {
+      this.#assertRegistered(registration);
+      throw publicOperationError(error);
+    }
   }
 
   async listSuggestions(botId) {
@@ -456,7 +484,7 @@ export class DeliveryService {
     return false;
   }
 
-  async sendSessionSyncText(botId, targetId, sessionId, text, { signal, format = 'plain' } = {}) {
+  async sendSessionSyncText(botId, targetId, sessionId, text, { signal, format = 'plain', excludedDestination } = {}) {
     const id = botIdOf(botId);
     const targetKey = targetIdOf(targetId);
     if (typeof sessionId !== 'string' || !sessionId
@@ -470,7 +498,10 @@ export class DeliveryService {
       throw deliveryError('session-sync-unavailable', 'Session sync is unavailable');
     }
     try {
-      await adapter.sendSessionSyncText(id, targetKey, sessionId, text, { signal, format });
+      const result = await adapter.sendSessionSyncText(id, targetKey, sessionId, text, {
+        signal, format, ...(excludedDestination == null ? {} : { excludedDestination }),
+      });
+      if (result?.sent === false && result.reason === 'externally-owned') return result;
       return { sent: true };
     } catch (error) {
       if (signal?.aborted || error?.name === 'AbortError' || error?.code === 'ABORT_ERR') {
@@ -577,10 +608,10 @@ export class DeliveryService {
    *
    * @param {string} sessionId harness session id
    * @param {string} text message body
-   * @param {{format?: 'plain'|'markdown', signal?: AbortSignal}} [options]
-   * @returns {Promise<{sent: true} | {sent: false, reason: 'unbound'|'unroutable'}>}
+   * @param {{format?: 'plain'|'markdown', signal?: AbortSignal, excludedDestination?: object}} [options]
+   * @returns {Promise<{sent: true} | {sent: false, reason: 'unbound'|'unroutable'|'externally-owned'}>}
    */
-  async deliverSessionText(sessionId, text, { format = 'plain', signal } = {}) {
+  async deliverSessionText(sessionId, text, { format = 'plain', signal, excludedDestination } = {}) {
     if (typeof sessionId !== 'string' || !sessionId
       || typeof text !== 'string' || !text.trim()
       || (format !== 'plain' && format !== 'markdown')) {
@@ -601,6 +632,12 @@ export class DeliveryService {
       // message the wrong place, so the key is only reported here.
       this.#warnUndelivered(sessionId, 'unroutable', described);
       return { sent: false, reason: 'unroutable' };
+    }
+    // Host-internal relay ownership is checked against the route this lookup
+    // actually resolved, not an earlier lookup that a rebind could invalidate.
+    // It excludes one exact Matrix destination, never another bot or thread.
+    if (described.channel === 'matrix' && matchesScheduledDestination(described.botId, draft, excludedDestination)) {
+      return { sent: false, reason: 'externally-owned' };
     }
     // The draft goes through the ordinary send path, so the adapter validates
     // and normalizes it exactly as it does a saved target.
@@ -738,6 +775,87 @@ export class DeliveryService {
     } catch (error) { throw publicOperationError(error); }
   }
 
+  /**
+   * Host-internal admission snapshot, never exposed through the IM facade/HTTP/RPC.
+   * The opaque handle binds this service, exact bot/room/thread, live account and
+   * adapter registration; neither a saved target edit nor reconnect can retarget it.
+   */
+  async authorizeScheduledTarget(botId, target, { signal } = {}) {
+    const id = botIdOf(botId);
+    const frozenTarget = normalizeScheduledDeliveryTarget(target);
+    cancellation(signal);
+    const registration = await this.#checkedRegistrationFor(id);
+    const fingerprint = await this.#scheduledAccount(registration, id, signal);
+    const authorization = Object.freeze(Object.create(null));
+    this.#scheduledAuthorizations.set(authorization, Object.freeze({
+      botId: id, target: frozenTarget, registration, fingerprint, signal,
+    }));
+    return authorization;
+  }
+
+  async #scheduledAccount(registration, botId, signal, expectedFingerprint) {
+    this.#assertRegistered(registration);
+    cancellation(signal);
+    const { adapter } = registration;
+    if (adapter.channel !== 'matrix' || this.#unavailableSessionSyncChannels.has('matrix')
+      || typeof adapter.sendScheduledPart !== 'function' || typeof adapter.describeAccount !== 'function') {
+      throw deliveryError('capability-unavailable');
+    }
+    if (!await adapter.ownsBot(botId)) throw deliveryError('unknown-bot');
+    this.#assertRegistered(registration);
+    cancellation(signal);
+    const account = await adapter.describeAccount(botId);
+    this.#assertRegistered(registration);
+    cancellation(signal);
+    if (account?.version !== 1 || account.botId !== botId || account.channel !== 'matrix'
+      || !account.capabilities?.includes('scheduled-part-delivery')) throw deliveryError('capability-unavailable');
+    if (account.connected !== true) throw deliveryError('bot-not-connected');
+    const fingerprint = account.account?.fingerprint;
+    if (!/^[a-f0-9]{64}$/.test(fingerprint ?? '')) throw deliveryError('account-unverified');
+    if (expectedFingerprint !== undefined && fingerprint !== expectedFingerprint) throw deliveryError('account-changed');
+    return fingerprint;
+  }
+
+  /**
+   * Send exactly one required part. Preconditions reject before side effects;
+   * actual attempts return explicit outcomes, not boolean `sent` or notice IDs.
+   * No checkpoint callback is accepted. The relay owns all persistence outside
+   * provider closures. Abort revokes future effects, not a confirmed remote send.
+   */
+  async sendScheduledPart(botId, target, part, { authorization, signal, format = 'plain' } = {}) {
+    const id = botIdOf(botId);
+    const normalizedTarget = normalizeScheduledDeliveryTarget(target);
+    const normalizedPart = normalizeScheduledDeliveryPart(part);
+    if (!['plain', 'markdown'].includes(format)) throw deliveryError('bad-request');
+    const snapshot = this.#scheduledAuthorizations.get(authorization);
+    if (!snapshot) throw deliveryError('capability-unavailable');
+    if (snapshot.botId !== id || JSON.stringify(snapshot.target) !== JSON.stringify(normalizedTarget)) {
+      throw deliveryError('target-changed');
+    }
+    const combined = AbortSignal.any([snapshot.registration.controller.signal, snapshot.signal, signal].filter(Boolean));
+    const beforeSend = () => this.#scheduledAccount(snapshot.registration, id, combined, snapshot.fingerprint);
+    await beforeSend();
+    const result = await snapshot.registration.adapter.sendScheduledPart(id, snapshot.target, normalizedPart, {
+      signal: combined, format, expectedFingerprint: snapshot.fingerprint, beforeSend,
+    });
+    // Do not recheck abort/registration here: replacement or shutdown after a
+    // native acknowledgement cannot erase that acknowledgement or trigger retry.
+    const providerMessageIds = [...new Set((Array.isArray(result?.providerMessageIds) ? result.providerMessageIds : []).filter(isMatrixEventId))];
+    const artifactResults = normalizedPart.kind === 'artifact' ? result?.artifacts : null;
+    const validArtifact = normalizedPart.kind !== 'artifact' || (Array.isArray(artifactResults)
+      && artifactResults.length === 1 && artifactResults[0].artifactId === normalizedPart.artifact.artifactId
+      && artifactResults[0].outcome === 'sent');
+    const deliveryOutcome = ['sent', 'failed', 'unknown'].includes(result?.deliveryOutcome)
+      && (result.deliveryOutcome !== 'sent' || (providerMessageIds.length > 0 && validArtifact))
+      ? result.deliveryOutcome : 'unknown';
+    return {
+      ...(result && typeof result === 'object' ? result : {}),
+      deliveryOutcome,
+      providerMessageIds,
+      ...(deliveryOutcome !== result?.deliveryOutcome ? { reason: 'send-result-unknown', errorCode: 'send-result-unknown' } : {}),
+    };
+  }
+
   async send(botId, targetIdOrDraft, text, { signal, format = 'plain' } = {}) {
     const id = botIdOf(botId);
     const targetKey = typeof targetIdOrDraft === 'string'
@@ -769,6 +887,15 @@ export class DeliveryService {
       });
       return { sent: true };
     } catch (error) {
+      const providerMessageIds = Array.isArray(error?.providerMessageIds) ? error.providerMessageIds : [];
+      // A lost Matrix acknowledgement or an already-sent chunk makes retrying
+      // the whole text unsafe, even when a later chunk was definitely rejected.
+      // Keep this public text-send mapping separate from scheduled part receipts.
+      if (error?.code === 'matrix-delivery-uncertain' || providerMessageIds.length > 0) {
+        const uncertain = deliveryError('send-result-unknown', 'Send result is unknown', { cause: error });
+        if (providerMessageIds.length > 0) uncertain.providerMessageIds = [...providerMessageIds];
+        throw uncertain;
+      }
       if (signal?.aborted || error?.name === 'AbortError' || error?.code === 'ABORT_ERR') {
         throw deliveryError('cancelled', 'Request cancelled', { cause: error });
       }

@@ -94,6 +94,8 @@
 
 Connect IM bots to DeepSeek Harness by scanning a QR code, using an App Manifest, or entering existing bot credentials, and let the local Harness connect outward to a public AI Office. One plugin and one settings entry manage the built-in IM channels and the AI Office Connector. iMessage uses one native Messages.app identity per macOS user account; see the [iMessage channel notes](docs/imessage.md).
 
+All consuming plugin contexts retain the shared Harness adapter and caller identity. Unloading one channel does not close another channel's event subscriptions. After the last consumer unloads, the old adapter rejects further requests instead of reporting a healthy connection.
+
 ## Interface
 
 ![IM bot settings page](docs/images/imbot_en.png)

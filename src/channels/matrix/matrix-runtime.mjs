@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { createEditableMessageStream, splitMessageText } from '../shared/editable-message-stream.mjs';
 import { t } from '../shared/i18n.mjs';
 import {
@@ -573,6 +574,37 @@ export class MatrixRuntime {
       actor, validate: options.validate,
       send: (text) => this.sendProactiveText(target, text),
     }, { ...options, runtimeSignal: this.#lifecycleController.signal });
+  }
+
+  /** Live whoami identity only; callers never read credentials or create another API. */
+  describeDeliveryAccount() {
+    if (this.#stopped || !this.#status.ready || !this.#api || !this.#botUserId) {
+      throw Object.assign(new Error('Matrix account is not connected'), { code: 'bot-not-connected' });
+    }
+    const identity = { homeserver: this.#config.homeserver, userId: this.#botUserId, deviceId: this.#deviceId };
+    return { ...identity, fingerprint: createHash('sha256').update(JSON.stringify({ provider: 'matrix', ...identity })).digest('hex') };
+  }
+
+  /** Native single-type sends: the shared artifact layer alone owns image fallback. */
+  sendProactiveImage(target, file, options = {}) {
+    return this.#sendProactiveArtifact(target, file, true, options);
+  }
+
+  sendProactiveFile(target, file, options = {}) {
+    return this.#sendProactiveArtifact(target, file, false, options);
+  }
+
+  #sendProactiveArtifact(target, file, preferImage, options) {
+    if (this.#stopped || !this.#status.ready || !this.#api) {
+      return Promise.reject(Object.assign(new Error('Matrix bot is not connected'), { code: 'bot-not-connected' }));
+    }
+    const normalized = normalizeMatrixDeliveryTarget(target ?? {});
+    if (normalized.error || !['room', 'thread'].includes(normalized.value.kind)) {
+      return Promise.reject(Object.assign(new Error('Matrix media delivery requires a room or thread'), { code: 'invalid-target' }));
+    }
+    return this.#trackTask(this.#outboundTasks, this.#sendArtifact({
+      roomId: normalized.value.roomId, threadId: normalized.value.threadId ?? null,
+    }, file, preferImage, options));
   }
 
   sendProactiveText(target, text, options = {}) {
@@ -1590,6 +1622,8 @@ export class MatrixRuntime {
       eventType = 'm.room.encrypted';
     }
     options.signal?.throwIfAborted();
+    await options.beforeSend?.();
+    options.signal?.throwIfAborted();
     let result;
     try {
       result = await api.sendEvent(roomId, eventType, content, options);
@@ -1763,9 +1797,18 @@ export class MatrixRuntime {
       }
       if (options.notice === true) content.msgtype = 'm.notice';
       applyMatrixRelations(content, { threadId, replyToEventId });
-      const result = await this.#sendRoomEvent(roomId, 'm.room.message', content, {
-        ...(options.signal ? { signal: options.signal } : {}),
-      });
+      let result;
+      try {
+        result = await this.#sendRoomEvent(roomId, 'm.room.message', content, {
+          ...(options.signal ? { signal: options.signal } : {}),
+          ...(options.beforeSend ? { beforeSend: options.beforeSend } : {}),
+        });
+      } catch (error) {
+        // Earlier chunks remain confirmed even when a later event is rejected,
+        // cancelled or uncertain. A partial ID list is not whole-part success.
+        error.providerMessageIds = [...providerMessageIds];
+        throw error;
+      }
       if (typeof result?.event_id === 'string') providerMessageIds.push(result.event_id);
       // The send exits are the trusted record of what the room received: this
       // deployment's homeserver verifiably does not echo bot-authored events
@@ -1838,14 +1881,15 @@ export class MatrixRuntime {
     return Object.assign(stream, { finishNotice, fail: finishNotice });
   }
 
-  async #sendArtifact(target, file, preferImage) {
+  async #sendArtifact(target, file, preferImage, options = {}) {
     const api = this.#api;
     if (!api) throw new Error('Matrix bot is not connected');
     const roomId = typeof target?.roomId === 'string' ? target.roomId : '';
     if (!isMatrixRoomId(roomId)) throw new TypeError('Matrix artifact target requires a valid room id');
     this.#assertRoomSendSupported(roomId);
-    const options = this.#sendOptions();
+    options = this.#sendOptions(options);
     const bytes = file?.bytes instanceof Uint8Array ? file.bytes : await file?.load?.(options).catch(() => null);
+    options.signal?.throwIfAborted();
     if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
       const error = new Error(t('结果文件内容为空或下载失败。'));
       error.code = 'artifact-provider-failed';
@@ -1857,7 +1901,9 @@ export class MatrixRuntime {
       throw error;
     }
     const mediaType = cleanString(file?.mediaType) ?? 'application/octet-stream';
-    const fileName = cleanString(file?.name) ?? (preferImage ? 'image.jpg' : 'file.bin');
+    const fileName = cleanString(file?.name) ?? cleanString(file?.fileName) ?? (preferImage ? 'image.jpg' : 'file.bin');
+    await options.beforeSend?.();
+    options.signal?.throwIfAborted();
     const contentUri = await api.uploadMedia(bytes, { filename: fileName, mediaType }, options).catch((cause) => {
       const error = new Error(t('Matrix 媒体上传失败。'));
       error.code = 'artifact-provider-failed';
@@ -1878,7 +1924,7 @@ export class MatrixRuntime {
     applyMatrixRelations(content, { threadId });
     try {
       const result = await this.#sendRoomEvent(roomId, 'm.room.message', content, options);
-      return { providerMessageIds: [result.event_id], msgtype };
+      return { providerMessageIds: [result.event_id], deliveryOutcome: 'sent', msgtype };
     } catch (cause) {
       if (cause?.code !== 'matrix-delivery-uncertain') throw cause;
       const error = new Error(cause.message, { cause });

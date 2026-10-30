@@ -11,6 +11,7 @@ import {
 import { parseConversationKey } from '../../src/channels/shared/conversation/describe.mjs';
 import { withSessionBindingLock } from '../../src/channels/shared/session-binding-lock.mjs';
 import { dsBotError } from './ds-bot-client.mjs';
+import { isManagedOutboundArtifact } from '../../src/channels/shared/semantic/artifact.mjs';
 
 const CHANNELS = new Set([
   'weixin',
@@ -30,6 +31,13 @@ const CHANNELS = new Set([
 
 export function supportsDeliveryChannel(channel) {
   return CHANNELS.has(channel);
+}
+
+/** Internal relay ownership is scoped to one exact Matrix destination, never a target id. */
+export function matchesScheduledDestination(botId, target, owner) {
+  return !!owner && owner.botId === botId && ['room', 'thread'].includes(owner.kind)
+    && target?.kind === owner.kind && target.route?.roomId === owner.route?.roomId
+    && (owner.kind === 'room' || target.route?.threadId === owner.route?.threadId);
 }
 
 function invalidTarget(message) {
@@ -182,6 +190,28 @@ export function normalizeDeliveryTarget(channel, value, { targetIdRequired = tru
   normalized.kind = requiredString(value.kind, 'target.kind');
   normalized.route = normalizeRoute(channel, normalized.kind, value.route);
   return normalized;
+}
+
+/** Internal relay targets never resolve a DM or a saved target alias. */
+export function normalizeScheduledDeliveryTarget(value) {
+  exactKeys(value, ['kind', 'route'], 'scheduled target');
+  if (!['room', 'thread'].includes(value.kind)) throw invalidTarget('Scheduled delivery requires a Matrix room or thread');
+  const target = normalizeDeliveryTarget('matrix', value, { targetIdRequired: false });
+  return Object.freeze({ kind: target.kind, route: Object.freeze(target.route) });
+}
+
+/** Preserve the registry object: a structurally identical copy has no snapshot ownership. */
+export function normalizeScheduledDeliveryPart(value) {
+  const allowed = value?.kind === 'text' ? ['kind', 'text'] : ['kind', 'artifact'];
+  if (!isRecord(value) || Object.keys(value).length !== allowed.length
+    || Object.keys(value).some((key) => !allowed.includes(key))
+    || (value.kind === 'text' ? typeof value.text !== 'string' || !value.text.trim()
+      : value.kind !== 'artifact' || !isManagedOutboundArtifact(value.artifact))) {
+    throw Object.assign(new Error('Invalid internal scheduled delivery part'), { code: 'bad-request' });
+  }
+  return Object.freeze(value.kind === 'text'
+    ? { kind: 'text', text: value.text }
+    : { kind: 'artifact', artifact: value.artifact });
 }
 
 function targetWithoutSessionSync(target) {
@@ -526,6 +556,15 @@ export function createDeliveryAdapter({
         return true;
       });
     },
+    async listConversationBindings(botId) {
+      const sessions = stateSessions(await stateFor(botId));
+      if (!sessions) throw new TypeError('Conversation bindings cannot be inspected');
+      return Object.entries(sessions).flatMap(([key, sessionId]) => {
+        if (typeof sessionId !== 'string' || !sessionId || sessionId.trim() !== sessionId) return [];
+        const target = deliverySuggestionFromConversationKey(channel, key);
+        return target ? [{ sessionId, ...target }] : [];
+      });
+    },
     async listSuggestions(botId) {
       const state = await stateFor(botId);
       if (!state || typeof state.snapshot !== 'function') {
@@ -548,6 +587,17 @@ export function createDeliveryAdapter({
       normalizeDeliveryTarget(channel, replacement, { targetIdRequired: false }),
     ),
     deleteTarget: (botId, targetId) => workspaces.deleteDeliveryTarget(botId, targetId),
+    // Optional, Host-internal capability. Other channels keep their existing required interface.
+    ...(channel === 'matrix' ? {
+      async sendScheduledPart(botId, target, part, options = {}) {
+        const normalizedTarget = normalizeScheduledDeliveryTarget(target);
+        const normalizedPart = normalizeScheduledDeliveryPart(part);
+        if (typeof coreController.sendScheduledPart !== 'function') {
+          throw Object.assign(new Error('Scheduled part delivery is unavailable'), { code: 'capability-unavailable' });
+        }
+        return coreController.sendScheduledPart(botId, normalizedTarget, normalizedPart, options);
+      },
+    } : {}),
     async sendText(botId, target, text, options = {}) {
       const normalized = normalizeDeliveryTarget(channel, targetWithoutSessionSync(target));
       if (typeof coreController.sendProactiveText !== 'function') {
@@ -626,6 +676,9 @@ export function createDeliveryAdapter({
     async sendSessionSyncText(botId, targetId, sessionId, text, options = {}) {
       if (typeof text !== 'string' || !text.trim()) throw new TypeError('text is required');
       const { target } = await syncTarget(botId, targetId, sessionId);
+      if (channel === 'matrix' && matchesScheduledDestination(botId, target, options.excludedDestination)) {
+        return { sent: false, reason: 'externally-owned' };
+      }
       if (typeof coreController.sendProactiveText !== 'function') {
         throw new TypeError('delivery controller cannot send proactive text');
       }

@@ -46,11 +46,12 @@ export async function installProductionChannel(ctx, config, {
   let production;
   let unregisterDelivery;
   let closing;
-  const closeProduction = () => (closing ??= (async () => {
+  const closeProduction = (drain = true) => (closing ??= (async () => {
     try {
-      await unregisterDelivery?.();
+      if (drain) await config.beforeClose?.();
     } finally {
-      await production?.close();
+      try { await unregisterDelivery?.(); }
+      finally { await production?.close(); }
     }
   })());
   try {
@@ -58,7 +59,7 @@ export async function installProductionChannel(ctx, config, {
     unregisterDelivery = config.deliveryService && production.deliveryAdapter
       ? config.deliveryService.registerAdapter(production.deliveryAdapter) : undefined;
     const readyHandler = createHandler(production.controller);
-    ctx.effect(() => closeProduction, `dsh-im: close ${channel} connections`);
+    ctx.effect(() => () => closeProduction(), `dsh-im: close ${channel} connections`);
     followHostLanguage(ctx, channel, production.controller, logger);
     handler = readyHandler;
   } catch (error) {
@@ -66,7 +67,8 @@ export async function installProductionChannel(ctx, config, {
       ? reportStartupError(error, false)
       : diagnostics.report(error, { operation: 'startup', stage: 'startup.load', publicError: publicChannelStartupError(channel, error) }).publicError;
     try {
-      await closeProduction();
+      // Startup rollback must not wait for consumers installed after channel activation.
+      await closeProduction(false);
     } catch (cleanupError) {
       if (reportStartupError) reportStartupError(cleanupError, true);
       else diagnostics.report(cleanupError, { operation: 'startup', stage: 'connection.stop', warning: true });

@@ -7,7 +7,10 @@ import { deepStrictEqual, equal, match, ok, rejects } from 'node:assert';
 import { MatrixRuntime } from '../../../src/channels/matrix/matrix-runtime.mjs';
 import { MatrixSidecarStore } from '../../../src/channels/matrix/matrix-config-store.mjs';
 import { MatrixApi, MatrixApiError } from '../../../src/channels/matrix/matrix-api.mjs';
-import { OutboundArtifactRegistry } from '../../../src/channels/shared/semantic/artifact.mjs';
+import { OutboundArtifactRegistry, materializeOutboundArtifact } from '../../../src/channels/shared/semantic/artifact.mjs';
+import { createDeliveryAdapter } from '../../../plugin-src/host/delivery-adapter.mjs';
+import { createDeliveryService } from '../../../plugin-src/host/delivery-service.mjs';
+import { controllerFixture } from './fixtures/controller-fixture.mjs';
 import { MatrixRoomHistoryStore } from '../../../src/channels/matrix/matrix-room-history.mjs';
 
 const HOME = 'https://matrix.example.org';
@@ -278,6 +281,228 @@ async function artifactContext(t, { name = 'result.png', outcome, uploadError, e
   await eventually(() => (context.runtime.status.artifactsSent ?? 0) + (context.runtime.status.artifactSendErrors ?? 0) === 1);
   return { ...context, roomId, media, get uploads() { return uploads; }, get asks() { return asks; } };
 }
+
+async function scheduledContext(t, { encrypted = false, eventOutcome, uploadOutcome, config = {} } = {}) {
+  const roomId = '!KplB3ESm99I-4PaRdWxDUKr0Sia5nRhRtykpfs1VloM';
+  const target = { kind: 'thread', route: { roomId, threadId: '$scheduled-thread:example.org' } };
+  const uploads = [], events = [];
+  const api = createFakeApi({ initial: { next_batch: 'scheduled-start', rooms: { join: {
+    [roomId]: { state: { events: encrypted ? [{ type: 'm.room.encryption', content: {} }] : [] } },
+  } } } });
+  api.uploadMedia = async (bytes, metadata, options) => {
+    uploads.push({ bytes: Buffer.from(bytes), metadata, options });
+    return uploadOutcome ? uploadOutcome(bytes, metadata, options) : 'mxc://media.example.org/scheduled';
+  };
+  api.sendEvent = async (room, type, content, options) => {
+    events.push({ roomId: room, type, content, options });
+    return eventOutcome ? eventOutcome(content, events.length, options) : { event_id: `$scheduled-${events.length}:example.org` };
+  };
+  const context = await createContext({ api, config: { e2eeMode: 'off', maxMessageLength: 500, ...config } });
+  t.after(() => context.stop());
+  const controller = await controllerFixture(t, { createRuntime: () => context.runtime });
+  await controller.controller.initialize();
+  const botId = controller.identity.botId;
+  const im = createDeliveryService();
+  im.registerAdapter(createDeliveryAdapter({ channel: 'matrix', coreController: controller.controller,
+    workspaces: { has: (id) => id === botId && Boolean(controller.configStore.get(id)), listBotIds: () => [botId] },
+    stateFor: () => context.state }));
+  const authorization = await im.authorizeScheduledTarget(botId, target);
+  const directory = await makeTempDirectory('dsh-matrix-scheduled-');
+  const registry = new OutboundArtifactRegistry();
+  t.after(() => registry.clear());
+  let artifactIndex = 0;
+  const artifact = async (name, bytes) => {
+    artifactIndex++;
+    const sessionId = `scheduled-${artifactIndex}`;
+    const session = { header: { id: sessionId, cwd: directory }, events: [
+      { type: 'turn/start', data: { turn: 1 } },
+      { type: 'user/message', data: { turn: 1, source: { rpcId: `scheduled-rpc-${artifactIndex}` } } },
+    ] };
+    t.after(registry.openConsumer(sessionId, `scheduled-rpc-${artifactIndex}`));
+    for (const event of session.events) registry.observeSessionEvent(session, event);
+    await writeFile(join(directory, name), bytes);
+    const staged = await registry.stage({ path: name }, { agent: { session }, callId: `scheduled-return-${artifactIndex}` });
+    registry.commit(staged);
+    return registry.take(sessionId, 1)[0];
+  };
+  return { ...context, im, controller, botId, target, authorization, uploads, events, artifact,
+    send: (part, options = {}) => im.sendScheduledPart(botId, target, part, { authorization, ...options }) };
+}
+
+test('scheduled Matrix bridge sends original names exact bytes and native IDs to the frozen thread', async (t) => {
+  const f = await scheduledContext(t);
+  const image = await f.artifact('existing-猫.png', Buffer.from([0, 1, 255, 3]));
+  const file = await f.artifact('existing-report.txt', Buffer.from('original document'));
+  const textResult = await f.send({ kind: 'text', text: 'Prepared once' });
+  const imageResult = await f.send({ kind: 'artifact', artifact: image });
+  const fileResult = await f.send({ kind: 'artifact', artifact: file });
+  deepStrictEqual(textResult, { deliveryOutcome: 'sent', providerMessageIds: ['$scheduled-1:example.org'] });
+  equal(imageResult.deliveryOutcome, 'sent');
+  deepStrictEqual(imageResult.providerMessageIds, ['$scheduled-2:example.org']);
+  deepStrictEqual(fileResult.providerMessageIds, ['$scheduled-3:example.org']);
+  deepStrictEqual(imageResult.artifactDelivery.receipt.artifacts, [{ artifactId: image.artifactId, outcome: 'sent' }]);
+  equal(imageResult.artifactDelivery.artifactsSent, 1);
+  equal(imageResult.failureNotice, null);
+  deepStrictEqual(f.uploads.map(({ metadata }) => metadata), [
+    { filename: 'existing-猫.png', mediaType: 'image/png' }, { filename: 'existing-report.txt', mediaType: 'text/plain' },
+  ]);
+  deepStrictEqual(f.uploads.map(({ bytes }) => [...bytes]), [[0, 1, 255, 3], [...Buffer.from('original document')]]);
+  deepStrictEqual(f.events.map(({ content }) => content.msgtype), ['m.text', 'm.image', 'm.file']);
+  for (const event of f.events) {
+    equal(event.roomId, f.target.route.roomId);
+    equal(event.content['m.relates_to'].event_id, f.target.route.threadId);
+    equal(event.content['m.relates_to'].rel_type, 'm.thread');
+    ok(event.options.signal instanceof AbortSignal);
+  }
+  equal(f.events[1].content.filename, 'existing-猫.png');
+  equal(f.events[1].content.info.size, 4);
+  equal(f.events[2].content['m.file'].size, Buffer.byteLength('original document'));
+  await rejects(materializeOutboundArtifact(image), { code: 'artifact-invalid' });
+  await rejects(materializeOutboundArtifact(file), { code: 'artifact-invalid' });
+});
+
+test('scheduled Matrix image rejection falls back exactly once, keeping attachment and notice outcomes separate', async (t) => {
+  for (const rejectFile of [false, true]) {
+    const f = await scheduledContext(t, { eventOutcome: (content, index) => {
+      if (content.msgtype === 'm.image' || (rejectFile && content.msgtype === 'm.file')) {
+        throw new MatrixApiError('explicit rejection', { code: 'matrix-rejected', status: 400 });
+      }
+      return { event_id: `$accepted-${index}:example.org` };
+    } });
+    const artifact = await f.artifact('already-created.png', Buffer.from([5, 4, 3]));
+    const result = await f.send({ kind: 'artifact', artifact });
+    equal(f.uploads.length, 2);
+    deepStrictEqual(f.events.filter(({ content }) => ['m.image', 'm.file'].includes(content.msgtype)).map(({ content }) => content.msgtype), ['m.image', 'm.file']);
+    equal(result.deliveryOutcome, rejectFile ? 'failed' : 'sent');
+    if (rejectFile) {
+      deepStrictEqual(result.providerMessageIds, []);
+      equal(result.artifacts[0].outcome, 'failed');
+      equal(result.reason, 'matrix-rejected');
+      deepStrictEqual(result.failureNotice, { deliveryOutcome: 'sent', providerMessageIds: ['$accepted-3:example.org'] });
+      deepStrictEqual(result.artifactDelivery.receipt.providerMessageIds, []);
+      equal(result.artifactDelivery.artifactsSent, 0);
+    } else {
+      deepStrictEqual(result.providerMessageIds, ['$accepted-2:example.org']);
+      equal(result.failureNotice, null);
+      equal(f.events.length, 2);
+    }
+  }
+});
+
+for (const [name, response] of [
+  ['network', () => { throw new TypeError('reset'); }],
+  ['timeout', () => { throw new DOMException('deadline', 'TimeoutError'); }],
+  ['5xx', () => { throw new MatrixApiError('failed', { status: 503 }); }],
+  ['missing event ID', () => ({})], ['invalid event ID', () => ({ event_id: 'not-an-event' })],
+]) {
+  test(`scheduled Matrix ${name} dispatch is unknown and never falls back to a second media event`, async (t) => {
+    const f = await scheduledContext(t, { eventOutcome: (content) => content.msgtype === 'm.image' ? response() : { event_id: '$safe-notice:example.org' } });
+    const artifact = await f.artifact('original.png', Buffer.from([1, 2]));
+    const result = await f.send({ kind: 'artifact', artifact });
+    equal(result.deliveryOutcome, 'unknown');
+    equal(result.reason, 'artifact-delivery-uncertain');
+    deepStrictEqual(result.providerMessageIds, []);
+    equal(result.artifacts[0].outcome, 'unknown');
+    equal(f.uploads.length, 1);
+    equal(f.events.filter(({ content }) => ['m.image', 'm.file'].includes(content.msgtype)).length, 1);
+    equal(result.failureNotice.deliveryOutcome, 'sent');
+    deepStrictEqual(result.failureNotice.providerMessageIds, ['$safe-notice:example.org']);
+  });
+}
+
+test('scheduled Matrix encrypted-room refusal uploads nothing and emits zero plaintext even for its notice', async (t) => {
+  const f = await scheduledContext(t, { encrypted: true });
+  const artifact = await f.artifact('private.png', Buffer.from([7]));
+  const result = await f.send({ kind: 'artifact', artifact });
+  equal(result.deliveryOutcome, 'failed');
+  equal(result.reason, 'matrix-encryption-unavailable');
+  equal(result.failureNotice.deliveryOutcome, 'failed');
+  equal(result.failureNotice.reason, 'matrix-encryption-unavailable');
+  equal(f.uploads.length, 0);
+  equal(f.events.length, 0);
+});
+
+test('scheduled Matrix text retains confirmed chunk IDs without confusing partial dispatch with whole-part success', async (t) => {
+  const f = await scheduledContext(t, { eventOutcome: (_content, index) => {
+    if (index === 2) throw new TypeError('later chunk reset');
+    return { event_id: '$first-chunk:example.org' };
+  } });
+  const result = await f.send({ kind: 'text', text: 'x'.repeat(1100) });
+  equal(result.deliveryOutcome, 'unknown');
+  equal(result.reason, 'matrix-delivery-uncertain');
+  deepStrictEqual(result.providerMessageIds, ['$first-chunk:example.org']);
+  equal(f.events.length, 2);
+});
+
+test('scheduled Matrix notice failure does not erase the definitive attachment failure', async (t) => {
+  const f = await scheduledContext(t, { eventOutcome: (content) => {
+    if (['m.image', 'm.file'].includes(content.msgtype)) {
+      throw new MatrixApiError('media rejected', { code: 'matrix-rejected', status: 400 });
+    }
+    throw new TypeError('notice disconnected');
+  } });
+  const artifact = await f.artifact('failed.png', Buffer.from([1]));
+  const result = await f.send({ kind: 'artifact', artifact });
+  equal(result.deliveryOutcome, 'failed');
+  equal(result.reason, 'matrix-rejected');
+  deepStrictEqual(result.providerMessageIds, []);
+  equal(result.artifactDelivery.receipt.artifacts[0].outcome, 'failed');
+  equal(result.failureNotice.deliveryOutcome, 'unknown');
+  equal(result.failureNotice.reason, 'matrix-delivery-uncertain');
+  deepStrictEqual(result.failureNotice.providerMessageIds, []);
+  deepStrictEqual(f.events.map(({ content }) => content.msgtype), ['m.image', 'm.file', 'm.notice']);
+  equal(f.uploads.length, 2);
+});
+
+for (const acknowledged of [true, false]) {
+  test(`scheduled Matrix Controller.close drains native send and retains ${acknowledged ? 'confirmed success' : 'unknown outcome'}`, { timeout: 5_000 }, async (t) => {
+    let entered, resolve, reject;
+    const started = new Promise((yes) => { entered = yes; });
+    const gate = new Promise((yes, no) => { resolve = yes; reject = no; });
+    let providerSignal;
+    t.after(() => resolve({ event_id: '$late-ack:example.org' }));
+    const f = await scheduledContext(t, { eventOutcome: (content, _index, options) => {
+      providerSignal = options.signal;
+      equal(content.msgtype, 'm.image');
+      entered();
+      return gate;
+    } });
+    const artifact = await f.artifact('inflight.png', Buffer.from([1, 9]));
+    const sending = f.send({ kind: 'artifact', artifact });
+    await started;
+    let closed = false;
+    const closing = f.controller.controller.close().then(() => { closed = true; });
+    await new Promise(setImmediate);
+    equal(closed, false);
+    equal(providerSignal.aborted, true);
+    if (acknowledged) resolve({ event_id: '$late-ack:example.org' });
+    else reject(new DOMException('provider cancellation without ack', 'AbortError'));
+    const result = await sending;
+    await closing;
+    equal(result.deliveryOutcome, acknowledged ? 'sent' : 'unknown');
+    deepStrictEqual(result.providerMessageIds, acknowledged ? ['$late-ack:example.org'] : []);
+    equal(result.artifactDelivery.receipt.artifacts[0].outcome, acknowledged ? 'sent' : 'unknown');
+    equal(f.events.length, 1);
+    equal(f.uploads.length, 1);
+    await rejects(materializeOutboundArtifact(artifact), { code: 'artifact-invalid' });
+  });
+}
+
+test('scheduled Matrix native acknowledgement wins its abort race and never becomes file fallback', async (t) => {
+  const abort = new AbortController();
+  const f = await scheduledContext(t, { eventOutcome: (content) => {
+    if (content.msgtype === 'm.image') abort.abort();
+    return { event_id: '$native-ack:example.org' };
+  } });
+  const artifact = await f.artifact('confirmed.png', Buffer.from([8, 9]));
+  const result = await f.send({ kind: 'artifact', artifact }, { signal: abort.signal });
+  equal(result.deliveryOutcome, 'sent');
+  deepStrictEqual(result.providerMessageIds, ['$native-ack:example.org']);
+  equal(result.artifactDelivery.artifactsSent, 1);
+  equal(result.failureNotice, null);
+  equal(f.events.length, 1);
+  equal(f.uploads.length, 1);
+});
 
 test('matrix send proactive text preserves ordered chunk IDs for rooms and DMs', async (t) => {
   const context = await createContext({ config: { e2eeMode: 'off', maxMessageLength: 500 },

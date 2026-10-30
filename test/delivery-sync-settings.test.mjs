@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -23,6 +23,7 @@ import {
   validDeliverySyncPayload,
 } from '../plugin-src/host/delivery-sync-rpc.mjs';
 import { INBOUND_TTL_RPC_CHANNEL } from '../plugin-src/host/inbound-ttl-rpc.mjs';
+import { assertRestrictiveMode } from './support/filesystem.mjs';
 
 async function home(t) {
   const path = await mkdtemp(join(tmpdir(), 'dsh-im-delivery-sync-'));
@@ -111,7 +112,7 @@ test('the store writes the document atomically and reads it back', async (t) => 
       modelIcon: '',
     },
   });
-  assert.equal((await stat(path)).mode & 0o777, 0o600);
+  await assertRestrictiveMode(path, 0o600);
 
   // A later save keeps the fields it did not touch.
   await store.set({ modelIcon: '🤖' });

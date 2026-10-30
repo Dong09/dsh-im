@@ -75,6 +75,9 @@ export async function deliverOutboundArtifacts({
   sendFailureNotice,
   onFailure,
   logger,
+  // Scheduled single-part callers persist receipts outside this helper. A late
+  // abort cannot revoke an explicit native acknowledgement already in hand.
+  preserveConfirmedResultOnAbort = false,
 }) {
   const receipts = baseReceipt ? [baseReceipt] : [];
   let userVisible = Boolean(baseReceipt) && baseReceipt.deliveryOutcome !== 'failed';
@@ -96,7 +99,8 @@ export async function deliverOutboundArtifacts({
           sendImage,
           signal,
         });
-        signal?.throwIfAborted();
+        if (!(preserveConfirmedResultOnAbort && sent.result?.deliveryOutcome === 'sent'
+          && providerIds(sent.result).length > 0)) signal?.throwIfAborted();
         receipts.push(createDeliveryReceipt({
           deliveryId: file.deliveryKey,
           presentation: `${channelKey}-${sent.presentation}`,
@@ -106,7 +110,8 @@ export async function deliverOutboundArtifacts({
         artifactsSent += 1;
         userVisible = true;
       } catch (error) {
-        if (isAbort(error, signal)) throw error;
+        if (isAbort(error, signal)
+          && !(preserveConfirmedResultOnAbort && error?.code === 'artifact-delivery-uncertain')) throw error;
         artifactSendErrors += 1;
         const failure = typeof onFailure === 'function'
           ? await onFailure(artifact, error)

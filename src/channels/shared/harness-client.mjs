@@ -2052,7 +2052,7 @@ export class HarnessClient {
         return deliveredArtifactCount;
       }
       artifactsDelivered = true;
-      const artifacts = outboundArtifactRegistry.take(sessionId, tracker.turn, { signal });
+      const artifacts = outboundArtifactRegistry.take(sessionId, tracker.turn, { promptRpcId, signal });
       for (const artifact of artifacts) {
         try {
           await onArtifact(artifact);
@@ -2346,7 +2346,9 @@ export class HarnessClient {
         this.#unregisterControlOwnership(ownership);
         this.#unregisterInteractionOwnership(sessionId, ownership);
       }
-      if (tracker.turn !== null) outboundArtifactRegistry.discard(sessionId, tracker.turn);
+      // Cleanup must never target a schedule or another RPC that has since
+      // taken over this Turn. The consumer close above is identity-scoped too.
+      if (tracker.turn !== null) outboundArtifactRegistry.discard(sessionId, tracker.turn, { promptRpcId });
       interactionController?.abort(new DOMException('Harness turn finished', 'AbortError'));
       if (interactionTask) await interactionTask.catch(() => undefined);
     }
