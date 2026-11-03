@@ -1,5 +1,6 @@
 {
-  "description": "Sanitized existing-file reproduction: native reminder (no rpcId), Host runtime/time snapshots, first return-file call, completed turn. Events are observed from the real Host, never injected from this fixture.",
+  "description": "Sanitized existing-file reproduction: native reminder (no rpcId), Host runtime/time snapshots, first return-file call, completed turn. Official Session sync owns final text; relay owns only artifacts, without cross-sender ordering. Events are observed from the real Host, never injected from this fixture.",
+  "finalText": "The existing file is queued for delivery after this turn.",
   "coreInputKinds": ["schedule", "runtime-context", "time-context"],
   "imageBase64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l2UAAAAASUVORK5CYII=",
   "fileText": "Existing scheduled report.\nDo not regenerate or rename for delivery.\n",

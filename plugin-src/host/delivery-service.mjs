@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { normalizeDeliveryTarget, normalizeScheduledDeliveryTarget, normalizeScheduledDeliveryPart, matchesScheduledDestination } from './delivery-adapter.mjs';
+import { normalizeDeliveryTarget, normalizeScheduledDeliveryTarget, normalizeScheduledDeliveryPart } from './delivery-adapter.mjs';
 import { deliverySuggestionFromConversationKey } from './delivery-suggestions.mjs';
 import { isMatrixEventId } from '../../src/channels/matrix/matrix-identifiers.mjs';
 import { COMPETITIVE_APPROVAL_CHANNELS } from '../../src/channels/shared/harness-approval.mjs';
@@ -362,7 +362,7 @@ export class DeliveryService {
     }
   }
 
-  async listSessionSyncTargets(sessionId) {
+  async listSessionSyncTargets(sessionId, { privateOnly = true } = {}) {
     if (typeof sessionId !== 'string' || !sessionId) {
       throw deliveryError('bad-request', 'Invalid Session id');
     }
@@ -370,7 +370,7 @@ export class DeliveryService {
     for (const { adapter } of this.#adapters.values()) {
       if (!this.#supportsSessionSync(adapter)) continue;
       try {
-        const listed = await adapter.listSessionSyncTargets(sessionId);
+        const listed = await adapter.listSessionSyncTargets(sessionId, { privateOnly });
         if (!Array.isArray(listed)) throw new TypeError('Adapter returned invalid sync targets');
         for (const target of listed) {
           targets.push({
@@ -484,7 +484,7 @@ export class DeliveryService {
     return false;
   }
 
-  async sendSessionSyncText(botId, targetId, sessionId, text, { signal, format = 'plain', excludedDestination } = {}) {
+  async sendSessionSyncText(botId, targetId, sessionId, text, { signal, format = 'plain' } = {}) {
     const id = botIdOf(botId);
     const targetKey = targetIdOf(targetId);
     if (typeof sessionId !== 'string' || !sessionId
@@ -498,10 +498,9 @@ export class DeliveryService {
       throw deliveryError('session-sync-unavailable', 'Session sync is unavailable');
     }
     try {
-      const result = await adapter.sendSessionSyncText(id, targetKey, sessionId, text, {
-        signal, format, ...(excludedDestination == null ? {} : { excludedDestination }),
+      await adapter.sendSessionSyncText(id, targetKey, sessionId, text, {
+        signal, format,
       });
-      if (result?.sent === false && result.reason === 'externally-owned') return result;
       return { sent: true };
     } catch (error) {
       if (signal?.aborted || error?.name === 'AbortError' || error?.code === 'ABORT_ERR') {
@@ -608,10 +607,10 @@ export class DeliveryService {
    *
    * @param {string} sessionId harness session id
    * @param {string} text message body
-   * @param {{format?: 'plain'|'markdown', signal?: AbortSignal, excludedDestination?: object}} [options]
-   * @returns {Promise<{sent: true} | {sent: false, reason: 'unbound'|'unroutable'|'externally-owned'}>}
+   * @param {{format?: 'plain'|'markdown', signal?: AbortSignal}} [options]
+   * @returns {Promise<{sent: true} | {sent: false, reason: 'unbound'|'unroutable'}>}
    */
-  async deliverSessionText(sessionId, text, { format = 'plain', signal, excludedDestination } = {}) {
+  async deliverSessionText(sessionId, text, { format = 'plain', signal } = {}) {
     if (typeof sessionId !== 'string' || !sessionId
       || typeof text !== 'string' || !text.trim()
       || (format !== 'plain' && format !== 'markdown')) {
@@ -632,12 +631,6 @@ export class DeliveryService {
       // message the wrong place, so the key is only reported here.
       this.#warnUndelivered(sessionId, 'unroutable', described);
       return { sent: false, reason: 'unroutable' };
-    }
-    // Host-internal relay ownership is checked against the route this lookup
-    // actually resolved, not an earlier lookup that a rebind could invalidate.
-    // It excludes one exact Matrix destination, never another bot or thread.
-    if (described.channel === 'matrix' && matchesScheduledDestination(described.botId, draft, excludedDestination)) {
-      return { sent: false, reason: 'externally-owned' };
     }
     // The draft goes through the ordinary send path, so the adapter validates
     // and normalizes it exactly as it does a saved target.
@@ -817,7 +810,7 @@ export class DeliveryService {
   }
 
   /**
-   * Send exactly one required part. Preconditions reject before side effects;
+   * Send exactly one managed artifact. Preconditions reject before side effects;
    * actual attempts return explicit outcomes, not boolean `sent` or notice IDs.
    * No checkpoint callback is accepted. The relay owns all persistence outside
    * provider closures. Abort revokes future effects, not a confirmed remote send.
@@ -841,10 +834,10 @@ export class DeliveryService {
     // Do not recheck abort/registration here: replacement or shutdown after a
     // native acknowledgement cannot erase that acknowledgement or trigger retry.
     const providerMessageIds = [...new Set((Array.isArray(result?.providerMessageIds) ? result.providerMessageIds : []).filter(isMatrixEventId))];
-    const artifactResults = normalizedPart.kind === 'artifact' ? result?.artifacts : null;
-    const validArtifact = normalizedPart.kind !== 'artifact' || (Array.isArray(artifactResults)
+    const artifactResults = result?.artifacts;
+    const validArtifact = Array.isArray(artifactResults)
       && artifactResults.length === 1 && artifactResults[0].artifactId === normalizedPart.artifact.artifactId
-      && artifactResults[0].outcome === 'sent');
+      && artifactResults[0].outcome === 'sent';
     const deliveryOutcome = ['sent', 'failed', 'unknown'].includes(result?.deliveryOutcome)
       && (result.deliveryOutcome !== 'sent' || (providerMessageIds.length > 0 && validArtifact))
       ? result.deliveryOutcome : 'unknown';

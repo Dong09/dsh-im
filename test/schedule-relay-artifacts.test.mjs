@@ -23,7 +23,7 @@ async function fixture(t, routes = [{ sessionId: 'one', ...ROOM }]) {
   let bindings = routes;
   let load = async () => bindings;
   let send = async (botId, target, part, options) => {
-    if (part.kind === 'text') return sent('$text');
+    assert.equal(part.kind, 'artifact');
     const result = await deliverOutboundArtifacts({
       artifacts: [part.artifact], channelKey: 'matrix', signal: options.signal,
       sendImage: async (file) => { native.push({ kind: 'image', target, file }); return sent('$image'); },
@@ -41,7 +41,9 @@ async function fixture(t, routes = [{ sessionId: 'one', ...ROOM }]) {
     async sendScheduledPart(...args) {
       calls.push(args);
       const persisted = JSON.parse(await readFile(path, 'utf8')).sessions.find((entry) => entry.sessionId === (args[2].artifact?.origin.sessionId ?? 'one'));
-      const partId = args[2].kind === 'text' ? 'text' : `artifact:${args[2].artifact.artifactId}`;
+      assert.equal(args[2].kind, 'artifact');
+       assert.ok(persisted.lastAttempt.parts.every((part) => part.kind === 'artifact'));
+       const partId = `artifact:${args[2].artifact.artifactId}`;
       assert.equal(persisted.lastAttempt.parts.find((part) => part.id === partId)?.status, 'sending');
       return send(...args);
     },
@@ -174,16 +176,16 @@ test('non-Matrix bindings never open scheduled artifact authority', async (t) =>
   assert.equal(f.calls.length, 0);
 });
 
-test('text then real image and file preserve ordering and independent receipts', async (t) => {
+test('final text is ignored while real image and file preserve attachment ordering and receipts', async (t) => {
   const f = await fixture(t);
   await f.begin();
   const image = await f.stage();
   const file = await f.stage('report.txt');
   await f.answer('final answer');
   await f.relay.observeEvent(f.session(), end());
-  assert.deepEqual(f.calls.map((call) => call[2].kind === 'text' ? call[2].text : call[2].artifact), ['final answer', image, file]);
+  assert.deepEqual(f.calls.map((call) => call[2].artifact), [image, file]);
   assert.deepEqual(f.native.map((entry) => entry.kind), ['image', 'file']);
-  assert.deepEqual(f.store.get('one').lastAttempt.parts.map((part) => [part.status, part.providerMessageIds]), [['sent', ['$text']], ['sent', ['$image']], ['sent', ['$file']]]);
+  assert.deepEqual(f.store.get('one').lastAttempt.parts.map((part) => [part.status, part.providerMessageIds]), [['sent', ['$image']], ['sent', ['$file']]]);
   released(f);
 });
 
@@ -209,24 +211,24 @@ for (const reason of ['error', 'blocked', 'aborted']) test(`${reason} turn close
   released(f);
 });
 
-test('text failure continues to independently confirmed attachments', async (t) => {
+test('attachment results do not describe the ignored final answer', async (t) => {
   const f = await fixture(t);
   await f.begin();
   await f.stage();
   await f.answer('text fails');
-  f.setSend(async (_bot, _target, part) => part.kind === 'text' ? failed() : sent('$image'));
+  f.setSend(async () => sent('$image'));
   await f.relay.observeEvent(f.session(), end());
-  assert.deepEqual(f.store.get('one').lastAttempt.parts.map((part) => part.status), ['failed', 'sent']);
-  assert.equal(f.store.get('one').lastAttempt.status, 'failed');
+  assert.deepEqual(f.store.get('one').lastAttempt.parts.map((part) => part.status), ['sent']);
+  assert.equal(f.store.get('one').lastAttempt.status, 'sent');
   released(f);
 });
 
 for (const receipts of [
-  [sent('$text'), sent('$a'), failed()],
-  [failed(), { deliveryOutcome: 'unknown', providerMessageIds: [] }, failed()],
-  [sent('$text'), { ...failed(), failureNotice: sent('$notice') }, sent('$b')],
-  [sent('$text'), { ...failed(), failureNotice: failed() }, sent('$b')],
-  [sent('$text'), { sent: true, deliveryOutcome: 'sent', providerMessageIds: ['invalid-id'] }, sent('$b')],
+  [sent('$a'), failed()],
+  [{ deliveryOutcome: 'unknown', providerMessageIds: [] }, failed()],
+  [{ ...failed(), failureNotice: sent('$notice') }, sent('$b')],
+  [{ ...failed(), failureNotice: failed() }, sent('$b')],
+  [{ sent: true, deliveryOutcome: 'sent', providerMessageIds: ['invalid-id'] }, sent('$b')],
 ]) test(`aggregate preserves required part outcomes: ${JSON.stringify(receipts)}`, async (t) => {
   const f = await fixture(t);
   await f.begin(); await f.stage('a.png'); await f.stage('b.txt'); await f.answer('answer');
@@ -235,8 +237,8 @@ for (const receipts of [
   await f.relay.observeEvent(f.session(), end());
   const attempt = f.store.get('one').lastAttempt;
   assert.equal(attempt.status, receipts.some((receipt) => receipt.deliveryOutcome === 'unknown' || receipt.providerMessageIds?.includes('invalid-id')) ? 'unknown' : 'failed');
-  assert.equal(attempt.parts.length, 3);
-  assert.equal(attempt.parts[1].notice?.status, receipts[1].failureNotice?.deliveryOutcome);
+  assert.equal(attempt.parts.length, 2);
+  assert.equal(attempt.parts[0].notice?.status, receipts[0].failureNotice?.deliveryOutcome);
   assert.notEqual(attempt.status, 'sent');
   released(f);
 });
@@ -300,10 +302,11 @@ test('P0: native image success followed by finishPart failure never falls back, 
 for (const status of ['sending', 'unknown', 'failed', 'sent']) test(`restart never replays persisted ${status} attempt`, async (t) => {
   const f = await fixture(t);
   await f.relay.captureBindings();
-  const attempt = await f.store.attempt('one', 1);
-  await f.store.startPart('one', 1, attempt.attemptId, 'text');
-  if (status !== 'sending') await f.store.finishPart('one', 1, attempt.attemptId, 'text', { status, providerMessageIds: status === 'sent' ? ['$previous'] : [] });
   await f.relay.close(); await f.store.close();
+  // Construct historical text evidence directly; the new writer cannot create it.
+  await writeFile(f.path, JSON.stringify({ version: 2, sessions: [{ sessionId: 'one', destination: ROOM, conflict: false,
+    lastAttempt: { turn: 1, attemptId: 'historical-text', status, parts: [{ id: 'text', kind: 'text', status,
+      ...(status === 'sent' ? { providerMessageIds: ['$previous'] } : {}) }] } }] }));
   const restored = await RelayStore.open(f.path);
   const registry = new OutboundArtifactRegistry();
   const relay = createScheduleRelay({ im: f.im, store: restored, registry });
@@ -312,10 +315,14 @@ for (const status of ['sending', 'unknown', 'failed', 'sent']) test(`restart nev
   relay.observeEvent(session, { type: 'turn/start', data: { turn: 1 } });
   relay.observeClaim(session, { id: 'replayed', source: { kind: 'schedule' } }, 1);
   await relay.preStep({ agent: { session }, turn: 1 });
+  await writeFile(join(f.root, 'replayed.txt'), 'must not resend');
+  const artifact = await registry.stage({ path: 'replayed.txt' }, { agent: { session }, callId: 'replayed-file' });
+  assert.ok(registry.commit(artifact));
   relay.observeEvent(session, { type: 'assistant/message', surfaceOp: 'append', data: { turn: 1, message: { content: [{ type: 'text', text: 'old answer' }] } } });
   await relay.observeEvent(session, end());
   assert.equal(f.calls.length, 0);
   assert.equal(restored.get('one').lastAttempt.status, status);
+  assert.equal(isManagedOutboundArtifact(artifact), false, 'rejected historical attempt releases new snapshots');
 });
 
 test('next turn generates artifacts without waiting for previous turn send tail', async (t) => {
@@ -360,10 +367,10 @@ for (const interruption of ['mixed', 'abort', 'dispose', 'close']) test(`route r
   assert.equal(f.calls.length, 0);
 });
 
-test('binding conflict after text prevents the next artifact and never retargets', async (t) => {
+test('binding conflict after first attachment prevents the next artifact and never retargets', async (t) => {
   const f = await fixture(t);
-  await f.begin(); await f.stage(); await f.answer('text');
-  f.setSend(async () => { f.setBindings([{ sessionId: 'one', ...THREAD }]); return sent('$text'); });
+  await f.begin(); await f.stage(); await f.stage('later.txt'); await f.answer('text');
+  f.setSend(async () => { f.setBindings([{ sessionId: 'one', ...THREAD }]); return sent('$first'); });
   await f.relay.observeEvent(f.session(), end());
   assert.equal(f.calls.length, 1);
   assert.deepEqual(f.calls[0][1], { kind: 'room', route: ROOM.route });
@@ -457,3 +464,22 @@ test('close waits for an accepted terminal checkpoint and records success before
   assert.deepEqual(f.store.get('one').lastAttempt.parts.map((part) => [part.status, part.providerMessageIds ?? []]), [['sent', ['$image']], ['skipped', []]]);
   released(f);
 });
+
+
+for (const text of ['', 'final answer without registered products', '![card](existing.png)']) {
+  test(`no committed artifacts means zero attempts and sends, regardless of final text: ${JSON.stringify(text)}`, async (t) => {
+    const f = await fixture(t);
+    await f.begin();
+    const original = await readFile(f.path, 'utf8');
+    let attempts = 0;
+    f.store.attempt = async () => { attempts += 1; assert.fail('an empty attachment set must not become a job'); };
+    await f.answer(text);
+    await f.relay.observeEvent(f.session(), end());
+    await f.relay.whenIdle();
+    assert.equal(attempts, 0);
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.store.get('one').lastAttempt, undefined);
+    assert.equal(await readFile(f.path, 'utf8'), original);
+    assert.equal(f.registry.hasActiveConsumer(f.session()), false);
+  });
+}

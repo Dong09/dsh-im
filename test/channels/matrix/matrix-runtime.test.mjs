@@ -333,13 +333,14 @@ test('scheduled Matrix bridge sends original names exact bytes and native IDs to
   const f = await scheduledContext(t);
   const image = await f.artifact('existing-猫.png', Buffer.from([0, 1, 255, 3]));
   const file = await f.artifact('existing-report.txt', Buffer.from('original document'));
-  const textResult = await f.send({ kind: 'text', text: 'Prepared once' });
+  await rejects(f.send({ kind: 'text', text: 'Prepared once' }), { code: 'bad-request' });
+  equal(f.uploads.length, 0);
+  equal(f.events.length, 0, 'scheduled text is rejected before native effects');
   const imageResult = await f.send({ kind: 'artifact', artifact: image });
   const fileResult = await f.send({ kind: 'artifact', artifact: file });
-  deepStrictEqual(textResult, { deliveryOutcome: 'sent', providerMessageIds: ['$scheduled-1:example.org'] });
   equal(imageResult.deliveryOutcome, 'sent');
-  deepStrictEqual(imageResult.providerMessageIds, ['$scheduled-2:example.org']);
-  deepStrictEqual(fileResult.providerMessageIds, ['$scheduled-3:example.org']);
+  deepStrictEqual(imageResult.providerMessageIds, ['$scheduled-1:example.org']);
+  deepStrictEqual(fileResult.providerMessageIds, ['$scheduled-2:example.org']);
   deepStrictEqual(imageResult.artifactDelivery.receipt.artifacts, [{ artifactId: image.artifactId, outcome: 'sent' }]);
   equal(imageResult.artifactDelivery.artifactsSent, 1);
   equal(imageResult.failureNotice, null);
@@ -347,16 +348,16 @@ test('scheduled Matrix bridge sends original names exact bytes and native IDs to
     { filename: 'existing-猫.png', mediaType: 'image/png' }, { filename: 'existing-report.txt', mediaType: 'text/plain' },
   ]);
   deepStrictEqual(f.uploads.map(({ bytes }) => [...bytes]), [[0, 1, 255, 3], [...Buffer.from('original document')]]);
-  deepStrictEqual(f.events.map(({ content }) => content.msgtype), ['m.text', 'm.image', 'm.file']);
+  deepStrictEqual(f.events.map(({ content }) => content.msgtype), ['m.image', 'm.file']);
   for (const event of f.events) {
     equal(event.roomId, f.target.route.roomId);
     equal(event.content['m.relates_to'].event_id, f.target.route.threadId);
     equal(event.content['m.relates_to'].rel_type, 'm.thread');
     ok(event.options.signal instanceof AbortSignal);
   }
-  equal(f.events[1].content.filename, 'existing-猫.png');
-  equal(f.events[1].content.info.size, 4);
-  equal(f.events[2].content['m.file'].size, Buffer.byteLength('original document'));
+  equal(f.events[0].content.filename, 'existing-猫.png');
+  equal(f.events[0].content.info.size, 4);
+  equal(f.events[1].content['m.file'].size, Buffer.byteLength('original document'));
   await rejects(materializeOutboundArtifact(image), { code: 'artifact-invalid' });
   await rejects(materializeOutboundArtifact(file), { code: 'artifact-invalid' });
 });
@@ -422,16 +423,25 @@ test('scheduled Matrix encrypted-room refusal uploads nothing and emits zero pla
   equal(f.events.length, 0);
 });
 
-test('scheduled Matrix text retains confirmed chunk IDs without confusing partial dispatch with whole-part success', async (t) => {
+test('ordinary Matrix text retains confirmed chunk IDs and reports partial dispatch as unknown', async (t) => {
   const f = await scheduledContext(t, { eventOutcome: (_content, index) => {
     if (index === 2) throw new TypeError('later chunk reset');
     return { event_id: '$first-chunk:example.org' };
   } });
-  const result = await f.send({ kind: 'text', text: 'x'.repeat(1100) });
-  equal(result.deliveryOutcome, 'unknown');
-  equal(result.reason, 'matrix-delivery-uncertain');
-  deepStrictEqual(result.providerMessageIds, ['$first-chunk:example.org']);
-  equal(f.events.length, 2);
+  await rejects(f.send({ kind: 'text', text: 'x'.repeat(1100) }), { code: 'bad-request' });
+  equal(f.events.length, 0, 'scheduled entry cannot become a second text sender');
+  await rejects(f.im.send(f.botId, f.target, 'x'.repeat(1100), { format: 'markdown' }), (error) => {
+    equal(error.code, 'send-result-unknown');
+    equal(error.cause.code, 'matrix-delivery-uncertain');
+    deepStrictEqual(error.providerMessageIds, ['$first-chunk:example.org']);
+    return true;
+  });
+  equal(f.events.length, 2, 'a partially delivered answer is never resent as plain text');
+  equal(f.uploads.length, 0);
+  for (const event of f.events) {
+    equal(event.roomId, f.target.route.roomId);
+    equal(event.content['m.relates_to'].event_id, f.target.route.threadId);
+  }
 });
 
 test('scheduled Matrix notice failure does not erase the definitive attachment failure', async (t) => {

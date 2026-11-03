@@ -6,23 +6,25 @@
 
 九个内置渠道均支持主动投递：微信、飞书、钉钉、企业微信、QQ、Slack、Telegram、Discord 和 WhatsApp。
 
-## Matrix 群聊定时回复（默认开启）
+## Matrix 群聊定时附件（附件默认开启）
 
-Matrix 群或线程的 Session 中，原生定时任务正常完成后，dsh-im 自动把最终回答发回原处。触发与发送之间包含模型生成最终回答的时间。房间和线程 ID 与 Matrix 渠道共用校验，支持经典格式及 v12 哈希房间 ID。无需安装额外插件、填写 Room ID、保存投递目标或开启会话同步；下方的手动目标步骤用于其他应用主动发送，不是群聊提醒的前置条件。
+Matrix 群或线程的原生定时回合由两条独立链路处理：官方会话同步负责最终回答，自研 schedule relay 仅负责已登记的图片／文件。`matrix.scheduleReplies` 默认开启的是附件权限与发送，不会自动开启最终文字；最终文字必须启用「通用设置 → 投递」的全局 `deliverModelAnswers`，并满足当前绑定及下文的保存目标策略。房间和线程共用 Matrix ID 校验，支持经典格式及 v12 哈希房间 ID。附件不要求额外插件、手填 Room ID 或保存投递目标；下方的手动目标步骤不是附件回群的前置条件。
 
-适用于群成员只通过 Matrix 使用 bot、一个群或线程使用一个独立 Session 的场景。从 Web 在同一 Session 创建的提醒也会回该群。真实定时输入在首个模型步骤前获得仅属于本轮的附件权限；运行时、时间快照、技能目录和本插件上下文通知不算用户插话。混入真人输入或未知来源会撤销本轮自动回群权限，普通 IM 仍走原回复链。无绑定、私聊、其他渠道及多个目标共用 Session 时均不开定时附件权限。
+适用于每个群或线程使用独立 Session 的场景。从 Web 在同一 Session 创建的原生提醒也可获得附件权限。真实定时输入在首个模型步骤前获得仅属于本轮的附件权限；运行时、时间快照、技能目录和本插件上下文通知不算用户插话。混入真人输入或未知来源会撤销本轮定时附件权限，普通 IM 仍走原回复链。无绑定、私聊、其他渠道及多个目标共用 Session 时均不开定时附件权限。
 
-模型须调用 `dsh_im_return_file` 显式登记已有图片或文件；成功仅表示“已登记待发送”，不等于 Matrix 已送达。原文件不为发送重新生成或改名；Web 展示卡片、Markdown 路径、失败工具及失败 Code Mode 外层不会被扫描补登记。正常完成后先尝试最终文字，再按登记顺序发送附件；只有附件没有文字也能发送。文字失败不会吞掉仍可发送的文件，但取消、路由失效或检查点写盘失败会停止后续发送。图片明确失败最多转文件一次；超时、网络故障、5xx 或缺少有效原生事件回执均视为未知，不换类型重发。已知加密房间缺少可用加密能力时在上传前拒绝，不明文降级。
+模型须调用 `dsh_im_return_file` 显式登记已有图片或文件；成功仅表示“已登记待发送”，不等于 Matrix 已送达。原文件不为发送重新生成或改名；Web 展示卡片、Markdown 路径、失败工具及失败 Code Mode 外层不会被扫描补登记。正常完成后附件按登记顺序发送，但**文字与附件相对顺序不保证**。最终文字为空、官方文字失败／结果未知或文字同步关闭，都不会单独阻止仍获授权的附件；没有已确认附件时，不创建自研发送 attempt，也不发送最终文字兜底。附件失败的操作性提示不是最终回答，不算附件成功，也不授权补发文字或重新生图。
 
-已记录的旧 Session 回复位置会保留到 `/new` 之后。状态保存在 Matrix `dshHome` 下的 `integrations/dsh-matrix/schedule-replies.json`。version 2 保留目的地、冲突、最近尝试 turn 和不可变部分清单：文字及每个附件分别有状态、可用 `providerMessageIds` 与安全错误码；附件失败通知单独记录，不算附件成功。只有所有必需部分均确认成功才是整轮 `sent`；存在 `sending`/`unknown` 时整体为 `unknown`，其余未确认或失败部分使整体为 `failed`。查看 Host 的 `[schedule-im-relay]` 诊断和该 Session 的 `lastAttempt.parts`，不能用一条文字或通知已可见判断文件全部送达。状态不保存凭据、文件字节或本地绝对路径。
+取消、附件路由失效或检查点写盘失败会停止后续附件。图片明确失败最多转文件一次；超时、网络故障、5xx 或缺少有效原生事件回执均视为未知，不换类型重发。已知加密房间缺少可用加密能力时在上传前拒绝，不明文降级。内部附件入口仅接受真实 managed artifact，不接受文字、伪造对象或任意 path／URL／bytes；公开 HTTP／RPC 仍是文字接口，不新增本地文件读取能力。
 
-有效 version 1 状态可读取，旧的四种尝试状态均继续防重；首次 v2 写入前在原文件旁保留逐字节 `.v1.bak`，再原子升级。损坏、未来版本或备份/写盘失败明确拒绝，不按空库继续发送。重复完成事件、重启、发送后写盘失败均不自动重开已尝试回合；历史 `pending`、`sending`、`unknown`、`failed` 也不会恢复附件快照或从旧路径补发，需要用户提出新的明确请求。上线不补发旧任务。
+已记录的旧 Session **附件**回复位置会保留到 `/new` 之后，但不等于旧 Session 仍有官方文字绑定：当前绑定切走后，旧任务可以只有附件没有最终文字，不能借附件旧路由兜底文字。新旧候选冲突时拒绝附件发送，不自动改投新 Session 或其他线程。
 
-不要把 v2 文件交给只读 v1 的旧版本，也不要删除状态后重启。降级前先关闭定时回群并停止当前 Host；优先保留新状态、关闭功能并修复前滚。若必须恢复备份，先在隔离副本核验，并禁用所有在新版开始过的任务，保留 v2 状态人工核对，避免旧备份缺少高水位导致重发。测试读写只使用隔离 `dshHome`，不操作生产状态。加载更新后的 dsh-im Host 产物才生效，浏览器刷新不能替换 Node 已导入模块；远程 Harness 模式不启用本地回合监听。
+状态保存在 Matrix `dshHome` 下的 `integrations/dsh-matrix/schedule-replies.json`。version 2 保留目的地、冲突、最近尝试 turn 和不可变部分清单；**新 attempt 必须是显式非空、全为 artifact 的清单，其结果只描述附件，不代表官方文字成功或失败**。每个附件保留状态、可用 `providerMessageIds` 与安全错误码；附件失败通知单独记录，不算附件成功。全部必需附件均确认成功才是附件 attempt 的 `sent`；部分结果汇总时 `sending`／`unknown` 优先于失败。上传／发送前先持久化完整意图与该附件的 `sending`，提供方返回后在发送 closure 之外记录终态；终态写盘失败保留已有防重记录并释放剩余快照，不转文件重发。查看 Host 的 `[schedule-im-relay]` 诊断及 `lastAttempt.parts`，不能用文字或通知可见推断附件送达。状态不保存凭据、文件字节或本地绝对路径。
 
-可在 dsh-im 的 `matrix` 配置中设置 `scheduleReplies: false` 关闭；`scheduleReplyTimeoutMs` 默认 60000 毫秒，只约束发送调用，不限制模型执行时间。删除原生提醒可停止其后续触发，不改变其他聊天行为。
+reader 兼容有效 v1 四种尝试状态，以及 v2 的历史 text／mixed／artifact 清单与各部分状态；旧文字只作为历史证据保留，不发送、不调用废弃 writer 修补。首次 v2 写入前在原文件旁保留逐字节 `.v1.bak`，再原子升级；目的地、冲突及高水位不丢失。损坏、未来版本或备份／写盘失败明确拒绝，不按空库继续发送。重复完成、重启、发送后写盘失败均不重开已尝试回合；历史 `pending`、`sending`、`unknown`、`failed` 不恢复快照、不从旧路径补发，也不补发历史文字。用户须提出新的明确请求，上线不补发旧任务。
 
-这里的 `matrix.scheduleReplies` 与「通用设置 → 投递」的文字同步开关相互独立；关闭通用同步不会关闭已有的 Matrix 定时附件回群。两套功能同时开启时，已被定时回群接管的同一 bot／房间／线程只由该回群任务发送；即使发送失败或结果未知，也不会由通用同步隐式补发。其他目的地、普通 Web 回合及未被定时回群接管的回合仍按通用同步设置处理。文字分段已有成功回执或 Matrix 返回发送结果未知时，不会把整段回答重新作为纯文本发送。
+不要把 v2 文件交给只读 v1 的旧版本，也不要删状态后重启。回滚优先恢复基线 `7a73dd6a` 的完整文字 relay 及双发送器排除桥，不可仅恢复文字发送而缺少去重桥；保留当前 v2 状态。降级前先关闭定时附件并停止当前 Host；优先保留新状态、关闭功能并修复前滚。若必须恢复备份，先在隔离副本核验，禁用所有在新版开始过的任务并保留 v2 状态人工核对，避免高水位缺失导致重发。测试只使用隔离 `dshHome`，不操作生产状态。加载更新后的 Host 产物才生效，浏览器刷新不能替换 Node 已导入模块；远程 Harness 模式不启用本地回合监听。
+
+`matrix.scheduleReplies: false` 仅关闭定时附件；`scheduleReplyTimeoutMs` 默认 60000 毫秒，仅约束附件发送调用，不限制模型执行。官方回答由全局 `deliverModelAnswers` 独立控制；关闭任一开关不会把其职责转交另一条链路。两者不再使用完成事件归属表或目的地排除协议。普通文字分段已有成功回执或 Matrix 返回发送结果未知时，仍不得将整段回答作为纯文本重发。删除原生提醒可停止后续触发，不撤回已开始的平台请求。
 
 ## 快速开始
 
@@ -98,18 +100,18 @@ Matrix 群或线程的 Session 中，原生定时任务正常完成后，dsh-im 
 
 ## 会话双向同步
 
-会话同步不需要预先创建投递目标：地址取自 Session 当前的聊天绑定，也就是这个 Session 在某个已接入聊天里的会话键（私聊、群聊、Slack Thread、Telegram Topic、Discord 频道等）。是否同步由「通用设置 → 投递」决定，这是唯一的开关位置；「投递目标」页只服务于手动投递，以及同步审批和同步提问的候选范围。
+官方会话文字同步由「通用设置 → 投递」的全局开关控制。机器人没有保存目标时，文字可按 Session 当前聊天绑定投递（私聊、群聊、Slack Thread、Telegram Topic、Discord 频道等），不要求预先建目标；机器人已有保存目标时，则仅使用已启用同步且仍匹配该 Session 的目标。保存目标存在但没有匹配／启用候选时，不绕过目标策略回退到绑定发送。
 
 1. 在该聊天里的普通提问和 `/steer` 仍走原回复链，不会被同步逻辑重复发送或转发到其他目标。
 2. 其他来源的 Turn 成功完成后，只投递**最终回答**——最后一次工具调用之后的文字，而不是各 step 拼接的全文，也不是工具调用之前的寒暄：Web GUI 中提交的 Turn、定时任务（`schedule`、`deliveryMode: host`）、待答问题回执，以及 `subagent-settled` 等内部通知发起的 Turn。
 3. 是否把 Web 中输入的文字本身也镜像到聊天、是否投递模型回答，由「通用设置 → 投递」决定；两个前缀图标分别作用于镜像的输入与模型回答。
 4. 只有读者自己在 Web GUI 里提交的文字才会被镜像：Host 注入的上下文快照、定时提醒和内部通知都不会回显，只投递模型回答。镜像发送失败时，该 Turn 的回答也不再投递。
 5. 渠道自己渲染回答时（飞书过程卡片），卡片就是这次投递：最终回答写在卡片里，只有卡片没能确认，才补发一条纯文字。同一条回答因此只会到达聊天一次，不会既在卡片里又以文字重发一遍。两个全局开关关闭时，卡片与文字一起停发，因为两者读的是同一份开关。
-6. 地址在每次投递前从当前绑定读取，因此自动跟随 `/session` 切换与 `/new`；没有绑定的 Session 不会投递，也不会报错，但会写一条不含消息正文的日志（Session、渠道与会话 Key），方便排查为什么聊天没有收到内容。
+6. 每次发送重新验证当前绑定或保存目标的 Session 匹配；`/session`、`/new`、删除目标、改绑或禁用会使旧候选失效。没有可用文字路由时不发送，诊断不含消息正文；旧附件目的地不会被用作文字路由。
 
 服务注入不会决定 Turn 的来源：Host 在每个 Turn 前注入的上下文快照、定时提醒与内部通知只是「这是本 Turn 的一条消息」，不会把 Turn 判成服务发起的。只有整个 Turn 都没有一条来自读者（Web 或本聊天）的消息时，才按服务发起的 Turn 投递回答；只要其中一条消息来自本聊天，该 Turn 就由聊天自己回答，同步逻辑完全不投递。
 
-投递目标行上原有的「会话双向同步」开关现在只影响同步审批与同步提问的候选范围，不再是会话同步的前提；这个候选范围仍然只限私聊：镜像文字可以跟随渠道持久化的任意路由（群聊、Slack Thread、Telegram Topic、Discord 频道），但同步审批与同步提问只在私聊中提出，因为在群里任何成员都能替读者作答。首版仅同步当前 Host 的文字，不同步图片、文件、卡片、工具过程、审批或历史消息。显式配置了远程 `harnessBaseUrl` 的渠道也不支持。
+保存目标行的「会话双向同步」开关参与文字候选筛选。官方文字协调器显式使用内部 `listSessionSyncTargets(sessionId, {privateOnly:false})`，允许合法、已启用且仍绑定本 Session 的保存房间／线程目标；这不是任意房间授权。默认枚举仍是私聊，审批／提问及其 Web／桌面兜底通知继续限私聊，describe／present 权限和 DS Bot 私聊歧义规则不变，群成员不会因此获得代答／审批权。官方同步只处理当前 Host 的文字或既有回答卡片，不同步附件、工具过程或历史消息；Matrix 定时附件是上文独立扩展。显式配置远程 `harnessBaseUrl` 的渠道仍不支持本地同步。
 
 ## 投递设置
 
@@ -131,7 +133,13 @@ Matrix 群或线程的 Session 中，原生定时任务正常完成后，dsh-im 
 - `deliverModelAnswers`：投递「非本聊天发起」的 Turn 的模型回答；默认关闭，与输入镜像一致。全新安装两项都是关闭的；设置文件无法读取时同样按两项关闭处理——协调器只记录一条警告，不会自行开始镜像。
 - `inputIcon` / `modelIcon`：镜像输入与模型回答的前缀图标。去除首尾空白，最长 32 个字符，不允许多行或控制字符；无效值按空字符串处理，空字符串表示不加前缀。非空时消息格式为「图标 + 空行 + 文字」。
 
-同机设置页通过 `settings.delivery-sync.get` / `settings.delivery-sync.set` 读写这份设置（`set` 只应用传入的字段，四个字段都可选）。消息语言通过 `settings.language.set` 在「跟随 DSH 界面语言」与 `zh`／`en`／`ru` 之间切换：显式选择优先于 DSH 界面语言，插件 `language` 选项仍然优先于两者。
+设置页通过当前 Host 的已认证 management transport 读写 `settings.delivery-sync.get` / `settings.delivery-sync.set`（`set` 仅应用传入字段，至少一个字段）。channel 为 `/dsh-im-delivery-sync`，Fetch carrier 路径为 `POST /api/dsh-im/dsh-im-delivery-sync`，遵守现有 `rpcAuthority` 与 Harness 认证，不使用公开主动发送 HTTP 代替。
+
+只启用回答时：先 GET `{}` 记录原值 → SET `{deliverModelAnswers:true}` → 同一运行 Host 再 GET `{}` 读回，核对输入镜像和两个图标未变；原本开启的输入镜像也应保留并报告。这是全局设置，影响其他已绑定聊天的非 IM 回合，不是 Matrix 单 bot 开关。
+
+store 是同 Host 单例且有缓存，直接编辑 JSON 或另起进程写同路径不等于运行实例生效；无法认证或无法确认目标代码已加载时，明确保留未启用，不降权限、不擅自重启。协调器每回合缓存设置，验证应使用读回之后的新回合。以上是操作说明，不表示本轮已在运行实例启用或已向 Matrix 验收发送。
+
+消息语言通过 `settings.language.set` 在「跟随 DSH 界面语言」与 `zh`／`en`／`ru` 之间切换：显式选择优先于 DSH 界面语言，插件 `language` 选项仍然优先于两者。
 
 ## 九渠道手动填写字段
 
@@ -234,7 +242,7 @@ await ctx.dshIm.send(botId, targetId, '# 每日报告\n\n**检查完成**', {
 
 长消息按渠道限制分段。飞书主动卡片保留原有不自动分段的行为，平台拒绝或结果未知时不自动改发文本。其他新增回退仅针对本地格式处理错误或明确的格式拒绝，不重发已成功的分段，不因网络结果未知而改格式重试。旧 Host 可能忽略 `format`，需要加载更新后的插件。
 
-会话同步的最终助手回答请求 Markdown，镜像的 Web 输入使用纯文本，两者都按 Session 绑定地址走普通投递路径，不再经由飞书专用的镜像卡片：飞书收到的就是同一份文本。
+会话同步的最终助手回答请求 Markdown，镜像的 Web 输入使用纯文本；地址遵守上文当前绑定／保存目标策略。既有渠道回答卡片确认时由卡片承载回答，未确认才走文字回退，不另发相同回答。
 
 同 Host 插件也可以列出某个机器人的已保存目标：
 
@@ -352,11 +360,11 @@ async function sendDailyReport(connection, summary) {
 | `target.create` | `{ botId, target: { targetId, name?, kind, route } }` | 已创建的完整目标 |
 | `target.update` | `{ botId, targetId, target: { name?, kind, route } }` | 更新后的完整目标 |
 | `target.delete` | `{ botId, targetId }` | `{ deleted: true }` |
-| `target.session-sync.set` | `{ botId, targetId, enabled }` | `{ enabled, state }`；仅供本机设置页管理私聊同步 |
+| `target.session-sync.set` | `{ botId, targetId, enabled }` | `{ enabled, state }`；管理保存目标的同步候选资格，交互仍限私聊 |
 | `target.test` | `{ botId, targetId }` | `{ sent: true }` |
 | `target.test` | `{ botId, target: { kind, route } }` | `{ sent: true }`；测试草稿，不保存 |
 
-接口严格校验字段。`target.update` 的内部 `target` 不能包含 `targetId`；草稿测试不能包含 `targetId` 或 `name`。`target.list` 返回的每个目标带只读 `sessionSync: { enabled, state }`，其中 `state` 为 `off`、`active`、`waiting` 或 `unavailable`；内部私聊键不会返回客户端。
+接口严格校验字段。`target.update` 的内部 `target` 不能包含 `targetId`；草稿测试不能包含 `targetId` 或 `name`。`target.list` 返回的每个目标带只读 `sessionSync: { enabled, state }`，其中 `state` 为 `off`、`active`、`waiting` 或 `unavailable`；内部会话键不会返回客户端。
 
 ## 错误处理
 
@@ -372,7 +380,7 @@ HTTP 失败响应格式为 `{ "error": { "code", "message", "details" } }`。同
 | `bot-not-connected` | 503 | 机器人当前离线；恢复连接后由调用方决定是否重试 |
 | `target-rejected` | 422 | 平台明确拒绝目标或机器人缺少发送权限；检查平台权限和目标 ID |
 | `delivery-failed` | 502 | 网络、平台或其他无法安全细分的发送失败；检查连接状态和 Host 日志 |
-| `session-sync-unavailable` | — | 目标不是可确认的当前 Host 私聊，尚无当前 Session，或渠道使用远程 Harness；先从已聊私聊创建目标并建立 Session |
+| `session-sync-unavailable` | — | 目标不是可确认的当前 Host 会话，尚无当前 Session，或渠道使用远程 Harness；先从已聊会话创建目标并建立 Session；审批／提问仍须私聊 |
 | `cancelled` | 408 | 调用被取消；按业务需要结束或重新发起 |
 
 HTTP 协议层还可能返回 `method-not-allowed`（405）、`unsupported-media-type`（415）或 `payload-too-large`（413）。
@@ -405,7 +413,7 @@ HTTP 接口只在当前 Host 提供 WebServer 时注册，并使用同一个监�
 
 这会同时扩大该 WebServer 上其他页面和路由的网络可达范围。当前主动投递 HTTP 接口没有鉴权，因此只能配合可信局域网、防火墙或反向代理使用，不能直接暴露到公网。
 
-Connection RPC 默认只允许当前 Host 的回环调用。若 Web profile 明确运行在受信任局域网，可在该 profile 的 `cordis.patch.yml` 中复用现有 Host authority：
+管理 Connection RPC 默认沿用 Harness 已认证的 `trusted-host` authority；配置 `rpcAuthority: loopback` 时进一步限于回环 Host／Origin。受信任 profile 可在 `cordis.patch.yml` 显式声明：
 
 ```yaml
 - id: xmanrui-dsh-im

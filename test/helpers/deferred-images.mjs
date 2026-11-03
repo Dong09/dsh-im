@@ -11,7 +11,7 @@ export async function loadDeferredImages(content, options = {}) {
   assert.equal(content.some((part) => part.type === 'image'), false,
     'the bridge must leave model image preparation to HarnessClient');
   const limits = imageInputLimits();
-  const loaded = await promptContentForMessage({ images: options.images }, {
+  const loaded = await promptContentForMessage({ images: options.images, reconcileImages: options.reconcileImages }, {
     maxImageBytes: limits.maxDownloadBytes,
     maxImages: limits.maxImages,
     maxTotalImageBytes: limits.maxDownloadBytes * limits.maxImages,

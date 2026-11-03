@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -30,7 +30,7 @@ async function fixture(t, initial = [{ sessionId: 'one', ...DEST }]) {
     },
     async authorizeScheduledTarget() { return Object.freeze({}); },
     async sendScheduledPart(botId, target, part, options) {
-      const result = await send(botId, target, part.text, options);
+      const result = await send(botId, target, part.artifact.fileName, options);
       return result?.sent === true ? { deliveryOutcome: 'sent', providerMessageIds: ['$sent'] } : result;
     },
   };
@@ -38,7 +38,13 @@ async function fixture(t, initial = [{ sessionId: 'one', ...DEST }]) {
   const relay = relayModule.createScheduleRelay({ im, store, registry, logger: { warn: (text) => warnings.push(text) } });
   t.after(async () => { await relay.close(); await store.close(); });
   await relay.captureBindings();
-  return { relay, store, path, im, sends, warnings, setBindings(value) { bindings = value; }, setSend(value) { send = value; } };
+  async function stage(sessionId = 'one') {
+    await writeFile(join(root, 'attachment.txt'), 'original file');
+    const artifact = await registry.stage({ path: 'attachment.txt' }, { agent: { session: { id: sessionId, header: { id: sessionId, cwd: root } } }, callId: 'file' });
+    assert.ok(registry.commit(artifact));
+    return artifact;
+  }
+  return { relay, store, path, im, registry, sends, warnings, stage, setBindings(value) { bindings = value; }, setSend(value) { send = value; } };
 }
 
 function input(kind = 'schedule') {
@@ -55,44 +61,49 @@ async function claim(relay, sessionId = 'one', kind = 'schedule', number = 1) {
   await relay.preStep({ agent: { session }, turn: number, signal: new AbortController().signal });
   await relay.observeEvent(session, event);
 }
-async function turn(relay, sessionId = 'one', { number = 1, kind = 'schedule', text = 'hello room', reason = 'completed' } = {}) {
+async function turn(f, sessionId = 'one', { number = 1, kind = 'schedule', text = 'hello room', reason = 'completed', artifact = true } = {}) {
+  const { relay } = f;
   await relay.observeEvent(sessionId, { type: 'turn/start', data: { turn: number } });
   await claim(relay, sessionId, kind, number);
+  if (artifact && f.registry.hasActiveConsumer({ id: sessionId })) await f.stage(sessionId);
   await relay.enqueue(sessionId, answer(text, number));
   await relay.enqueue(sessionId, { type: 'turn/end', data: { turn: number, reason: { kind: reason } } });
 }
 
-test('a schedule final answer reaches its Matrix room without saved targets or Session sync', async (t) => {
+test('a scheduled attachment reaches its Matrix room without saved targets or Session sync', async (t) => {
   const f = await fixture(t);
-  await turn(f.relay);
+  await turn(f);
   assert.equal(f.sends.length, 1);
   assert.equal(f.sends[0][0], 'matrix_one');
   assert.deepEqual(f.sends[0][1], { kind: 'room', route: DEST.route });
-  assert.equal(f.sends[0][2], 'hello room');
+  assert.equal(f.sends[0][2], 'attachment.txt');
+  assert.ok(f.store.get('one').lastAttempt.parts.every((part) => part.kind === 'artifact'));
+  assert.equal('deliveryDestinationFor' in f.relay, false);
   assert.equal(f.sends[0][3].format, 'markdown');
   assert.equal(f.store.get('one').lastAttempt.status, 'sent');
 });
 
-test('different rooms and threads keep separate destinations and only the final answer is sent', async (t) => {
+test('different rooms and threads keep separate attachment destinations without sending final text', async (t) => {
   const f = await fixture(t, [{ sessionId: 'one', ...DEST }, { sessionId: 'two', ...THREAD }]);
   await f.relay.enqueue('two', { type: 'turn/start', data: { turn: 1 } });
   await claim(f.relay, 'two');
+  await f.stage('two');
   await f.relay.enqueue('two', answer('intermediate tool explanation'));
   await f.relay.enqueue('two', answer('final thread answer'));
   await f.relay.enqueue('two', { type: 'turn/end', data: { turn: 1, reason: 'completed' } });
-  await turn(f.relay);
+  await turn(f);
   assert.deepEqual(f.sends.map((entry) => [entry[1], entry[2]]), [
-    [{ kind: 'thread', route: THREAD.route }, 'final thread answer'],
-    [{ kind: 'room', route: DEST.route }, 'hello room'],
+    [{ kind: 'thread', route: THREAD.route }, 'attachment.txt'],
+    [{ kind: 'room', route: DEST.route }, 'attachment.txt'],
   ]);
 });
 
-test('ordinary chats, failed turns, interrupted attempts, empty answers and unbound Sessions do not relay', async (t) => {
+test('ordinary chats, failed turns, text-only answers and unbound Sessions do not relay', async (t) => {
   const f = await fixture(t);
-  await turn(f.relay, 'one', { number: 1, kind: 'user' });
-  await turn(f.relay, 'one', { number: 2, reason: 'error' });
-  await turn(f.relay, 'one', { number: 3, text: '   ' });
-  await turn(f.relay, 'unbound', { number: 1 });
+  await turn(f, 'one', { number: 1, kind: 'user' });
+  await turn(f, 'one', { number: 2, reason: 'error' });
+  await turn(f, 'one', { number: 3, text: 'final answer without files', artifact: false });
+  await turn(f, 'unbound', { number: 1 });
   await f.relay.enqueue('one', { type: 'turn/start', data: { turn: 4 } });
   await claim(f.relay, 'one', 'schedule', 4);
   await f.relay.enqueue('one', { ...answer('partial', 4), data: { ...answer('partial', 4).data, interrupted: true } });
@@ -104,15 +115,15 @@ test('a new Session for the same room does not remove the old Session reply rout
   const f = await fixture(t);
   f.setBindings([{ sessionId: 'new', ...DEST }]);
   await f.relay.captureBindings();
-  await turn(f.relay, 'one');
-  await turn(f.relay, 'new');
+  await turn(f, 'one');
+  await turn(f, 'new');
   assert.equal(f.sends.length, 2);
   assert.ok(f.sends.every((entry) => entry[1].route.roomId === '!one:example.org'));
 });
 
 test('one Session bound to different rooms is reported as a conflict rather than broadcast', async (t) => {
   const f = await fixture(t, [{ sessionId: 'one', ...DEST }, { sessionId: 'one', ...OTHER }]);
-  await turn(f.relay);
+  await turn(f);
   assert.deepEqual(f.sends, []);
   assert.equal(f.store.get('one').conflict, true);
   assert.ok(f.warnings.some((text) => text.includes('binding-conflict')));
@@ -120,16 +131,16 @@ test('one Session bound to different rooms is reported as a conflict rather than
 
 test('restart retains old routes and does not repeat a previously attempted turn', async (t) => {
   const f = await fixture(t);
-  await turn(f.relay);
+  await turn(f);
   await f.relay.close();
   await f.store.close();
   const restored = await storeModule.RelayStore.open(f.path);
-  const relay = relayModule.createScheduleRelay({ im: f.im, store: restored });
+  const relay = relayModule.createScheduleRelay({ im: f.im, store: restored, registry: f.registry });
   t.after(async () => { await relay.close(); await restored.close(); });
   f.setBindings([]);
-  await turn(relay);
+  await turn({ ...f, relay, store: restored });
   assert.equal(f.sends.length, 1);
-  await turn(relay, 'one', { number: 2 });
+  await turn({ ...f, relay, store: restored }, 'one', { number: 2 });
   assert.equal(f.sends.length, 2);
 });
 
@@ -140,28 +151,28 @@ test('sending is recorded before the platform call and unknown outcomes are not 
     assert.equal(persisted.sessions[0].lastAttempt.status, 'sending');
     throw Object.assign(new Error('provider secret detail'), { code: 'send-result-unknown' });
   });
-  await turn(f.relay);
+  await turn(f);
   assert.equal(f.store.get('one').lastAttempt.status, 'unknown');
   assert.ok(f.warnings.some((text) => text.includes('send-result-unknown')));
   assert.ok(f.warnings.every((text) => !text.includes('provider secret detail')));
-  await turn(f.relay);
+  await turn(f);
   assert.equal(f.store.get('one').lastAttempt.status, 'unknown');
 });
 
 test('a persisted sending state after a crash is not resent', async (t) => {
   const f = await fixture(t);
-  await f.store.attempt('one', 1);
-  await turn(f.relay);
+  await f.store.attempt('one', 1, [{ id: 'artifact:old', kind: 'artifact', artifactId: 'old', fileName: 'old.txt', mediaType: 'text/plain', size: 1, digest: 'a'.repeat(64) }]);
+  await turn(f);
   assert.deepEqual(f.sends, []);
 });
 
-test('close drains accepted sends, rejects new work, and does not lose an in-flight answer', async (t) => {
+test('close drains accepted sends, rejects new work, and does not lose an in-flight attachment', async (t) => {
   const f = await fixture(t);
   const entered = Promise.withResolvers();
   const release = Promise.withResolvers();
   t.after(() => release.resolve());
   f.setSend(async (...args) => { entered.resolve(); await release.promise; f.sends.push(args); return { sent: true }; });
-  const sending = turn(f.relay);
+  const sending = turn(f);
   await entered.promise;
   let closed = false;
   const closing = f.relay.close().then(() => { closed = true; });
@@ -170,11 +181,11 @@ test('close drains accepted sends, rejects new work, and does not lose an in-fli
   release.resolve();
   await sending;
   await closing;
-  await turn(f.relay, 'one', { number: 2 });
+  await turn(f, 'one', { number: 2 });
   assert.equal(f.sends.length, 1);
 });
 
-test('automatic Host runtime context snapshots do not suppress the scheduled answer', async (t) => {
+test('automatic Host runtime context snapshots do not suppress scheduled attachments', async (t) => {
   const f = await fixture(t);
   await f.relay.enqueue('one', { type: 'turn/start', data: { turn: 1 } });
   const context = {
@@ -183,11 +194,12 @@ test('automatic Host runtime context snapshots do not suppress the scheduled ans
   };
   await f.relay.enqueue('one', context);
   await claim(f.relay, 'one', 'schedule', 1);
+  await f.stage();
   await f.relay.enqueue('one', answer('scheduled final answer'));
   await f.relay.enqueue('one', context);
   await f.relay.enqueue('one', { type: 'turn/end', data: { turn: 1, reason: 'completed' } });
   assert.equal(f.sends.length, 1);
-  assert.equal(f.sends[0][2], 'scheduled final answer');
+  assert.equal(f.sends[0][2], 'attachment.txt');
   assert.ok(!f.warnings.some((text) => text.includes('mixed-input')));
 });
 

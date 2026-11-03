@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { callManagementRpc, registerManagementRpc } from '../plugin-src/management-rpc.mjs';
 import { installInboundTtlRpc } from '../plugin-src/host/inbound-ttl-rpc.mjs';
+import { DELIVERY_SYNC_ENDPOINTS, DELIVERY_SYNC_RPC_CHANNEL, deliverySyncStore, installDeliverySyncRpc } from '../plugin-src/host/delivery-sync-rpc.mjs';
+import { deliverySyncSettingsPath, getDeliverySyncSettingsStore } from '../src/channels/shared/delivery-sync-settings-store.mjs';
+import { DEFAULT_DELIVERY_SYNC_SETTINGS } from '../src/channels/shared/delivery-sync-settings.mjs';
 import { managementFetch } from './fixtures/management-rpc.mjs';
 
 function fixture(handler, options) {
@@ -248,4 +251,72 @@ test('management callers preserve business failures and original cancellation er
     await assert.rejects(callManagementRpc({ rpc: { call: async () => { throw cause; } } }, '/dsh-im', 'update.install', {}, signal),
       error => error === cause);
   }
+});
+
+
+for (const rpcAuthority of ['trusted-host', 'loopback']) {
+  for (const mirrorUserInput of [false, true]) {
+    test(`delivery-sync management GET / answer-only SET / GET preserves shared settings (${rpcAuthority}, mirror=${mirrorUserInput})`, async (t) => {
+      const dshHome = await mkdtemp(join(tmpdir(), 'dsh-im-sync-management-'));
+      t.after(() => rm(dshHome, { recursive: true, force: true }));
+      const config = { dshHome, rpcAuthority };
+      const store = deliverySyncStore(config);
+      const coordinatorStore = getDeliverySyncSettingsStore({ dshHome });
+      assert.equal(store, coordinatorStore);
+      const original = { mirrorUserInput, deliverModelAnswers: false, inputIcon: '👤', modelIcon: '🤖' };
+      await store.set(original);
+      await coordinatorStore.get();
+      let call;
+      const ctx = { connection: { fetch: managementFetch((channel, handler, route) => {
+        assert.equal(channel, DELIVERY_SYNC_RPC_CHANNEL);
+        assert.equal(route.path, '/api/dsh-im/dsh-im-delivery-sync');
+        call = handler;
+      }) } };
+      installDeliverySyncRpc(ctx, { config });
+      // The carrier fixture starts after Harness browser authentication and trust checks.
+      // It exercises the registered route, not a bypass of the management handler.
+      const host = rpcAuthority === 'loopback' ? 'localhost:3080' : 'dashboard.example:3080';
+      const headers = { host, origin: `http://${host}` };
+      assert.deepEqual(await call(DELIVERY_SYNC_ENDPOINTS.get, {}, undefined, headers), { ok: true, value: original });
+      const expected = { ...original, deliverModelAnswers: true };
+      assert.deepEqual(await call(DELIVERY_SYNC_ENDPOINTS.set, { deliverModelAnswers: true }, undefined, headers), { ok: true, value: expected });
+      assert.deepEqual(await call(DELIVERY_SYNC_ENDPOINTS.get, {}, undefined, headers), { ok: true, value: expected });
+      assert.deepEqual(await coordinatorStore.get(), expected, 'same cached owner sees the authenticated management patch');
+      const path = deliverySyncSettingsPath(config);
+      const bytes = await readFile(path);
+      assert.deepEqual(JSON.parse(bytes.toString()), { version: 1, deliverySync: expected });
+      if (rpcAuthority === 'loopback') {
+        let writes = 0;
+        const set = store.set.bind(store);
+        store.set = async (...args) => { writes += 1; return set(...args); };
+        try {
+          for (const deniedHeaders of [
+            { host: 'remote.example:3080', origin: 'http://remote.example:3080' },
+            { host: 'localhost:3080', origin: 'https://remote.example' },
+          ]) {
+            await assert.rejects(call(DELIVERY_SYNC_ENDPOINTS.get, {}, undefined, deniedHeaders), /HTTP 403/);
+            await assert.rejects(call(DELIVERY_SYNC_ENDPOINTS.set, { deliverModelAnswers: false }, undefined, deniedHeaders), /HTTP 403/);
+          }
+          assert.equal(writes, 0, 'authority rejection occurs before the settings writer');
+          assert.deepEqual(await readFile(path), bytes);
+          assert.deepEqual(await coordinatorStore.get(), expected);
+        } finally { store.set = set; }
+      }
+    });
+  }
+}
+
+test('denied delivery-sync management requests leave a fresh home and cached defaults untouched', async (t) => {
+  const dshHome = await mkdtemp(join(tmpdir(), 'dsh-im-sync-denied-'));
+  t.after(() => rm(dshHome, { recursive: true, force: true }));
+  const config = { dshHome, rpcAuthority: 'loopback' };
+  const store = deliverySyncStore(config);
+  let call;
+  installDeliverySyncRpc({ connection: { fetch: managementFetch((_channel, handler) => { call = handler; }) } }, { config });
+  const headers = { host: 'remote.example', origin: 'https://remote.example' };
+  await assert.rejects(call(DELIVERY_SYNC_ENDPOINTS.get, {}, undefined, headers), /HTTP 403/);
+  await assert.rejects(call(DELIVERY_SYNC_ENDPOINTS.set, { deliverModelAnswers: true }, undefined, headers), /HTTP 403/);
+  assert.deepEqual(await readdir(dshHome), [], 'no settings or temporary file is created');
+  assert.deepEqual(await store.get(), { ...DEFAULT_DELIVERY_SYNC_SETTINGS });
+  assert.deepEqual(await readdir(dshHome), [], 'reading defaults is not a write');
 });

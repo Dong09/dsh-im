@@ -160,6 +160,10 @@ for (const scenario of fixture.cases) {
     assert.equal(result.sends.length, 2, 'exactly one final text and one registered artifact');
     assert.deepEqual(result.sends.map(send => send.target), [expectedTarget, expectedTarget]);
     assert.deepEqual(result.sends.map(send => send.botId), ['matrix_fixture', 'matrix_fixture']);
+    const texts = result.sends.filter(send => send.kind === 'text');
+    assert.deepEqual(texts, [{ kind: 'text', owner: scenario.input === 'schedule' ? 'official-session-sync' : 'direct-im',
+      botId: 'matrix_fixture', target: expectedTarget, text: fixture.finalText, providerMessageIds: [scenario.textEventId] }],
+    'exactly one unmodified final answer from its sole delivery owner');
     const files = result.sends.filter(send => send.kind !== 'text');
     assert.equal(files.length, 1);
     assert.deepEqual(files[0], { kind: scenario.mediaType.startsWith('image/') ? 'image' : 'file',
@@ -208,19 +212,24 @@ for (const scenario of fixture.cases) {
       const initialGuidance = result.assemblies[0].find(context => context.name === 'dsh-im:return-file');
       assert.ok(initialGuidance, 'empty context registration must survive initial assembly for later refresh');
       assert.equal(initialGuidance.text, '');
-      assert.deepEqual(result.sends.map(send => send.kind), ['text', scenario.mediaType.startsWith('image/') ? 'image' : 'file']);
-      assert.equal(record.lastAttempt.status, 'sent');
+      assert.deepEqual(result.scheduledParts, [{ kind: 'artifact', artifactId: registered.artifactId }],
+        'the relay private sender receives only the registered artifact');
+      assert.deepEqual(result.officialTextCalls, [{ sessionId: record.sessionId, text: fixture.finalText,
+        options: { format: 'markdown' }, target: expectedTarget }], 'official sync independently sends the sole final answer');
+      // Text and artifact delivery are independent; do not assert their relative order.
+      assert.equal(record.lastAttempt.status, 'sent', 'checkpoint success describes the artifact only');
       assert.deepEqual(record.lastAttempt.parts.map(part => ({ kind: part.kind, status: part.status, ids: part.providerMessageIds })), [
-        { kind: 'text', status: 'sent', ids: [scenario.textEventId] },
         { kind: 'artifact', status: 'sent', ids: [scenario.eventId] },
       ]);
       assert.equal(result.warnings.length, 0, JSON.stringify(result.warnings));
     } else {
+      assert.deepEqual(result.officialTextCalls, [], 'official sync sees IM ownership and must not echo input or duplicate the answer');
+      assert.deepEqual(result.scheduledParts, [], 'direct IM never dispatches a relay artifact');
       assert.equal(result.claims[0].source.kind, 'user');
       assert.equal(typeof result.claims[0].source.rpcId, 'string');
       assert.equal(record.lastAttempt, undefined, 'ordinary IM consumer sends once; relay must not duplicate it');
       assert.equal(result.trace.filter(entry => entry.kind === 'platform:authorize').length, 0);
     }
-    t.diagnostic(`DSH ${mode} profile=headless case=${scenario.id}: ${result.requests.length} model calls, ${result.imageCalls} image-generation calls, ${result.sends.map(send => `${send.kind}:${send.providerMessageIds.join(',')}`).join(' ')}; managed snapshot retained/released; first-request guidance and exact receipts asserted`);
+    t.diagnostic(`DSH ${mode} profile=headless case=${scenario.id}: ${result.requests.length} model calls, ${result.imageCalls} image-generation calls, ${result.sends.map(send => `${send.kind}:${send.providerMessageIds.join(',')}`).join(' ')}; official final texts=${result.officialTextCalls.length}, relay parts=${result.scheduledParts.map(part => part.kind).join(',') || 'none'}; managed snapshot retained/released; first-request guidance and exact receipts asserted`);
   });
 }

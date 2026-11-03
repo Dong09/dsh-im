@@ -323,7 +323,7 @@ export class MatrixController {
   }
 
   /**
-   * Internal single-part bridge. Keep rebind/delete behind this bot's transition
+   * Internal managed-artifact bridge. Keep rebind/delete behind this bot's transition
    * until the provider settles; close still aborts and drains the runtime. The
    * only fallback owner is deliverOutboundArtifacts, never a checkpoint writer.
    */
@@ -331,8 +331,9 @@ export class MatrixController {
     this.#assertOpen();
     this.#requireId(botId);
     if (!['room', 'thread'].includes(target?.kind)
-      || !['text', 'artifact'].includes(part?.kind)
-      || (part.kind === 'text' ? typeof part.text !== 'string' || !part.text.trim() : !isManagedOutboundArtifact(part.artifact))) {
+      || !part || typeof part !== 'object' || Array.isArray(part)
+      || Object.keys(part).length !== 2 || Object.keys(part).some((key) => !['kind', 'artifact'].includes(key))
+      || part.kind !== 'artifact' || !isManagedOutboundArtifact(part.artifact)) {
       throw operationError('bad-request', 'Invalid internal Matrix scheduled part');
     }
     if (!/^[a-f0-9]{64}$/.test(options.expectedFingerprint ?? '')) {
@@ -353,10 +354,6 @@ export class MatrixController {
       };
       await beforeSend();
       const sendOptions = { signal: options.signal, format: options.format ?? 'plain', beforeSend };
-      if (part.kind === 'text') {
-        try { return scheduledTextReceipt(await runtime.sendProactiveText(target, part.text, sendOptions)); }
-        catch (error) { return scheduledFailure(error); }
-      }
       const artifact = part.artifact;
       let failure;
       let artifactDelivery;

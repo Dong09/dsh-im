@@ -39,7 +39,8 @@ import {
   extractOutboundMentions,
   hasRoomMention,
 } from './matrix-rich-text.mjs';
-import { createMatrixImageSource, matrixImageFailure } from './matrix-image-input.mjs';
+import { createMatrixImageSource, matrixImageFailure, matrixImageReferenceFailure } from './matrix-image-input.mjs';
+import { redactionTargetOf, isRedactedMatrixEvent } from './matrix-redaction.mjs';
 import { RootContextRegistry } from '../shared/conversation/root-context.mjs';
 import { WindowAmbientProvider } from '../shared/conversation/ambient-provider.mjs';
 import { createEventLru, resolveReplyChain } from '../shared/conversation/reply-context.mjs';
@@ -209,6 +210,7 @@ export class MatrixRuntime {
   #notifiedEncryptedRooms = new Set();
   #e2eeActive = false;
   #imageInbox;
+  #imageInvalidationRepairs = new Map();
   #imageAssociationWindowMs;
 
   constructor({
@@ -810,14 +812,40 @@ export class MatrixRuntime {
 
   async #handleTimelineEvent(roomId, event, generation, signal) {
     this.#assertCurrentGeneration(generation, signal);
-    if (event?.type === 'm.room.encrypted') {
+    const encryptedEnvelope = event?.type === 'm.room.encrypted';
+    if (encryptedEnvelope) {
       this.#noteEncryptedRoom(roomId);
       if (!this.#crypto) return;
       if (typeof event?.event_id !== 'string' || !event.event_id) return;
       const decrypted = await this.#crypto.decryptRoomEvent(roomId, event).catch(() => null);
       this.#assertCurrentGeneration(generation, signal);
       if (!decrypted || typeof decrypted.content !== 'object' || decrypted.content === null) return;
-      event = { ...event, type: 'm.room.message', content: decrypted.content };
+      event = { ...event, type: decrypted.type ?? 'm.room.message', content: decrypted.content };
+    }
+    if (event?.type === 'm.room.redaction') {
+      const target = redactionTargetOf(event, { roomId });
+      if (target && this.#imageInbox && !this.#dmRooms.has(roomId)) {
+        if (encryptedEnvelope) {
+          // Decryption proves authorship, not homeserver authorization to redact.
+          // An encrypted user payload is only a hint; require independent server evidence.
+          let proof;
+          try {
+            const read = this.#api.getEventStrict ?? this.#api.getEvent;
+            proof = await read.call(this.#api, roomId, target, { signal });
+          } catch (error) {
+            this.#assertCurrentGeneration(generation, signal);
+            this.#logger.warn?.('[dsh-im:matrix] encrypted redaction hint could not be confirmed');
+            return;
+          }
+          this.#assertCurrentGeneration(generation, signal);
+          if (!isRedactedMatrixEvent(proof, { roomId, eventId: target })) return;
+        }
+        // Do not advance the sync cursor until this durable invalidation succeeds.
+        this.#assertCurrentGeneration(generation, signal);
+        await this.#invalidateImage(roomId, target, { signal });
+        this.#assertCurrentGeneration(generation, signal);
+      }
+      return;
     }
     if (event?.type !== 'm.room.message' && event?.type !== 'm.room.encryption') return;
     if (event?.type === 'm.room.encryption') {
@@ -927,85 +955,201 @@ export class MatrixRuntime {
     }
   }
 
-  async #readImageEvent(api, crypto, roomId, eventId, options = {}) {
-    const event = await api.getEvent(roomId, eventId, options);
+  async #imageReferenceBarrier(options = {}) {
     options.signal?.throwIfAborted();
-    if (!event || (event.event_id && event.event_id !== eventId)) throw new Error('Matrix reply event is unavailable');
-    let content = event.content;
-    if (event.type === 'm.room.encrypted') {
-      content = (await crypto?.decryptRoomEvent(roomId, event))?.content;
-      if (!content) throw new Error('Matrix reply event cannot be decrypted');
+    // A read-time invalidation has no sync event to replay. Retry exactly the
+    // already-proven targets before consulting the store's persistent safety latch.
+    for (const { roomId, eventId } of [...this.#imageInvalidationRepairs.values()]) {
+      await this.#invalidateImage(roomId, eventId, options);
     }
-    return { ...event, content };
+    try { await this.#imageInbox?.barrier?.(); }
+    catch (error) {
+      options.signal?.throwIfAborted();
+      throw matrixImageReferenceFailure('storage', error);
+    }
   }
 
-  #referencedImageSource(message, reference, resolved = null) {
+  async #invalidateImage(roomId, eventId, options = {}) {
+    options.signal?.throwIfAborted();
+    const key = JSON.stringify([roomId, eventId]);
+    try {
+      await this.#imageInbox.invalidate({ roomId, eventId }, options);
+      this.#imageInvalidationRepairs.delete(key);
+    } catch (error) {
+      options.signal?.throwIfAborted();
+      this.#imageInvalidationRepairs.set(key, { roomId, eventId });
+      throw matrixImageReferenceFailure('storage', error);
+    }
+  }
+
+  async #readImageEvent(api, crypto, roomId, eventId, options = {}) {
+    const read = api.getEventStrict ?? api.getEvent;
+    const event = await read.call(api, roomId, eventId, options);
+    options.signal?.throwIfAborted();
+    if (!event || event.event_id !== eventId
+      || (Object.hasOwn(event, 'room_id') && event.room_id !== roomId)
+      || !['m.room.message', 'm.room.encrypted'].includes(event.type)
+      || (options.expectedSender && event.sender !== options.expectedSender)) {
+      throw matrixImageReferenceFailure('unavailable');
+    }
+    // Server-provided redaction evidence is checked before attempting to decrypt erased content.
+    if (isRedactedMatrixEvent(event, { roomId, eventId })) {
+      await this.#invalidateImage(roomId, eventId, options);
+      throw matrixImageReferenceFailure('redacted');
+    }
+    let content = event.content;
+    let type = event.type;
+    if (event.type === 'm.room.encrypted') {
+      const decrypted = await crypto?.decryptRoomEvent(roomId, event);
+      content = decrypted?.content;
+      type = decrypted?.type ?? 'm.room.message';
+      options.signal?.throwIfAborted();
+      if (!content) throw matrixImageReferenceFailure('unavailable');
+    }
+    if (type !== 'm.room.message') throw matrixImageReferenceFailure('unavailable');
+    return { ...event, type, content };
+  }
+
+  #referencedImageSource(message, reference) {
     const api = this.#api;
     const crypto = this.#crypto;
     const maxBytes = this.#config.maxMediaBytes;
+    const generation = this.#generation;
+    const parent = this.#lifecycleController?.signal;
     return {
       name: reference.name,
       load: async (options = {}) => {
-        options.signal?.throwIfAborted();
+        const signal = parent && options.signal ? AbortSignal.any([parent, options.signal]) : parent ?? options.signal;
+        const check = () => this.#assertCurrentGeneration(generation, signal);
+        check();
+        await this.#imageReferenceBarrier({ signal });
+        check();
+        if (this.#imageInbox.isInvalidated({ roomId: message.roomId, eventId: reference.eventId })) {
+          throw matrixImageReferenceFailure('redacted');
+        }
         let event;
         try {
-          event = resolved ?? await this.#readImageEvent(api, crypto, message.roomId, reference.eventId, { signal: options.signal });
+          // Arrival-time metadata can be stale after queueing or a workspace retry.
+          event = await this.#readImageEvent(api, crypto, message.roomId, reference.eventId,
+            { signal, expectedSender: reference.senderId });
+          check();
           if (event?.content?.msgtype !== 'm.image'
             || (reference.senderId && event.sender !== reference.senderId)) {
-            throw new Error('Matrix image reference no longer matches the recorded message');
+            throw matrixImageReferenceFailure('unavailable');
           }
         } catch (error) {
-          if (options.signal?.aborted) throw options.signal.reason ?? error;
-          throw matrixImageFailure(reference.name, 'event', error);
+          check();
+          if (error?.code?.startsWith('image-reference-')) throw error;
+          throw matrixImageReferenceFailure('unavailable', error);
         }
-        return await createMatrixImageSource(api, event.content, { maxBytes }).load(options);
+        const data = await createMatrixImageSource(api, event.content, { maxBytes }).load({ ...options, signal });
+        check();
+        return data;
       },
     };
   }
 
-  /** Explicit replies select exactly their target; implicit attachment selection never crosses authors or threads. */
+  /** Explicit replies are exact; implicit reconciliation never crosses authors or threads. */
   async #associateImages(message, event) {
     if (!this.#imageInbox || message.kind !== 'group' || !message.addressed
       || isMatrixCommandLike(message.content)) return;
+    const generation = this.#generation;
+    const parent = this.#lifecycleController?.signal;
+    const check = () => this.#assertCurrentGeneration(generation, parent);
     let references = [];
+    let implicit = false;
+    const sourceRefs = new Map();
+    const addSource = (reference) => {
+      const source = this.#referencedImageSource(message, reference);
+      sourceRefs.set(source, reference);
+      return source;
+    };
     if (message.images?.length > 0) {
       const own = this.#imageInbox.get({ roomId: message.roomId, eventId: message.messageId });
-      if (own) references = [own];
+      if (own) { references = [own]; message.images = [addSource(own)]; }
     } else if (message.replyToEventId) {
       const reference = this.#imageInbox.get({ roomId: message.roomId, eventId: message.replyToEventId });
       if (reference) {
         references = [reference];
-        message.images = [this.#referencedImageSource(message, reference)];
-      } else if (typeof this.#api?.getEvent === 'function') {
+        message.images = [addSource(reference)];
+      } else if (typeof this.#api?.getEvent === 'function' || typeof this.#api?.getEventStrict === 'function') {
         try {
-          const resolved = await this.#readImageEvent(this.#api, this.#crypto, message.roomId, message.replyToEventId, this.#sendOptions());
+          if (this.#imageInbox.isInvalidated({ roomId: message.roomId, eventId: message.replyToEventId })) {
+            throw matrixImageReferenceFailure('redacted');
+          }
+          const resolved = await this.#readImageEvent(this.#api, this.#crypto, message.roomId, message.replyToEventId, { signal: parent });
+          check();
           if (resolved.content?.msgtype === 'm.image') {
             const selected = { eventId: message.replyToEventId, senderId: resolved.sender,
               name: typeof resolved.content.body === 'string' ? resolved.content.body : 'image' };
-            message.images = [this.#referencedImageSource(message, selected, resolved)];
+            message.images = [addSource(selected)];
           }
         } catch (error) {
-          const failure = matrixImageFailure(message.replyToEventId, 'event', error);
+          check();
+          const failure = error?.code?.startsWith('image-reference-') ? error : matrixImageReferenceFailure('unavailable', error);
           message.images = [{ name: 'image', load: async () => { throw failure; } }];
         }
       }
-      // A reply to a text message must not pick up unrelated pending images.
+      // Replying to text must not pick up unrelated pending images.
     } else {
+      implicit = true;
       const beforeTs = Number.isSafeInteger(event.origin_server_ts) ? event.origin_server_ts : Date.now();
-      references = this.#imageInbox.pending({
+      references = this.#imageInbox.candidates({
         roomId: message.roomId, senderId: message.senderId, threadId: message.threadId ?? null,
         beforeTs, sinceTs: Math.max(0, beforeTs - this.#imageAssociationWindowMs),
       });
-      message.images = references.map((reference) => this.#referencedImageSource(message, reference));
-      // Keep this arrival's candidates fixed, but decide consumption after earlier queued turns settle.
-      if (references.length > 0) message.prepareImages = (current) => {
-        const pending = references.filter((reference) =>
-          this.#imageInbox.get({ roomId: current.roomId, eventId: reference.eventId })?.consumed !== true);
-        current.images = pending.map((reference) => this.#referencedImageSource(current, reference));
-        current.matrixImageEventIds = pending.map((reference) => reference.eventId);
-      };
+      message.images = references.map((reference) => addSource(reference));
     }
     message.matrixImageEventIds = references.map((reference) => reference.eventId);
+    if (sourceRefs.size === 0) return;
+    let notified = false;
+    let activeMessage = message;
+    const excluded = new Set();
+    const reconcile = async (sources, { signal } = {}, { notify = true } = {}) => {
+      check();
+      signal?.throwIfAborted();
+      const operationSignal = parent && signal ? AbortSignal.any([parent, signal]) : parent ?? signal;
+      await this.#imageReferenceBarrier({ signal: operationSignal });
+      check();
+      signal?.throwIfAborted();
+      const retained = sources.filter((source) => {
+        const reference = sourceRefs.get(source);
+        if (!reference) throw new TypeError('Unexpected Matrix image source');
+        const identity = { roomId: message.roomId, eventId: reference.eventId };
+        if (this.#imageInbox.isInvalidated(identity)) {
+          if (!implicit) throw matrixImageReferenceFailure('redacted');
+          excluded.add(reference.eventId);
+          return false;
+        }
+        if (implicit) {
+          const latest = this.#imageInbox.get(identity);
+          return latest && !latest.consumed;
+        }
+        return true;
+      });
+      activeMessage.matrixImageEventIds = retained.map((source) => sourceRefs.get(source).eventId);
+      if (retained.length === 0 && excluded.size > 0) throw matrixImageReferenceFailure('empty');
+      if (notify && retained.length > 0 && excluded.size > 0 && !notified) {
+        notified = true;
+        try {
+          await this.#sendRoomText(message.replyTarget,
+            t('有 {count} 张已撤回图片未参与本次分析。', { count: excluded.size }), { notice: true, signal: parent });
+        } catch (error) {
+          check();
+          // Operational notice failure never consumes input or prevents the valid request.
+          this.#logger.warn?.('[dsh-im:matrix] image exclusion notice could not be delivered');
+        }
+        // A new invalidation can arrive while the notice is in flight.
+        return reconcile(retained, { signal }, { notify: false });
+      }
+      return retained;
+    };
+    message.reconcileImages = reconcile;
+    // Fixed arrival candidates; only the store's latest state can retire them.
+    message.prepareImages = async (current) => {
+      activeMessage = current;
+      current.images = await reconcile(current.images, {}, { notify: false });
+    };
   }
 
   #structuredContextActive() {

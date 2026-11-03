@@ -13,7 +13,8 @@ const image = (eventId, extra = {}) => ({
   ...scope, eventId, ts: 100, name: `${eventId}.png`, ...extra,
 });
 const ids = (entries) => entries.map((entry) => entry.eventId);
-const persisted = (entry) => ({ threadId: null, ...entry, consumed: false });
+const legacy = (entry) => ({ threadId: null, ...entry, consumed: false });
+const persisted = (entry) => ({ ...legacy(entry), invalidated: false });
 
 async function fixture(run) {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-matrix-image-inbox-'));
@@ -136,7 +137,7 @@ test('only reference metadata is persisted; returned objects cannot mutate the i
     const text = await readFile(path, 'utf8');
     assert.doesNotMatch(text, /private-|private image|accessToken|"content"|"bytes"|"key"/);
     assert.deepEqual(Object.keys((await readDocument(path)).entries[0]).sort(),
-      ['consumed', 'eventId', 'name', 'roomId', 'senderId', 'threadId', 'ts']);
+      ['consumed', 'eventId', 'invalidated', 'name', 'roomId', 'senderId', 'threadId', 'ts']);
   });
 });
 
@@ -179,7 +180,7 @@ test('retention is global FIFO, including consumed entries, and duplicate replay
 
 test('default retention is 2000 globally and load durably trims a reduced limit', async () => {
   await fixture(async ({ path }) => {
-    const entries = Array.from({ length: 2001 }, (_, index) => persisted(image(`$${index}`)));
+    const entries = Array.from({ length: 2001 }, (_, index) => legacy(image(`$${index}`)));
     await writeFile(path, JSON.stringify({ version: 1, entries }), 'utf8');
     const store = await new MatrixImageInboxStore(path).load();
     assert.equal(store.pending(scope).length, 2000);
@@ -193,7 +194,7 @@ test('default retention is 2000 globally and load durably trims a reduced limit'
 
 test('malformed JSON, invalid schema, duplicate references and invalid metadata fail loudly without overwriting disk', async () => {
   await fixture(async ({ path }) => {
-    const valid = persisted(image('$one'));
+    const valid = legacy(image('$one'));
     const invalidDocuments = [
       '{broken JSON', 'null', '[]', '{}',
       JSON.stringify({ version: 2, entries: [] }),
@@ -301,7 +302,323 @@ test('invalid API inputs fail explicitly rather than widening scope or writing b
     assert.throws(() => store.pending({ ...scope, sinceTs: -1 }), /sinceTs/);
     await assert.rejects(store.markConsumed({ roomId: ROOM, eventIds: '$one' }), /eventIds/);
     await assert.rejects(store.markConsumed({ roomId: ROOM, eventIds: [null] }), /eventId/);
+    assert.throws(() => store.candidates({ roomId: ROOM }), /senderId/);
+    assert.throws(() => store.isInvalidated({ roomId: ROOM }), /eventId/);
+    await assert.rejects(store.invalidate({ eventId: '$one' }), /roomId/);
+    for (const tombstoneLimit of [0, -1, 1.5, Infinity, '2']) {
+      assert.throws(() => new MatrixImageInboxStore(path, { tombstoneLimit }), /tombstoneLimit/);
+    }
     assert.deepEqual(store.pending(scope), []);
     await store.flush();
+  });
+});
+
+test('v1 reads original fields without rewriting; first mutation backs up exact bytes and migrates', async () => {
+  await fixture(async ({ directory, path }) => {
+    const entries = [legacy(image('$first', { ts: 300 })), { ...legacy(image('$second')), consumed: true }];
+    const bytes = Buffer.from(`{ "version": 1, "entries": ${JSON.stringify(entries)} }\r\n`);
+    await writeFile(path, bytes);
+    const store = await new MatrixImageInboxStore(path).load();
+    assert.deepEqual(await readFile(path), bytes);
+    assert.deepEqual(await readdir(directory), ['inbox.json']);
+    assert.deepEqual(store.get(entries[0]), { ...entries[0], invalidated: false });
+    assert.deepEqual(store.get(entries[1]), { ...entries[1], invalidated: false });
+    await store.record(image('$first'));
+    await store.markConsumed({ roomId: ROOM, eventIds: ['$absent'] });
+    await store.barrier();
+    assert.deepEqual(await readFile(path), bytes, 'no-op writes do not migrate');
+    await store.invalidate(entries[0]);
+    assert.deepEqual(await readFile(`${path}.v1.bak`), bytes);
+    assert.deepEqual(await readDocument(path), {
+      version: 2,
+      entries: [{ ...entries[0], invalidated: true }, { ...entries[1], invalidated: false }],
+      tombstones: [],
+    });
+    const restarted = await new MatrixImageInboxStore(path).load();
+    assert.equal(restarted.isInvalidated(entries[0]), true);
+    assert.equal(restarted.get(entries[1]).consumed, true);
+    await restarted.record(image('$third'));
+    assert.deepEqual(await readFile(`${path}.v1.bak`), bytes, 'later v2 mutations leave backup intact');
+  });
+});
+
+test('migration accepts an identical existing backup but refuses different bytes or an unwritable backup', async () => {
+  await fixture(async ({ path }) => {
+    const bytes = JSON.stringify({ version: 1, entries: [legacy(image('$one'))] });
+    await writeFile(path, bytes);
+    await writeFile(`${path}.v1.bak`, 'do not overwrite');
+    const store = await new MatrixImageInboxStore(path).load();
+    await assert.rejects(store.invalidate({ roomId: ROOM, eventId: '$one' }), /backup differs/);
+    assert.equal(store.isInvalidated({ roomId: ROOM, eventId: '$one' }), false);
+    assert.equal(await readFile(path, 'utf8'), bytes);
+    assert.equal(await readFile(`${path}.v1.bak`, 'utf8'), 'do not overwrite');
+    await assert.rejects(store.barrier(), /backup differs/);
+    await rm(`${path}.v1.bak`);
+    await mkdir(`${path}.v1.bak`);
+    await assert.rejects(store.invalidate({ roomId: ROOM, eventId: '$one' }));
+    assert.equal(await readFile(path, 'utf8'), bytes);
+    await rm(`${path}.v1.bak`, { recursive: true });
+    await writeFile(`${path}.v1.bak`, bytes);
+    assert.equal(await store.invalidate({ roomId: ROOM, eventId: '$one' }), true);
+    await store.barrier();
+    assert.equal((await readDocument(path)).version, 2);
+    await assert.rejects(store.flush(), /backup differs/, 'legacy diagnostics retain original failure');
+    await store.flush();
+  });
+});
+
+test('failed first v2 atomic rename preserves exact legacy backup and retries migration without false invalidation', async () => {
+  await fixture(async ({ directory, path }) => {
+    const bytes = Buffer.from(`${JSON.stringify({ version: 1, entries: [legacy(image('$one'))] })}\r\n`);
+    await writeFile(path, bytes);
+    const store = await new MatrixImageInboxStore(path).load();
+    const original = join(directory, 'original.json');
+    await rename(path, original);
+    await mkdir(path);
+    const target = { roomId: ROOM, eventId: '$one' };
+    await assert.rejects(store.invalidate(target));
+    assert.equal(store.isInvalidated(target), false);
+    assert.deepEqual(await readFile(`${path}.v1.bak`), bytes);
+    assert.deepEqual(await readFile(original), bytes);
+    await assert.rejects(store.barrier());
+    await rm(path, { recursive: true });
+    await rename(original, path);
+    await store.invalidate(target);
+    await store.barrier();
+    assert.equal((await readDocument(path)).version, 2);
+    assert.deepEqual(await readFile(`${path}.v1.bak`), bytes);
+    assert.equal((await new MatrixImageInboxStore(path).load()).isInvalidated(target), true);
+  });
+});
+
+test('v2 schema is strict for document, entries and tombstones, including duplicates and future versions', async () => {
+  await fixture(async ({ path }) => {
+    const entry = persisted(image('$one'));
+    const tombstone = { roomId: ROOM, eventId: '$missing' };
+    const valid = { version: 2, entries: [entry], tombstones: [tombstone] };
+    const documents = [
+      { ...valid, version: 3 }, { ...valid, extra: false },
+      { version: 2, entries: [] }, { ...valid, tombstones: null },
+      { ...valid, entries: [legacy(image('$one'))] },
+      { ...valid, entries: [{ ...entry, invalidated: 'false' }] },
+      { ...valid, entries: [{ ...entry, invalidated: null }] },
+      { ...valid, entries: [{ ...entry, secret: 'no' }] },
+      { ...valid, entries: [entry, entry] },
+      { ...valid, tombstones: [tombstone, tombstone] },
+      ...[null, [], {}, { roomId: ROOM }, { ...tombstone, roomId: '' },
+        { ...tombstone, eventId: null }, { ...tombstone, ts: 100 }]
+        .map((value) => ({ ...valid, tombstones: [value] })),
+      { version: 1, entries: [entry] },
+    ];
+    for (const document of documents) {
+      const text = JSON.stringify(document);
+      await writeFile(path, text);
+      await assert.rejects(new MatrixImageInboxStore(path).load(), TypeError, text);
+      assert.equal(await readFile(path, 'utf8'), text);
+    }
+    await writeFile(path, JSON.stringify(valid));
+    const store = await new MatrixImageInboxStore(path).load();
+    assert.equal(store.isInvalidated(tombstone), true);
+    assert.equal(store.get(tombstone), null);
+  });
+});
+
+test('invalidation is durable, independent of consumption, idempotent and room scoped', async () => {
+  await fixture(async ({ path }) => {
+    const store = await new MatrixImageInboxStore(path).load();
+    const target = { roomId: ROOM, eventId: '$same' };
+    await store.record(image('$same'));
+    await store.record(image('$same', { roomId: '!other:example.org' }));
+    const invalidating = store.invalidate(target);
+    assert.equal(store.isInvalidated(target), false, 'uncommitted state stays invisible');
+    assert.equal(await invalidating, true);
+    const bytes = await readFile(path);
+    assert.equal(await store.invalidate(target), false);
+    assert.deepEqual(await readFile(path), bytes, 'duplicate is a disk no-op');
+    assert.equal(store.get(target).consumed, false);
+    assert.equal(store.isInvalidated({ ...target, roomId: '!other:example.org' }), false);
+    assert.deepEqual(ids(store.pending(scope)), []);
+    assert.deepEqual(ids(store.candidates(scope)), ['$same']);
+    assert.equal(await store.markConsumed({ roomId: ROOM, eventIds: ['$same'] }), 1);
+    assert.deepEqual(store.get(target), { ...persisted(image('$same')), consumed: true, invalidated: true });
+    assert.deepEqual(store.candidates(scope), []);
+    await store.record(image('$already-consumed'));
+    await store.markConsumed({ roomId: ROOM, eventIds: ['$already-consumed'] });
+    await store.invalidate({ roomId: ROOM, eventId: '$already-consumed' });
+    const restarted = await new MatrixImageInboxStore(path).load();
+    assert.equal(restarted.get(target).invalidated, true);
+    assert.equal(restarted.get(target).consumed, true);
+    assert.equal(restarted.get({ roomId: ROOM, eventId: '$already-consumed' }).invalidated, true);
+    assert.equal((await restarted.record(image('$same', { name: 'changed' }))).invalidated, true);
+  });
+});
+
+test('unknown redactions survive restart and image replay without leaking across rooms', async () => {
+  await fixture(async ({ path }) => {
+    const target = { roomId: ROOM, eventId: '$late' };
+    const store = await new MatrixImageInboxStore(path).load();
+    assert.equal(await store.invalidate(target), true);
+    assert.equal(store.isInvalidated(target), true);
+    assert.equal(store.get(target), null);
+    assert.deepEqual((await readDocument(path)).tombstones, [target]);
+    assert.equal(await store.invalidate(target), false);
+    const restarted = await new MatrixImageInboxStore(path).load();
+    const late = await restarted.record(image('$late'));
+    assert.equal(late.invalidated, true);
+    assert.equal(late.consumed, false);
+    await restarted.record(image('$late', { roomId: '!other:example.org' }));
+    assert.deepEqual(restarted.pending(scope), []);
+    assert.equal(restarted.pending({ ...scope, roomId: '!other:example.org' }).length, 1);
+    assert.deepEqual(ids(restarted.candidates(scope)), ['$late']);
+    const again = await new MatrixImageInboxStore(path).load();
+    assert.equal(again.isInvalidated(target), true);
+    assert.equal((await again.record(image('$late'))).invalidated, true);
+  });
+});
+
+test('entry and tombstone FIFO bounds are independent and tombstone eviction cannot revive retained entries', async () => {
+  await fixture(async ({ path }) => {
+    const store = await new MatrixImageInboxStore(path, { limit: 3, tombstoneLimit: 2 }).load();
+    const target = (eventId) => ({ roomId: ROOM, eventId });
+    await store.invalidate(target('$a'));
+    await store.record(image('$a'));
+    await store.record(image('$b'));
+    await store.invalidate(target('$b')); // Known entry: does not consume tombstone capacity.
+    await store.invalidate(target('$c'));
+    await store.invalidate(target('$a')); // Replay must not refresh FIFO.
+    await store.invalidate(target('$d'));
+    assert.deepEqual(ids((await readDocument(path)).tombstones), ['$c', '$d']);
+    assert.equal(store.isInvalidated(target('$a')), true);
+    assert.equal(store.isInvalidated(target('$b')), true);
+    await store.record(image('$e'));
+    await store.record(image('$f'));
+    assert.equal(store.get(target('$a')), null);
+    assert.equal(store.isInvalidated(target('$a')), false, 'expired identity is not retained forever');
+    assert.equal(store.isInvalidated(target('$c')), true, 'entry eviction does not evict tombstones');
+    const restarted = await new MatrixImageInboxStore(path, { limit: 3, tombstoneLimit: 1 }).load();
+    assert.deepEqual(ids((await readDocument(path)).tombstones), ['$d']);
+    assert.equal(restarted.isInvalidated(target('$b')), true, 'retained entry survives restart and tombstone trim');
+    assert.equal((await restarted.record(image('$d'))).invalidated, true);
+  });
+});
+
+test('default tombstone bound is independently 2000 and reduced bounds are durably trimmed', async () => {
+  await fixture(async ({ path }) => {
+    const tombstones = Array.from({ length: 2001 }, (_, index) => ({ roomId: ROOM, eventId: `$${index}` }));
+    await writeFile(path, JSON.stringify({ version: 2, entries: [persisted(image('$entry'))], tombstones }));
+    const store = await new MatrixImageInboxStore(path).load();
+    assert.equal(store.pending(scope).length, 1);
+    assert.equal(store.isInvalidated(tombstones[0]), false);
+    assert.equal((await readDocument(path)).tombstones.length, 2000);
+    await new MatrixImageInboxStore(path, { limit: 2 }).load();
+    assert.deepEqual(ids((await readDocument(path)).tombstones), ['$1999', '$2000']);
+    assert.equal((await readDocument(path)).entries.length, 1);
+  });
+});
+
+test('candidates distinguish absent, all-invalidated and all-consumed scopes with exact isolation and copies', async () => {
+  await fixture(async ({ path }) => {
+    const store = await new MatrixImageInboxStore(path).load();
+    assert.deepEqual(store.candidates(scope), []);
+    await store.record(image('$first', { ts: 200 }));
+    await store.record(image('$second', { ts: 100 }));
+    await store.record(image('$past', { ts: 99 }));
+    await store.record(image('$future', { ts: 201 }));
+    await store.record(image('$sender', { senderId: '@bob:example.org' }));
+    await store.record(image('$room', { roomId: '!other:example.org' }));
+    await store.record(image('$thread', { threadId: '$thread' }));
+    for (const eventId of ['$first', '$second', '$past', '$future', '$sender', '$room', '$thread']) {
+      await store.invalidate({ roomId: eventId === '$room' ? '!other:example.org' : ROOM, eventId });
+    }
+    const query = { ...scope, sinceTs: 100, beforeTs: 200 };
+    assert.deepEqual(ids(store.candidates(query)), ['$first', '$second']);
+    assert.deepEqual(store.pending(query), []);
+    store.candidates(query)[0].invalidated = false;
+    assert.equal(store.candidates(query).every((entry) => entry.invalidated), true);
+    assert.deepEqual(ids(store.candidates({ ...query, threadId: '$thread' })), ['$thread']);
+    await store.markConsumed({ roomId: ROOM, eventIds: ['$first', '$second'] });
+    assert.deepEqual(store.candidates(query), []);
+  });
+});
+
+test('failed invalidations block repeated barriers despite flush and unrelated success until exact retries repair all targets', async () => {
+  await fixture(async ({ directory, path }) => {
+    const store = await new MatrixImageInboxStore(path).load();
+    const a = { roomId: ROOM, eventId: '$a' };
+    const b = { roomId: ROOM, eventId: '$b' };
+    await store.record(image('$a'));
+    const backup = join(directory, 'committed.json');
+    const bytes = await readFile(path);
+    await rename(path, backup);
+    await mkdir(path);
+    await assert.rejects(store.invalidate(a));
+    await assert.rejects(store.invalidate(b));
+    assert.equal(store.isInvalidated(a), false);
+    assert.equal(store.isInvalidated(b), false);
+    assert.deepEqual(await readFile(backup), bytes);
+    assert.deepEqual((await readdir(directory)).sort(), ['committed.json', 'inbox.json']);
+    await assert.rejects(store.barrier());
+    await assert.rejects(store.barrier());
+    await assert.rejects(store.flush());
+    await store.flush();
+    await assert.rejects(store.barrier(), undefined, 'flush is not a safety acknowledgement');
+    const cancelled = new AbortController();
+    cancelled.abort();
+    await assert.rejects(store.invalidate(a, { signal: cancelled.signal }), { name: 'AbortError' });
+    await assert.rejects(store.barrier(), undefined, 'cancelled retry cannot repair an earlier failed invalidation');
+    await rm(path, { recursive: true });
+    await rename(backup, path);
+    await store.record(image('$unrelated'));
+    await assert.rejects(store.barrier(), undefined, 'other successful writes do not hide failed redactions');
+    await store.invalidate(a);
+    await assert.rejects(store.barrier(), undefined, 'repair of A cannot acknowledge B');
+    await store.invalidate(b);
+    await store.barrier();
+    const restarted = await new MatrixImageInboxStore(path).load();
+    assert.equal(restarted.isInvalidated(a), true);
+    assert.equal(restarted.isInvalidated(b), true);
+    assert.equal(restarted.get(a).consumed, false);
+    assert.deepEqual(ids(restarted.pending(scope)), ['$unrelated']);
+  });
+});
+
+test('barrier waits queued invalidations and concurrent consumption cannot resurrect references', async () => {
+  await fixture(async ({ path }) => {
+    const store = await new MatrixImageInboxStore(path).load();
+    const target = { roomId: ROOM, eventId: '$one' };
+    await store.record(image('$one'));
+    const invalidating = store.invalidate(target);
+    const consuming = store.markConsumed({ roomId: ROOM, eventIds: ['$one'] });
+    const duplicate = store.record(image('$one'));
+    const unknown = store.invalidate({ roomId: ROOM, eventId: '$late' });
+    const late = store.record(image('$late'));
+    const barrier = store.barrier();
+    assert.equal(store.isInvalidated(target), false);
+    await barrier;
+    await Promise.all([invalidating, consuming, duplicate, unknown, late]);
+    assert.equal(store.get(target).invalidated, true);
+    assert.equal(store.get(target).consumed, true);
+    assert.equal(store.get({ roomId: ROOM, eventId: '$late' }).invalidated, true);
+    const restarted = await new MatrixImageInboxStore(path).load();
+    assert.deepEqual(restarted.pending(scope), []);
+    assert.equal(restarted.get(target).consumed, true);
+  });
+});
+
+test('cancelled invalidations queued before execution do not persist state or poison the safety barrier', async () => {
+  await fixture(async ({ path }) => {
+    const store = await new MatrixImageInboxStore(path).load();
+    await store.record(image('$one'));
+    const bytes = await readFile(path);
+    const controller = new AbortController();
+    const invalidating = store.invalidate({ roomId: ROOM, eventId: '$one' }, { signal: controller.signal });
+    controller.abort();
+    await assert.rejects(invalidating, { name: 'AbortError' });
+    await store.barrier();
+    assert.equal(store.isInvalidated({ roomId: ROOM, eventId: '$one' }), false);
+    assert.deepEqual(await readFile(path), bytes);
+    await assert.rejects(store.flush(), { name: 'AbortError' });
+    assert.equal(await store.invalidate({ roomId: ROOM, eventId: '$one' }), true);
+    await store.barrier();
   });
 });

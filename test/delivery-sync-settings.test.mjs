@@ -20,6 +20,7 @@ import {
 import {
   createDeliverySyncRpcHandler,
   DELIVERY_SYNC_ENDPOINTS,
+  deliverySyncStore,
   validDeliverySyncPayload,
 } from '../plugin-src/host/delivery-sync-rpc.mjs';
 import { INBOUND_TTL_RPC_CHANNEL } from '../plugin-src/host/inbound-ttl-rpc.mjs';
@@ -218,3 +219,27 @@ test('the RPC reads, saves, and reports failures without leaking them', async (t
   assert.match(warnings[0], /private-disk-path/);
   assert.throws(() => createDeliverySyncRpcHandler({}), TypeError);
 });
+
+
+for (const mirrorUserInput of [false, true]) {
+  test(`answer-only RPC patch preserves existing mirror=${mirrorUserInput} and icons in the shared live store`, async (t) => {
+    const root = await home(t);
+    const config = { dshHome: root };
+    const store = deliverySyncStore(config);
+    const coordinatorStore = getDeliverySyncSettingsStore({ dshHome: join(root, '.') });
+    assert.equal(store, coordinatorStore, 'RPC and coordinator resolve the same home owner');
+    const original = { mirrorUserInput, deliverModelAnswers: false, inputIcon: '👤', modelIcon: '🤖' };
+    await store.set(original);
+    assert.deepEqual(await coordinatorStore.get(), original, 'warm the same live cache before the patch');
+    const handler = createDeliverySyncRpcHandler(store);
+    assert.deepEqual(await handler(DELIVERY_SYNC_ENDPOINTS.get, {}), { ok: true, value: original });
+    const expected = { ...original, deliverModelAnswers: true };
+    assert.deepEqual(await handler(DELIVERY_SYNC_ENDPOINTS.set, { deliverModelAnswers: true }), { ok: true, value: expected });
+    assert.deepEqual(await handler(DELIVERY_SYNC_ENDPOINTS.get, {}), { ok: true, value: expected });
+    assert.deepEqual(await coordinatorStore.get(), expected, 'already loaded coordinator sees the update without a restart');
+    const path = deliverySyncSettingsPath(config);
+    assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), { version: 1, deliverySync: expected });
+    await assertRestrictiveMode(path, 0o600);
+    assert.deepEqual(await new DeliverySyncSettingsStore(path).get(), expected);
+  });
+}

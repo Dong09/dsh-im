@@ -14,6 +14,7 @@ import { deliverOutboundArtifacts } from '../../src/channels/shared/semantic/art
 import { HarnessClient } from '../../src/channels/shared/harness-client.mjs';
 import { modernHarnessApi } from '../../plugin-src/host/modern-harness-api.mjs';
 import { installScheduleRelay } from '../../plugin-src/host/schedule-relay.mjs';
+import { installSessionSyncCoordinator } from '../../plugin-src/host/session-sync-coordinator.mjs';
 
 export const name = 'schedule-relay-real-host-fixture';
 export const inject = ['llm', 'agents', 'sessions', 'tools', 'systemPrompt', 'schedule', 'sessionController', 'connection'];
@@ -39,7 +40,7 @@ class ScriptedModel extends LlmAdapter {
     }
     assert.equal(state.toolResults.length, 1, 'the first tool call must settle before the final response');
     assert.notEqual(state.toolResults[0].isError, true, 'first return-file must succeed');
-    const text = 'The existing file is queued for delivery after this turn.';
+    const text = state.fixture.finalText;
     yield { type: 'block-start', index: 0, blockType: 'text' };
     yield { type: 'text-delta', index: 0, text };
     yield { type: 'block-end', index: 0, block: { type: 'text', text } };
@@ -60,7 +61,7 @@ export async function apply(ctx) {
   const fixture = JSON.parse(await readFile(fileURLToPath(new URL('./schedule-relay-sequence.json', import.meta.url)), 'utf8'));
   const scenario = fixture.cases.find(({ id }) => id === process.env.DSH_SCHEDULE_RELAY_CASE);
   assert.ok(scenario, 'known schedule relay fixture case is required');
-  const state = { scenario, trace: [], events: [], requests: [], claims: [], assemblies: [], toolResults: [], sends: [], snapshots: [], warnings: [], imageCalls: 0, agent: null };
+  const state = { fixture, scenario, trace: [], events: [], requests: [], claims: [], assemblies: [], toolResults: [], sends: [], scheduledParts: [], officialTextCalls: [], snapshots: [], warnings: [], imageCalls: 0, agent: null };
   const expectedTarget = targetFor(scenario);
   const authorization = Object.freeze({ fixture: scenario.id });
   const expectedBytes = scenario.mediaType.startsWith('image/') ? Buffer.from(fixture.imageBase64, 'base64') : Buffer.from(fixture.fileText);
@@ -94,9 +95,9 @@ export async function apply(ctx) {
     assert.equal(snapshot.liveAfter, false, 'the shared sender releases the consumed snapshot');
     return { ...result.receipt, deliveryOutcome: outcome };
   };
-  const recordText = (text) => {
-    state.trace.push({ kind: 'platform:text' });
-    state.sends.push({ kind: 'text', botId, target: expectedTarget, text, providerMessageIds: [scenario.textEventId] });
+  const recordText = (text, owner) => {
+    state.trace.push({ kind: 'platform:text', owner });
+    state.sends.push({ kind: 'text', owner, botId, target: expectedTarget, text, providerMessageIds: [scenario.textEventId] });
     return { deliveryOutcome: 'sent', providerMessageIds: [scenario.textEventId] };
   };
   const im = {
@@ -119,7 +120,9 @@ export async function apply(ctx) {
       assert.equal(id, botId);
       assert.deepEqual(target, expectedTarget);
       assert.equal(options.authorization, authorization);
-      return part.kind === 'text' ? recordText(part.text) : deliverArtifact(part.artifact);
+      assert.equal(part.kind, 'artifact', 'relay must never send final text');
+      state.scheduledParts.push({ kind: part.kind, artifactId: part.artifact.artifactId });
+      return deliverArtifact(part.artifact);
     },
   };
 
@@ -127,6 +130,27 @@ export async function apply(ctx) {
   assert.equal(installOutboundArtifactTool(ctx, { registry }), true);
   relay = await installScheduleRelay(ctx, im, { dshHome: process.env.DSH_HOME, registry,
     logger: { warn: (message) => state.warnings.push(message) } });
+  // Use the official event subscriber and IM-origin classifier, not a fixture
+  // turn/end sender. Only the external platform is replaced; text and artifacts
+  // intentionally have no shared completion barrier or ordering contract.
+  const sync = installSessionSyncCoordinator(ctx, {
+    async listSessionSyncTargets() { return []; },
+    async describeConversation(id) { assert.equal(id, sessionId); return { botId }; },
+    async listTargets(id) { assert.equal(id, botId); return { targets: [] }; },
+    async deliverSessionText(id, text, options) {
+      assert.equal(id, sessionId);
+      assert.equal(scenario.input, 'schedule', 'official sync must suppress direct IM answers');
+      const listed = await im.listConversationBindings(botId);
+      const binding = listed.bindings.find(candidate => candidate.sessionId === id);
+      assert.deepEqual(binding, { sessionId, ...expectedTarget });
+      state.officialTextCalls.push({ sessionId: id, text, options, target: expectedTarget });
+      recordText(text, 'official-session-sync');
+      return { sent: true, providerMessageIds: [scenario.textEventId] };
+    },
+  }, {
+    loadSettings: async () => ({ deliverModelAnswers: true, mirrorUserInput: true, modelIcon: '', inputIcon: '' }),
+    logger: { warn: message => state.warnings.push(message) },
+  });
   ctx.tools.register({ name: 'codex_image_generate', description: 'External generation sentinel; never needed for an existing file.',
     parameters: { type: 'object', properties: {} },
     output: { schema: { type: 'object', properties: {} }, render: () => [] },
@@ -190,9 +214,10 @@ export async function apply(ctx) {
         // never opens either a scheduled lease or an RPC consumer by hand.
         const client = new HarnessClient({ apiProxy: modernHarnessApi(ctx), interactionScope: ctx.root, workspace: process.cwd() });
         const answer = await client.ask(sessionId, `Return ${scenario.fileName}.`, { timeoutMs: 15_000, onArtifact: deliverArtifact });
-        recordText(answer);
+        recordText(answer, 'direct-im');
         await relay.whenIdle();
       }
+      await sync.whenIdle();
       await ctx.sessions.flush(handle.agent.session);
       state.originalAfterBase64 = (await readFile(join(process.cwd(), scenario.fileName))).toString('base64');
       state.workspaceFiles = (await readdir(process.cwd())).filter((name) => !name.startsWith('.')).sort();

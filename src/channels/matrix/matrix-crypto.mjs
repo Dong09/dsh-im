@@ -779,6 +779,7 @@ export class MatrixCryptoEngine {
       return null;
     }
     return {
+      type: cleanText(payload.type) ?? 'm.room.message',
       content: content2,
       senderKey,
       sessionId,

@@ -138,6 +138,76 @@ test('state reads fold missing rooms to null and member counts count the joined 
   deepStrictEqual(await broken.listRelations('!room:example.org', '$evt', 'm.reaction'), { events: [] });
 });
 
+test('strict event lookup returns available and null payloads without inferring deletion', async () => {
+  const event = { event_id: '$image:example.org', type: 'm.room.message', content: { msgtype: 'm.image' } };
+  const { api, calls } = apiWith(() => jsonResponse(event));
+  deepStrictEqual(await api.getEventStrict('!room:example.org', '$image:example.org'), event);
+  deepStrictEqual(await api.getEvent('!room:example.org', '$image:example.org'), event);
+  match(calls[0].url, /\/rooms\/!room%3Aexample\.org\/event\/%24image%3Aexample\.org$/u);
+  const { api: empty } = apiWith(() => jsonResponse(null));
+  deepStrictEqual(await empty.getEventStrict('!room:example.org', '$image'), null);
+  await rejects(() => api.getEventStrict('invalid', '$image'), TypeError);
+  await rejects(() => api.getEventStrict('!room:example.org', 'invalid'), TypeError);
+  await rejects(() => api.getEvent('invalid', '$image'), TypeError);
+});
+
+for (const [status, providerCode, code] of [
+  [403, 'M_FORBIDDEN', 'matrix-forbidden'],
+  [404, 'M_NOT_FOUND', 'matrix-not-found'],
+  [500, 'M_UNKNOWN', 'matrix-service'],
+  [503, 'M_UNAVAILABLE', 'matrix-service'],
+]) {
+  test(`strict event lookup preserves HTTP ${status} while context lookup returns null`, async () => {
+    const { api } = apiWith(() => jsonResponse({ errcode: providerCode, error: 'fixture' }, status));
+    await rejects(() => api.getEventStrict('!room:example.org', '$image'), (error) => {
+      ok(error instanceof MatrixApiError);
+      deepStrictEqual([error.status, error.providerCode, error.code], [status, providerCode, code]);
+      return true;
+    });
+    deepStrictEqual(await api.getEvent('!room:example.org', '$image'), null);
+  });
+}
+
+for (const cause of [new TypeError('offline'), new DOMException('deadline', 'TimeoutError')]) {
+  test(`strict event lookup preserves ${cause.name} request failure`, async () => {
+    const { api } = apiWith(() => { throw cause; });
+    await rejects(() => api.getEventStrict('!room:example.org', '$image'), (error) => error === cause);
+    deepStrictEqual(await api.getEvent('!room:example.org', '$image'), null);
+  });
+}
+
+test('strict event lookup forwards cancellation and preserves the exact abort reason', async () => {
+  const controller = new AbortController();
+  const reason = new Error('cancel this generation');
+  const { api, calls } = apiWith(({ signal }) => new Promise((resolve, reject) => {
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    controller.abort(reason);
+  }));
+  await rejects(() => api.getEventStrict('!room:example.org', '$image', { signal: controller.signal }),
+    (error) => error === reason);
+  ok(calls[0].signal instanceof AbortSignal && calls[0].signal.aborted);
+  deepStrictEqual(calls[0].signal.reason, reason);
+  deepStrictEqual(await api.getEvent('!room:example.org', '$image', { signal: controller.signal }), null);
+  deepStrictEqual(calls.length, 1, 'pre-aborted requests do not contact fetch');
+});
+
+test('strict event lookup retains the bounded request timeout signal', async (context) => {
+  // Exercise requestSignal without waiting for the production ten-second limit.
+  const deadline = new AbortController();
+  const reason = new DOMException('fixture deadline', 'TimeoutError');
+  const timeouts = [];
+  context.mock.method(AbortSignal, 'timeout', (milliseconds) => {
+    timeouts.push(milliseconds);
+    return deadline.signal;
+  });
+  const { api } = apiWith(({ signal }) => new Promise((resolve, reject) => {
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    deadline.abort(reason);
+  }));
+  await rejects(() => api.getEventStrict('!room:example.org', '$image'), (error) => error === reason);
+  deepStrictEqual(timeouts, [10_000]);
+});
+
 test('media uploads post raw bytes and must answer with a content URI', async () => {
   const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
   const { api, calls } = apiWith(() => jsonResponse({ content_uri: 'mxc://media.example.org/UP1' }));

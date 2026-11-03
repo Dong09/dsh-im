@@ -69,6 +69,8 @@ Host 主动投递与建议支持 v12 实际房间 ID、旧式房间 ID 和合法
 
 [定时附件所有权与逐部分防重](2026-10-29-matrix-scheduled-artifact-delivery.md)复用本文的单一回退、未知结果与排空规则，增加非 RPC lease、内部桥与独立 checkpoint；不替换本文决定。本次没有旧决策被完全取代，不归档或删除既有记录。
 
+[图片引用撤回失效](2026-11-02-matrix-image-reference-invalidation.md)补充入站图片引用的可用性与提交前复查，不替换本文的媒体回退、代际和关闭排空决定。
+
 ## Alternatives considered
 
 1. **直接迁移完整 Matrix SDK。** 有机会将同步、协议和加密维护交给上游，但也涉及 Node 持久化、设备身份、事件模型及打包兼容。本批先稳定已有路径，SDK 研究继续保留，不把未验证的迁移当作已解决 E2EE。

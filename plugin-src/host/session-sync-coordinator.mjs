@@ -11,7 +11,6 @@ import {
 } from '../../src/channels/shared/delivery-sync-settings.mjs';
 import { getDeliverySyncSettingsStore } from '../../src/channels/shared/delivery-sync-settings-store.mjs';
 import { deliverSessionSyncMirror } from '../../src/channels/shared/session-sync-registry.mjs';
-import { matchesScheduledDestination } from './delivery-adapter.mjs';
 
 /**
  * Where the turn came from, as far as a chat mirror is concerned.
@@ -84,7 +83,6 @@ export function createSessionSyncCoordinator({
   deliveryService,
   logger = console,
   loadSettings = null,
-  resolveAnswerDestination = null,
 } = {}) {
   if (typeof deliveryService?.deliverSessionText !== 'function') {
     throw new TypeError('Session sync requires a delivery service that can follow a Session binding');
@@ -154,26 +152,10 @@ export function createSessionSyncCoordinator({
   };
 
   // Saved sync targets and DS Bot bindings share the same card receipt path.
-  const deliverToTargets = async (sessionId, targets, text, phase, format, { turn = null, cardText = null, excludedDestination = null } = {}) => {
+  const deliverToTargets = async (sessionId, targets, text, phase, format, { turn = null, cardText = null } = {}) => {
     if (!Array.isArray(targets) || targets.length === 0) {
       logUndelivered(sessionId, phase, 'no-sync-targets');
       return false;
-    }
-    if (excludedDestination) {
-      const owned = await Promise.all(targets.map(async (target) => {
-        if (target.channel !== 'matrix' || target.botId !== excludedDestination.botId) return false;
-        try {
-          const listed = await deliveryService.listTargets(target.botId);
-          const actual = listed.targets.find((entry) => entry.targetId === target.targetId);
-          return matchesScheduledDestination(target.botId, actual, excludedDestination);
-        } catch (error) {
-          // An unresolved same-bot route cannot safely be retried by a second sender.
-          logFailure('relay target lookup', error);
-          return true;
-        }
-      }));
-      targets = targets.filter((_target, index) => !owned[index]);
-      if (targets.length === 0) return true;
     }
     // Only the final answer has a card renderer; a mirrored user message has no
     // receipt to wait for, so it keeps its text path untouched.
@@ -187,8 +169,7 @@ export function createSessionSyncCoordinator({
         target.botId, target.targetId, sessionId, text,
         // Feishu renders its own card; preserve its plain fallback instead of
         // attempting another rich card.
-        { format: target.channel === 'feishu' ? 'plain' : format,
-          ...(excludedDestination ? { excludedDestination } : {}) },
+        { format: target.channel === 'feishu' ? 'plain' : format },
       )
     )));
     results.forEach((result, index) => {
@@ -201,12 +182,11 @@ export function createSessionSyncCoordinator({
   };
 
   // New path: no targets configured, so the address comes from the Session binding.
-  const deliverToBinding = async (sessionId, text, phase, format, excludedDestination = null) => {
-    const attempt = (value) => deliveryService.deliverSessionText(sessionId, text, { format: value,
-      ...(excludedDestination ? { excludedDestination } : {}) });
+  const deliverToBinding = async (sessionId, text, phase, format) => {
+    const attempt = (value) => deliveryService.deliverSessionText(sessionId, text, { format: value });
     try {
       const result = await attempt(format);
-      if (result?.sent === true || result?.reason === 'externally-owned') return true;
+      if (result?.sent === true) return true;
       logUndelivered(sessionId, phase, result?.reason);
       return false;
     } catch (error) {
@@ -220,7 +200,7 @@ export function createSessionSyncCoordinator({
       }
       try {
         const fallback = await attempt('plain');
-        if (fallback?.sent === true || fallback?.reason === 'externally-owned') return true;
+        if (fallback?.sent === true) return true;
         logUndelivered(sessionId, `${phase} (plain fallback)`, fallback?.reason);
         return false;
       } catch (fallbackError) {
@@ -233,11 +213,11 @@ export function createSessionSyncCoordinator({
   const deliver = async (sessionId, text, phase, format = 'plain', card = null) => {
     // DS Bot bindings can supply sync targets without any saved delivery target,
     // including after rollover when the persisted Session map is still stale.
-    const targets = await deliveryService.listSessionSyncTargets?.(sessionId) ?? [];
+    const targets = await deliveryService.listSessionSyncTargets?.(sessionId, { privateOnly: false }) ?? [];
     if (targets.length > 0 || await botHasSavedTargets(sessionId)) {
       return deliverToTargets(sessionId, targets, text, phase, format, card ?? {});
     }
-    return deliverToBinding(sessionId, text, phase, format, card?.excludedDestination);
+    return deliverToBinding(sessionId, text, phase, format);
   };
 
   const onUserMessage = async (sessionId, state, event, originHint) => {
@@ -286,9 +266,6 @@ export function createSessionSyncCoordinator({
     if (state.echoFailed) return;
     const text = state.assistant.text;
     if (!text) return;
-    // Consult accepted relay ownership after the synchronous event observers have
-    // run. A failed/unknown native send is still owned; mirroring is not a retry.
-    const excludedDestination = await resolveAnswerDestination?.(sessionId, state.turn, event) ?? null;
     // The card carries the answer itself, so it gets the text without the icon
     // label that marks a delivered message.
     await deliver(
@@ -296,7 +273,7 @@ export function createSessionSyncCoordinator({
       withDeliverySyncIcon(settings.modelIcon, text),
       'assistant delivery',
       'markdown',
-      { turn: state.turn, cardText: text, excludedDestination },
+      { turn: state.turn, cardText: text },
     );
   };
 
@@ -389,7 +366,6 @@ export function installSessionSyncCoordinator(ctx, deliveryService, {
   inputScope = ctx?.root ?? ctx,
   loadSettings = null,
   imInputOwnership = isImOwnedInput,
-  resolveAnswerDestination = null,
   config = {},
 } = {}) {
   if (typeof ctx?.on !== 'function') {
@@ -402,7 +378,6 @@ export function installSessionSyncCoordinator(ctx, deliveryService, {
     deliveryService,
     logger,
     loadSettings: readSettings,
-    resolveAnswerDestination,
   });
   const disposeEvent = ctx.on('session/event', (session, event) => {
     const sessionId = sessionIdOf(session);

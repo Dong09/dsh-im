@@ -9,7 +9,7 @@ import { createDeliveryService } from '../plugin-src/host/delivery-service.mjs';
 import { createDeliveryAdapter } from '../plugin-src/host/delivery-adapter.mjs';
 import { installProductionChannel } from '../plugin-src/host/channels/shared/startup.mjs';
 import { installScheduleRelay } from '../plugin-src/host/schedule-relay.mjs';
-import { OutboundArtifactRegistry, isManagedOutboundArtifact } from '../src/channels/shared/semantic/artifact.mjs';
+import { OutboundArtifactRegistry, isManagedOutboundArtifact, outboundArtifactRegistry } from '../src/channels/shared/semantic/artifact.mjs';
 
 const channelNames = ['Feishu', 'Weixin', 'Dingtalk', 'Wecom', 'WecomApp', 'Qq', 'Slack', 'Telegram', 'Discord', 'Whatsapp', 'IMessage', 'Email', 'Matrix', 'Office'];
 function internals(service) {
@@ -26,8 +26,8 @@ function internals(service) {
   };
 }
 
-async function emitTurn(ctx, turn, text, sessionId = 'one') {
-  const session = { id: sessionId };
+async function emitTurn(ctx, turn, text, root, sessionId = 'one') {
+  const session = { id: sessionId, header: { id: sessionId, cwd: root } };
   ctx.emit('session/event', session, { type: 'turn/start', data: { turn } });
   const messages = [
     { id: `${sessionId}:${turn}:schedule`, source: { kind: 'schedule' } },
@@ -38,6 +38,11 @@ async function emitTurn(ctx, turn, text, sessionId = 'one') {
   const decision = { kind: 'enter' };
   assert.equal(await ctx.waterfall('agent/pre-step', { agent: { session }, turn, signal: new AbortController().signal }, async () => decision), decision);
   for (const message of messages) ctx.emit('session/event', session, { type: 'user/message', surfaceOp: 'append', data: message });
+  if (outboundArtifactRegistry.hasActiveConsumer(session)) {
+    await writeFile(join(root, `${sessionId}.png`), text);
+    const artifact = await outboundArtifactRegistry.stage({ path: `${sessionId}.png` }, { agent: { session }, callId: `file:${turn}` });
+    assert.ok(outboundArtifactRegistry.commit(artifact));
+  }
   ctx.emit('session/event', session, { type: 'assistant/message', surfaceOp: 'append', data: { turn, message: { content: [{ type: 'text', text }] } } });
   ctx.emit('session/event', session, { type: 'turn/end', data: { turn, reason: 'completed' } });
 }
@@ -97,8 +102,8 @@ test('a second bot with a v12 room never disables legacy-room scheduled replies'
     channel: 'matrix', workspaces: { has: (id) => routes.has(id), listBotIds: () => [...routes.keys()] },
     stateFor: async (id) => ({ snapshot: () => ({ sessions: { [`group:room:${routes.get(id).roomId}`]: routes.get(id).sessionId } }) }),
     coreController: { describeDeliveryAccount: account, async sendScheduledPart(botId, target, part) {
-      assert.equal(part.kind, 'text');
-      delivered.push({ botId, roomId: target.route.roomId, text: part.text });
+      assert.equal(part.kind, 'artifact');
+      delivered.push({ botId, roomId: target.route.roomId, fileName: part.artifact.fileName });
       if (delivered.length === 2) sent.resolve();
       return receipt(`$sent${delivered.length}`);
     } },
@@ -107,13 +112,13 @@ test('a second bot with a v12 room never disables legacy-room scheduled replies'
   await host.await();
   const state = JSON.parse(await readFile(join(root, 'integrations', 'dsh-matrix', 'schedule-replies.json'), 'utf8'));
   assert.equal(state.sessions.length, 2);
-  await emitTurn(ctx, 1, 'legacy reminder', 'one');
-  await emitTurn(ctx, 1, 'v12 reminder', 'two');
+  await emitTurn(ctx, 1, 'legacy reminder', root, 'one');
+  await emitTurn(ctx, 1, 'v12 reminder', root, 'two');
   await sent.promise;
   await host.dispose();
   assert.deepEqual(delivered.sort((a, b) => a.botId.localeCompare(b.botId)), [
-    { botId: 'matrix_one', roomId: routes.get('matrix_one').roomId, text: 'legacy reminder' },
-    { botId: 'matrix_two', roomId: routes.get('matrix_two').roomId, text: 'v12 reminder' },
+    { botId: 'matrix_one', roomId: routes.get('matrix_one').roomId, fileName: 'one.png' },
+    { botId: 'matrix_two', roomId: routes.get('matrix_two').roomId, fileName: 'two.png' },
   ]);
 });
 
@@ -167,7 +172,7 @@ test('Matrix channel shutdown drains accepted replies before withdrawing its ada
   });
   const host = ctx.plugin(createImHostPlugin(options), { dshHome: root });
   await host.await();
-  await emitTurn(ctx, 1, 'must finish before Matrix shutdown');
+  await emitTurn(ctx, 1, 'must finish before Matrix shutdown', root);
   await entered.promise;
   const closing = host.dispose();
   try {
@@ -200,12 +205,13 @@ test('the actual dsh-im Host replies without a second plugin and drains the repl
     workspaces: { has: (id) => id === 'matrix_one', listBotIds: () => ['matrix_one'] },
     stateFor: async () => ({ snapshot: () => ({ sessions: { 'group:room:!one:example.org': 'one' } }) }),
     coreController: { describeDeliveryAccount: account, async sendScheduledPart(botId, target, part) {
-      entered.resolve(); await release.promise; sends.push({ botId, target, text: part.text }); return receipt();
+      assert.equal(part.kind, 'artifact');
+      entered.resolve(); await release.promise; sends.push({ botId, target, fileName: part.artifact.fileName }); return receipt();
     } },
   }));
   const host = ctx.plugin(createImHostPlugin(internals(im)), { dshHome: root });
   await host.await();
-  await emitTurn(ctx, 1, 'built-in reminder reply');
+  await emitTurn(ctx, 1, 'built-in reminder reply', root);
   await entered.promise;
   let disposed = false;
   const closing = host.dispose().then(() => { disposed = true; });
@@ -214,11 +220,11 @@ test('the actual dsh-im Host replies without a second plugin and drains the repl
   release.resolve();
   await closing;
   assert.equal(sends.length, 1);
-  assert.equal(sends[0].text, 'built-in reminder reply');
+  assert.equal(sends[0].fileName, 'one.png');
   assert.equal(sends[0].target.route.roomId, '!one:example.org');
   const path = join(root, 'integrations', 'dsh-matrix', 'schedule-replies.json');
   const before = await readFile(path, 'utf8');
-  await emitTurn(ctx, 2, 'must not send after unload');
+  await emitTurn(ctx, 2, 'must not send after unload', root);
   assert.equal(await readFile(path, 'utf8'), before);
   assert.equal(sends.length, 1);
 });
@@ -265,7 +271,8 @@ test('Host synchronous claims and awaited pre-step authorize next turn while pre
   const entered = Promise.withResolvers(), release = Promise.withResolvers();
   t.after(() => release.resolve());
   const f = await installedRelayFixture(t, { send: async (_bot, _target, part) => {
-    if (part.kind === 'text') { entered.resolve(); await release.promise; return receipt('$first-text'); }
+    assert.equal(part.kind, 'artifact');
+    if (part.artifact.origin.turn === 1) { entered.resolve(); await release.promise; }
     return { ...receipt(`$image${part.artifact.origin.turn}`), artifacts: [{ artifactId: part.artifact.artifactId, outcome: 'sent' }] };
   } });
   await f.begin(1);
@@ -281,7 +288,7 @@ test('Host synchronous claims and awaited pre-step authorize next turn while pre
   f.finish(2, '');
   release.resolve();
   await f.relay.whenIdle();
-  assert.deepEqual(f.calls.map((call) => call[2].kind === 'text' ? call[2].text : call[2].artifact), ['answer', first, second]);
+  assert.deepEqual(f.calls.map((call) => call[2].artifact), [first, second]);
   assert.equal(isManagedOutboundArtifact(first), false);
   assert.equal(isManagedOutboundArtifact(second), false);
 });
@@ -302,14 +309,15 @@ for (const change of ['delete-account', 'replace-account', 'withdraw-adapter']) 
   f = await installedRelayFixture(t, {
     describeAccount: (botId) => ({ ...account(botId), account: { fingerprint } }),
     send: async (_bot, _target, part) => {
-      assert.equal(part.kind, 'text');
+      assert.equal(part.kind, 'artifact');
       if (change === 'delete-account') f.removeAccount();
       if (change === 'replace-account') fingerprint = 'b'.repeat(64);
       if (change === 'withdraw-adapter') f.unregister();
-      return receipt('$text-before-change');
+      return { ...receipt('$artifact-before-change'), artifacts: [{ artifactId: part.artifact.artifactId, outcome: 'sent' }] };
     },
   });
   await f.begin();
+  await f.stage('first.png');
   const artifact = await f.stage('must-not-retarget.png');
   f.finish();
   await f.relay.whenIdle();

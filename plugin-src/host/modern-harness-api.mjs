@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { activeHarnessInteractionOwner, clearModelCatalogCache, hasActiveHarnessInteractionOwner, harnessToolCallFromEvent, HarnessInteractionError } from '../../src/channels/shared/harness-client.mjs';
 import { extractConnectionEvidence } from '../../src/channels/shared/connection-error.mjs';
 import { harnessPeer } from './harness-peer.mjs';
+import { traceAbortedPeerCall } from './peer-lifecycle-trace.mjs';
 import { sameWorkspacePath } from '../../src/channels/shared/default-workspace.mjs';
 import { sharedHostResource } from './shared-host-resource.mjs';
 
@@ -326,11 +327,13 @@ class ModernHarnessApi {
 
   async #invoke(namespace, method, args, signal) {
     this.#assertActive();
+    traceAbortedPeerCall(this.#peer, namespace, method);
     return this.#gateway.invoke(remoteRequest(namespace, method, args, signal, this.#peer));
   }
 
   async #streamFirst(namespace, method, args, signal) {
     this.#assertActive();
+    traceAbortedPeerCall(this.#peer, namespace, method);
     const controller = new AbortController();
     const streamSignal = signal
       ? AbortSignal.any([signal, controller.signal])

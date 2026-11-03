@@ -2,6 +2,10 @@
 
 提案、开发与实施由 [composite 项目](../../../)及其专用会话管理。父级 `.pr-scratch` 会话用于跨项目讨论、工作树比较与统筹安排，原则上不直接实施子项目；本提案不扩展到其他同级项目。
 
+## 后继契约
+
+[官方文字与独立附件简化变更](../simplify-matrix-scheduled-attachments/proposal.md)部分替代本变更：自研不再发送最终文字、不再创建文字 part，删除双文字排除桥；文字与附件独立，不保证文字先发。附件授权、安全、旧路由、兼容和防重仍保留。本文是历史规划，不得将旧文字共队列要求原样归档或同步为现行主规范；归档／同步前须按[后继规范](../simplify-matrix-scheduled-attachments/specs/matrix-scheduled-delivery/spec.md)协调。
+
 ## Why
 
 2026-10-29 的实际 Matrix 会话中，定时任务按时触发并调用 `dsh_im_return_file`，却因该回合没有 IM delivery consumer 而注册失败，随后只能通过 `present` 在 Web 展示；直接 IM 请求则能登记同类附件。当前定时回群只发送最终文字，且把 Host 自动 `time-context` 快照误当成用户插话，附件缺失与文字误拦需要一起修复。

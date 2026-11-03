@@ -91,8 +91,10 @@ function readAttempt(value, version, sessionId) {
 }
 
 /**
- * Atomic v2 routes and immutable attempt manifests. v1 is read without replay,
- * backed up byte-for-byte before the first v2 commit. Snapshots are never restored.
+ * Atomic v2 routes and immutable attachment-only new attempt manifests.
+ * Historical v1/v2 text and mixed attempts remain readable without replay;
+ * New attempt status describes attachments only, never official answer delivery.
+ * v1 is backed up byte-for-byte before the first v2 commit. Snapshots are never restored.
  * A rejected write does not publish its candidate records to readers.
  */
 export class RelayStore {
@@ -179,9 +181,12 @@ export class RelayStore {
     });
   }
 
-  /** Persist the entire intent before any provider side effect; high water never decreases. */
-  attempt(sessionId, turn, manifest = [{ id: 'text', kind: 'text' }], { expectedDestination } = {}) {
+  /** Persist explicit nonempty attachment intent before side effects; high water never decreases. */
+  attempt(sessionId, turn, manifest, { expectedDestination } = {}) {
     if (!Number.isSafeInteger(turn) || turn < 0) return Promise.reject(failure('invalid-turn'));
+    if (!Array.isArray(manifest) || !manifest.length || Array.from(manifest).some((part) => part?.kind !== 'artifact')) {
+      return Promise.reject(failure('invalid-part-manifest'));
+    }
     const parts = manifest.map(manifestPart);
     if (!parts.length || new Set(parts.map((part) => part.id)).size !== parts.length) return Promise.reject(failure('invalid-part-manifest'));
     return this.#change((records) => {
@@ -234,17 +239,6 @@ export class RelayStore {
       for (const part of attempt.parts) if (part.status === 'pending') Object.assign(part, { status: 'skipped', error });
       attempt.status = aggregateRelayParts(attempt.parts);
       return { changed: true, value: attempt };
-    });
-  }
-
-  /** Legacy text-only callers cannot overwrite an unrelated newer attempt. */
-  finish(sessionId, turn, status, error) {
-    if (!['sent', 'failed', 'unknown'].includes(status) || (error !== undefined && !safeError(error))) return Promise.reject(failure('invalid-delivery-status'));
-    return this.#change((records) => {
-      const record = records.get(sessionId);
-      if (record?.lastAttempt?.turn !== turn || !record.lastAttempt.legacy) throw failure('delivery-checkpoint-changed');
-      Object.assign(record.lastAttempt, { status, ...(error ? { error } : {}) });
-      return { changed: true, value: record };
     });
   }
 

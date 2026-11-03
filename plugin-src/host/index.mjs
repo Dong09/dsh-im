@@ -113,13 +113,13 @@ export function createImHostPlugin(internals = {}) {
       // A settings read failure must not disable delivery, so it falls through.
       if (typeof deliveryService.listSessionSyncTargets === 'function') {
         const rawListSessionSyncTargets = deliveryService.listSessionSyncTargets.bind(deliveryService);
-        deliveryService.listSessionSyncTargets = async (sessionId) => {
+        deliveryService.listSessionSyncTargets = async (sessionId, options) => {
           try {
             if (deliverySwitchesOff(await getDeliverySyncSettingsStore(config).get())) return [];
           } catch {
             // keep the unwrapped behaviour
           }
-          return rawListSessionSyncTargets(sessionId);
+          return rawListSessionSyncTargets(sessionId, options);
         };
       }
       /** Sessions already reported, so the log stays one line per session. */
@@ -272,10 +272,6 @@ export function createImHostPlugin(internals = {}) {
           logger,
           inputScope: ctx.root ?? ctx,
           config,
-          resolveAnswerDestination: async (sessionId, turn, event) => {
-            const relay = await scheduleRelayReady.catch(() => null);
-            return relay?.deliveryDestinationFor?.(sessionId, turn, event) ?? null;
-          },
         });
         installDsBotQuestionSync(ctx, deliveryService, { logger });
       } catch (error) {

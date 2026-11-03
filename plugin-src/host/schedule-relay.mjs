@@ -3,7 +3,7 @@ import { join, resolve } from 'node:path';
 import { RelayStore } from './schedule-relay-store.mjs';
 import { createScheduleRelay } from './schedule-relay-coordinator.mjs';
 
-/** Install Matrix scheduled replies as part of the dsh-im Host lifecycle. */
+/** Install scheduled Matrix attachments; official Session sync owns final text independently. */
 export async function installScheduleRelay(ctx, deliveryService, { dshHome, sendTimeoutMs = 60_000, logger = console, registry } = {}) {
   if (!Number.isSafeInteger(sendTimeoutMs) || sendTimeoutMs < 1 || sendTimeoutMs > 2_147_483_647) {
     throw new Error('scheduleReplyTimeoutMs must be an integer between 1 and 2147483647');

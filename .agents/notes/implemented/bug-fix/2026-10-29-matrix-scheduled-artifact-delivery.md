@@ -18,6 +18,8 @@ v2 状态先落完整意图，再逐项落 sending，发送器返回后才落终
 
 关闭先撤 hooks 和 admission、撤自己的 lease、取消尚未开始的工作，再等待已接受发送与 checkpoint 收尾，最后撤 adapter/runtime/store。abort 不代表远端撤回，已有可信成功回执保留；未确认结果不盲目补发。不调用全局 registry.clear。
 
+后继关系：[官方独占最终文字、定时路径只交付附件](../simplification/2026-11-02-matrix-scheduled-attachments-only.md)部分替代本文的自研文字发送及跨发送器排除桥。本文保留当时决定与验证；附件所有权、逐部分防重及生命周期约束继续适用，现行文字职责以该后继记录为准。
+
 ## 与通用会话文字同步共存
 
 官方的非 IM 回合文字同步也能处理 schedule，因此不能把默认关闭当成防重保证。[Relay](../../../../plugin-src/host/schedule-relay-coordinator.mjs)只在完成事件确实接管一个已授权 job 时，用该 `turn/end` 原对象作为 WeakMap 键记下冻结目的地；它不是发送成功回执，不依据可伪造的 schedule 元数据，也不要求发送结束后仍保有 lease。记录随事件对象回收，不建立无限回合历史表。
@@ -41,6 +43,8 @@ Matrix 定时开关与通用文字同步开关保持独立，不改配置和落�
 ## 与既有记录的关系
 
 创建本文前检索所有活跃 proposed/implemented/rejected 笔记及相关 ADR：[共享 Harness 生命周期](2026-10-29-shared-harness-consumer-lifetime.md)部分重叠，继续保留其共享资源持有纪律；[Matrix 非加密主线](2026-10-27-matrix-non-e2ee-mainline.md)部分重叠，继续保留单一回退、加密拒绝、未知结果与真实排空规则；[生命周期简化提案](../../proposed/simplification/2026-10-28-matrix-lifecycle-ablation.md)不在本次范围，不实施或改变其状态；[统一语义核心 ADR](../../../../docs/adr/0001-semantic-core-native-channel-adapters.md)保持现有约束。没有旧笔记被完全吸收、替换、拒绝或归档。
+
+[图片引用撤回失效](2026-11-02-matrix-image-reference-invalidation.md)处理入站图片，不撤销已提交回合的出站 owner；图片引用库与本文定时发送状态独立迁移和回滚，现行文字职责仍以后继简化记录为准。
 
 ## Alternatives considered
 

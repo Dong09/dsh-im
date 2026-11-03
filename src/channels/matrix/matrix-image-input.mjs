@@ -17,6 +17,18 @@ export function matrixImageFailure(name, stage, cause) {
     `Matrix image ${stage} failed`, userMessage, { cause });
 }
 
+/** Only confirmed redactions are permanent; these safe messages contain no event identifiers. */
+export function matrixImageReferenceFailure(reason, cause) {
+  const userMessage = reason === 'redacted'
+    ? t('引用的图片已撤回，本次未提交图片分析。请回复新图片并重新 @，或重新发送有效图片。')
+    : reason === 'empty'
+      ? t('待分析图片均已撤回，本次未提交图片分析。请重新发送有效图片，或回复新图片并 @。')
+      : reason === 'storage'
+        ? t('图片引用失效状态保存失败，本次未提交图片分析。请检查本地存储后重试。')
+        : t('暂时无法读取图片引用，本次未提交图片分析。请稍后重试，或明确回复新图片并 @。');
+  return new ImagePromptError(`image-reference-${reason}`, `Matrix image reference ${reason}`, userMessage, { cause });
+}
+
 function decryptImage(data, file) {
   if (file?.v !== 'v2' || file?.key?.kty !== 'oct' || file?.key?.alg !== 'A256CTR'
     || typeof file.key.k !== 'string' || typeof file.iv !== 'string'

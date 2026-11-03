@@ -1,4 +1,5 @@
 import { sharedHostResource } from './shared-host-resource.mjs';
+import { peerLifecycleObserver } from './peer-lifecycle-trace.mjs';
 
 const peers = new WeakMap();
 
@@ -13,5 +14,6 @@ export function harnessPeer(ctx) {
     create: () => connection.createPeer({ principal: { kind: 'owner' }, interactions: 'none' }),
     dispose: (peer) => peer.dispose(),
     label: 'dsh-im: shared Harness caller',
+    observe: peerLifecycleObserver(),
   });
 }

@@ -1,5 +1,15 @@
 // English translations (matrix area). Keys are exact Chinese literals passed to t().
 export default {
+  '引用的图片已撤回，本次未提交图片分析。请回复新图片并重新 @，或重新发送有效图片。':
+    'The referenced image was recalled. Image analysis was not submitted. Reply to a new image and mention the bot, or resend a valid image.',
+  '待分析图片均已撤回，本次未提交图片分析。请重新发送有效图片，或回复新图片并 @。':
+    'All selected images were recalled. Image analysis was not submitted. Resend valid images, or reply to a new image and mention the bot.',
+  '图片引用失效状态保存失败，本次未提交图片分析。请检查本地存储后重试。':
+    'The image reference invalidation state could not be saved. Image analysis was not submitted. Check local storage before retrying.',
+  '暂时无法读取图片引用，本次未提交图片分析。请稍后重试，或明确回复新图片并 @。':
+    'The image reference cannot be read right now. Image analysis was not submitted. Retry later, or explicitly reply to a new image and mention the bot.',
+  '有 {count} 张已撤回图片未参与本次分析。':
+    '{count} recalled image(s) were excluded from this analysis.',
   'Matrix 控制器已关闭，请重新启用插件后再操作。':
     'The Matrix controller is closed. Enable the plugin again before continuing.',
   'Matrix 凭据或配置回滚失败，已暂停自动连接。请检查凭据存储并重新接入，勿直接重试连接。':

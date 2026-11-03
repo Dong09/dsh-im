@@ -1362,6 +1362,8 @@ export class TextHarnessBridge {
         createOptions: this.#signal ? { signal: this.#signal } : undefined,
         existsOptions: this.#signal ? { signal: this.#signal } : undefined,
         askOptions: {
+          ...(typeof message.reconcileImages === 'function'
+            ? { reconcileImages: message.reconcileImages } : {}),
           groupHistory: message.groupHistory,
           timeoutMs: this.#replyTimeoutMs,
           signal: this.#signal,

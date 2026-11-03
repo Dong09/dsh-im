@@ -1,5 +1,7 @@
 # Spec Delta: Matrix Scheduled Delivery
 
+本历史 delta 的文字共队列、文字先发与新文字检查点要求已由[后继 delta](../../../simplify-matrix-scheduled-attachments/specs/matrix-scheduled-delivery/spec.md)替代。附件安全与兼容要求保留；不得不经协调便将本文件原样归档为现行主规范。
+
 ## Purpose
 
 让当前 Host 中、已唯一绑定到 Matrix 群聊或线程的原生定时回合，能够把成功完成的文字、图片和文件发送回原处。该能力区分自动上下文与真实输入，维持目的地隔离、明确的发送结果和不盲目重发的安全要求，避免把 Web 展示或附件登记成功误报为 Matrix 已送达。

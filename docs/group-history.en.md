@@ -117,6 +117,18 @@ Downloads use the authorized Bot Token. External cloud files and inaccessible li
 
 The current SDK handles both ordinary and mentioned group messages, subject to platform delivery and authorization; see [Tencent's official SDK](https://github.com/tencent-connect/qqbot-nodejs). **QQ archives are currently isolated by app: different QQ apps do not automatically share records for the same physical group.**
 
+## Matrix image references: send images, then mention
+
+Matrix image references are separate from the six-platform group archive above; this does not add Matrix to the group-history tools' supported platforms. While the bot is online and allowed to receive messages, send images first, then mention it in a separate question. An ordinary mention associates unconsumed, valid images from the preceding **10 minutes**, restricted to the same room, sender, and thread, in arrival order. Only images actually used are consumed after successful answer delivery; failures leave valid images available for retry. Channel configuration can change this window independently of archive retention.
+
+- **Confirmed redaction:** a trusted room redaction event or a valid redaction marker on the queried event durably invalidates the exact reference. Ordinary mentions exclude it, continue with remaining valid images in the same request, and give a brief notice. If all candidates were invalidated by redaction, the bot asks for a new image instead of submitting text-only image analysis.
+- **Temporarily unreadable:** 403, 404, timeouts, network/server errors, decryption failures, and empty results without redaction evidence do not prove redaction. The whole request stops without permanently invalidating references or consuming other valid images. Retry after restoring permissions or connectivity.
+- **Reply to a new image explicitly:** replying to valid image B and mentioning the bot bypasses unrelated old image A. Replying to redacted A produces an error, never silently substitutes B. Replying to ordinary text does not collect unrelated pending images. Equal filenames do not make different events interchangeable.
+
+Known invalidation is rechecked before submission; it cannot retract input already submitted to the model or erase existing Session history. Official answer synchronization is outbound delivery, not a repair for inbound image references. Operational redaction notices are neither final model answers nor successful image consumption.
+
+**Independent upgrade and rollback:** each bot's `matrix-images.json` migrates from v1 to v2. Before the first actual mutation, its original bytes are saved to the same path with `.v1.bak` appended; a conflicting existing backup rejects the write. Images and unknown-target redaction tombstones each default to a separate 2000-item bound. Eviction is not consumption and does not promise indefinite protection against arbitrary historical replay. Old readers cannot load image v2. To downgrade, first stop its writer, then restore code from the baseline **with scheduled-attachment simplification but without the image migration**, together with the image v1 backup. This loses consumption/invalidation progress made after the backup. Do not simply restore old HEAD, clear the inbox, or modify the independent `integrations/dsh-matrix/schedule-replies.json` v2 store or its deduplication high-water. Image rollback must not revive the retired text sender. Deployment and real-homeserver verification require separate authorization.
+
 ## Retention and storage
 
 Open **DSH Settings → IM Bots → gear icon, General settings → General → Group chat retention (days)**. This is the plugin's global settings page, separate from the General tab on an individual bot card.

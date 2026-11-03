@@ -33,13 +33,6 @@ export function supportsDeliveryChannel(channel) {
   return CHANNELS.has(channel);
 }
 
-/** Internal relay ownership is scoped to one exact Matrix destination, never a target id. */
-export function matchesScheduledDestination(botId, target, owner) {
-  return !!owner && owner.botId === botId && ['room', 'thread'].includes(owner.kind)
-    && target?.kind === owner.kind && target.route?.roomId === owner.route?.roomId
-    && (owner.kind === 'room' || target.route?.threadId === owner.route?.threadId);
-}
-
 function invalidTarget(message) {
   const error = new Error(message);
   error.code = 'invalid-target';
@@ -202,16 +195,13 @@ export function normalizeScheduledDeliveryTarget(value) {
 
 /** Preserve the registry object: a structurally identical copy has no snapshot ownership. */
 export function normalizeScheduledDeliveryPart(value) {
-  const allowed = value?.kind === 'text' ? ['kind', 'text'] : ['kind', 'artifact'];
+  const allowed = ['kind', 'artifact'];
   if (!isRecord(value) || Object.keys(value).length !== allowed.length
     || Object.keys(value).some((key) => !allowed.includes(key))
-    || (value.kind === 'text' ? typeof value.text !== 'string' || !value.text.trim()
-      : value.kind !== 'artifact' || !isManagedOutboundArtifact(value.artifact))) {
+    || value.kind !== 'artifact' || !isManagedOutboundArtifact(value.artifact)) {
     throw Object.assign(new Error('Invalid internal scheduled delivery part'), { code: 'bad-request' });
   }
-  return Object.freeze(value.kind === 'text'
-    ? { kind: 'text', text: value.text }
-    : { kind: 'artifact', artifact: value.artifact });
+  return Object.freeze({ kind: 'artifact', artifact: value.artifact });
 }
 
 function targetWithoutSessionSync(target) {
@@ -632,21 +622,18 @@ export function createDeliveryAdapter({
       await workspaces.setDeliveryTargetSessionSync(botId, targetId, conversationKey);
       return { enabled: true, state: 'active' };
     },
-    async listSessionSyncTargets(sessionId) {
+    async listSessionSyncTargets(sessionId, { privateOnly = true } = {}) {
       if (typeof sessionId !== 'string' || !sessionId) {
         throw new TypeError('sessionId is required');
       }
       const matches = [];
       for (const configured of configuredSessionSyncTargets(workspaces)) {
         const target = sessionSyncTarget(channel, workspaces, configured);
-        // Listed targets are the candidate range of synced questions and
-        // approvals only, so a non-private route never appears here even
-        // though mirrored text may be delivered to it.
-        if (!target || !privateConversationKeyMatchesTarget(
-          channel,
-          configured.conversationKey,
-          target,
-        )) continue;
+        // Interactions and their fallback notices keep the private-only default.
+        // Only the official text coordinator explicitly includes shared routes.
+        const matchesTarget = privateOnly === false
+          ? conversationKeyMatchesTarget : privateConversationKeyMatchesTarget;
+        if (!target || !matchesTarget(channel, configured.conversationKey, target)) continue;
         let currentId;
         try {
           currentId = configured.dsBotId
@@ -676,9 +663,6 @@ export function createDeliveryAdapter({
     async sendSessionSyncText(botId, targetId, sessionId, text, options = {}) {
       if (typeof text !== 'string' || !text.trim()) throw new TypeError('text is required');
       const { target } = await syncTarget(botId, targetId, sessionId);
-      if (channel === 'matrix' && matchesScheduledDestination(botId, target, options.excludedDestination)) {
-        return { sent: false, reason: 'externally-owned' };
-      }
       if (typeof coreController.sendProactiveText !== 'function') {
         throw new TypeError('delivery controller cannot send proactive text');
       }

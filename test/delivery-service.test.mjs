@@ -263,56 +263,6 @@ for (const [label, properties] of unsafeTextFailures) {
   });
 }
 
-test('Session sync text forwards relay exclusions internally and preserves externally-owned results', async () => {
-  const service = createDeliveryService();
-  const calls = [];
-  const excludedDestination = {
-    botId: 'bot_one', kind: 'room', route: { roomId: '!relay:example.org' },
-  };
-  service.registerAdapter({
-    ...memoryAdapter({ channel: 'matrix' }),
-    setSessionSync() {},
-    listSessionSyncTargets: () => [],
-    sendSessionSyncText: async (...args) => {
-      calls.push(args);
-      return args[4].excludedDestination ? { sent: false, reason: 'externally-owned' } : { sent: true };
-    },
-  });
-  assert.deepEqual(await service.sendSessionSyncText('bot_one', 'saved', 'session', 'answer', {
-    format: 'markdown', excludedDestination,
-  }), { sent: false, reason: 'externally-owned' });
-  assert.deepEqual(calls[0][4], { signal: undefined, format: 'markdown', excludedDestination });
-  assert.deepEqual(await service.sendSessionSyncText('bot_one', 'saved', 'session', 'ordinary'), { sent: true });
-  assert.deepEqual(calls[1][4], { signal: undefined, format: 'plain' });
-});
-
-test('Session text excludes only the exact relay-owned Matrix bot, room and thread', async () => {
-  const { service, sends } = matrixBindingDeliveryFixture();
-  const room = { botId: 'matrix_one', kind: 'room', route: { roomId: '!relay:example.org' } };
-  const thread = { botId: 'matrix_one', kind: 'thread', route: { roomId: '!relay:example.org', threadId: '$first' } };
-  for (const [sessionId, excludedDestination] of [['matrix-room', room], ['matrix-thread', thread]]) {
-    assert.deepEqual(await service.deliverSessionText(sessionId, 'answer', { excludedDestination }), {
-      sent: false, reason: 'externally-owned',
-    });
-  }
-  assert.deepEqual(sends, []);
-  for (const [sessionId, excludedDestination] of [
-    ['matrix-other-thread', thread],
-    ['matrix-other-bot', room],
-    ['matrix-room', thread],
-    ['matrix-thread', room],
-    ['matrix-room', { ...room, route: { roomId: '!different:example.org' } }],
-  ]) {
-    assert.deepEqual(await service.deliverSessionText(sessionId, 'answer', { excludedDestination }), { sent: true });
-  }
-  assert.equal(sends.length, 5);
-  // The public send path does not interpret this Host-internal exclusion option.
-  assert.deepEqual(await service.send('matrix_one', { kind: room.kind, route: room.route }, 'manual', {
-    excludedDestination: room,
-  }), { sent: true });
-  assert.equal(sends.length, 6);
-});
-
 test('a Session delivery follows the binding instead of a configured target', async () => {
   const warnings = [];
   const service = createDeliveryService({ logger: { warn: (line) => warnings.push(line) } });
@@ -491,6 +441,38 @@ test('a group Session receives mirrored text but never a synced question or appr
   assert.deepEqual(calls.map((entry) => entry[0]), ['text']);
 });
 
+test('Matrix text scope is explicit through the service and never widens interaction fallback notices', async () => {
+  for (const kind of ['room', 'thread']) {
+    const target = { targetId: 'shared', kind, route: { roomId: '!room:example.org',
+      ...(kind === 'thread' ? { threadId: '$thread:example.org' } : {}) } };
+    const key = `room:${target.route.roomId}${kind === 'thread' ? `$${target.route.threadId}` : ''}`;
+    const calls = [];
+    const service = createDeliveryService();
+    service.registerAdapter(createDeliveryAdapter({
+      channel: 'matrix',
+      workspaces: {
+        has: () => true,
+        listSessionSyncTargets: () => [{ botId: 'matrix-bot', targetId: 'shared', conversationKey: key }],
+        deliveryTargetFor: () => target,
+      },
+      stateFor: () => ({ snapshot: () => ({ sessions: { [key]: 'shared-session' } }) }),
+      coreController: {
+        sendProactiveText: async () => { calls.push('text'); },
+        presentSessionSyncQuestion: async () => { calls.push('question'); return true; },
+        presentSessionSyncApproval: async () => { calls.push('approval'); return true; },
+      },
+    }));
+    assert.deepEqual(await service.listSessionSyncTargets('shared-session'), []);
+    assert.deepEqual(await service.listSessionSyncTargets('shared-session', { privateOnly: false }), [
+      { channel: 'matrix', botId: 'matrix-bot', targetId: 'shared' },
+    ]);
+    await service.sendSessionSyncText('matrix-bot', 'shared', 'shared-session', 'official answer');
+    assert.equal(await service.presentSessionSyncQuestion('shared-session', {}), false);
+    assert.equal(await service.presentSessionSyncApproval('shared-session', { payload: { toolName: 'test' } }), false);
+    assert.deepEqual(calls, ['text'], 'shared destinations receive neither interactions nor Web/desktop notices');
+  }
+});
+
 test('DeliveryService revalidates suggestions before exposing adapter output', async () => {
   const service = createDeliveryService();
   const adapter = memoryAdapter();
@@ -628,7 +610,8 @@ function scheduledFixture(options = {}) {
   adapter.sendScheduledPart = async (...args) => {
     await args[3].beforeSend();
     calls.push(args);
-    return { deliveryOutcome: 'sent', providerMessageIds: ['$scheduled:example.org'] };
+    return { deliveryOutcome: 'sent', providerMessageIds: ['$scheduled:example.org'],
+      artifacts: [{ artifactId: args[2].artifact.artifactId, outcome: 'sent' }] };
   };
   const dispose = service.registerAdapter(adapter);
   return { service, adapter, calls, account, dispose };
@@ -653,7 +636,8 @@ async function scheduledArtifact(t) {
 
 const scheduledRoom = () => ({ kind: 'room', route: { roomId: '!r:example.org' } });
 
-test('scheduled admission freezes the exact Matrix bot room/thread and keeps its authorization opaque', async () => {
+test('scheduled admission freezes the exact Matrix bot room/thread and keeps its authorization opaque', async (t) => {
+  const artifact = await scheduledArtifact(t);
   const fx = scheduledFixture();
   for (const target of [scheduledRoom(), { kind: 'thread', route: {
     roomId: '!KplB3ESm99I-4PaRdWxDUKr0Sia5nRhRtykpfs1VloM', threadId: '$thread:example.org',
@@ -663,15 +647,16 @@ test('scheduled admission freezes the exact Matrix bot room/thread and keeps its
     assert.deepEqual(Object.keys(authorization), []);
     assert.equal(Object.isFrozen(authorization), true);
     target.route.roomId = '!elsewhere:example.org';
-    const receipt = await fx.service.sendScheduledPart('bot_one', original, { kind: 'text', text: '**prepared**' }, { authorization, format: 'markdown' });
-    assert.deepEqual(receipt, { deliveryOutcome: 'sent', providerMessageIds: ['$scheduled:example.org'] });
-    assert.deepEqual(fx.calls.at(-1).slice(0, 3), ['bot_one', original, { kind: 'text', text: '**prepared**' }]);
+    const receipt = await fx.service.sendScheduledPart('bot_one', original, { kind: 'artifact', artifact }, { authorization, format: 'markdown' });
+    assert.deepEqual(receipt, { deliveryOutcome: 'sent', providerMessageIds: ['$scheduled:example.org'],
+      artifacts: [{ artifactId: artifact.artifactId, outcome: 'sent' }] });
+    assert.deepEqual(fx.calls.at(-1).slice(0, 3), ['bot_one', original, { kind: 'artifact', artifact }]);
     assert.equal(fx.calls.at(-1)[3].format, 'markdown');
     assert.equal(fx.calls.at(-1)[3].expectedFingerprint, 'a'.repeat(64));
     assert.equal(Object.isFrozen(fx.calls.at(-1)[1].route), true);
-    await assert.rejects(fx.service.sendScheduledPart('bot_one', target, { kind: 'text', text: 'not retargeted' }, { authorization }), { code: 'target-changed' });
-    await assert.rejects(fx.service.sendScheduledPart('other_bot', original, { kind: 'text', text: 'not borrowed' }, { authorization }), { code: 'target-changed' });
-    await assert.rejects(fx.service.sendScheduledPart('bot_one', original, { kind: 'text', text: 'not cloned' }, { authorization: structuredClone(authorization) }), { code: 'capability-unavailable' });
+    await assert.rejects(fx.service.sendScheduledPart('bot_one', target, { kind: 'artifact', artifact }, { authorization }), { code: 'target-changed' });
+    await assert.rejects(fx.service.sendScheduledPart('other_bot', original, { kind: 'artifact', artifact }, { authorization }), { code: 'target-changed' });
+    await assert.rejects(fx.service.sendScheduledPart('bot_one', original, { kind: 'artifact', artifact }, { authorization: structuredClone(authorization) }), { code: 'capability-unavailable' });
   }
   assert.equal(fx.calls.length, 2);
 });
@@ -701,12 +686,13 @@ test('scheduled parts reject paths URLs bytes and reconstructed artifacts withou
   const target = scheduledRoom();
   const authorization = await fx.service.authorizeScheduledTarget('bot_one', target);
   const artifact = await scheduledArtifact(t);
-  for (const part of [{ kind: 'text', text: 'ok', path: 'secret' }, { kind: 'text', text: '' },
+  for (const part of [{ kind: 'text', text: 'valid text is rejected' }, { kind: 'text', text: 'ok', path: 'secret' }, { kind: 'text', text: '' },
     { kind: 'artifact', path: 'original.png' }, { kind: 'artifact', artifact: { ...artifact } },
     { kind: 'artifact', artifact: { path: 'original.png' } }, { kind: 'artifact', artifact: 'https://example.org/file' },
     { kind: 'artifact', artifact: Buffer.from([1]) }, { kind: 'artifact', artifact, bytes: [1] }]) {
     await assert.rejects(fx.service.sendScheduledPart('bot_one', target, part, { authorization }), { code: 'bad-request' });
   }
+  assert.equal(fx.calls.length, 0, 'invalid parts never reach the adapter');
   fx.adapter.sendScheduledPart = async (_bot, _target, part) => {
     assert.equal(part.artifact, artifact);
     return { deliveryOutcome: 'failed', providerMessageIds: [], artifacts: [{ artifactId: artifact.artifactId, outcome: 'failed', reason: 'artifact-provider-failed' }],
@@ -718,7 +704,8 @@ test('scheduled parts reject paths URLs bytes and reconstructed artifacts withou
   assert.deepEqual(result.failureNotice.providerMessageIds, ['$notice:example.org']);
 });
 
-test('each scheduled part rechecks the original registration and current account instead of selecting another bot', async () => {
+test('each scheduled part rechecks the original registration and current account instead of selecting another bot', async (t) => {
+  const artifact = await scheduledArtifact(t);
   for (const change of ['account', 'removed', 'registration', 'disposal', 'cancelled']) {
     const fx = scheduledFixture();
     const abort = new AbortController();
@@ -729,7 +716,7 @@ test('each scheduled part rechecks the original registration and current account
     if (change === 'registration') fx.service.registerAdapter(fx.adapter);
     if (change === 'disposal') fx.dispose();
     if (change === 'cancelled') abort.abort();
-    await assert.rejects(fx.service.sendScheduledPart('bot_one', target, { kind: 'text', text: 'stop' }, { authorization }),
+    await assert.rejects(fx.service.sendScheduledPart('bot_one', target, { kind: 'artifact', artifact }, { authorization }),
       { code: { account: 'account-changed', removed: 'unknown-bot', registration: 'capability-unavailable', disposal: 'capability-unavailable', cancelled: 'cancelled' }[change] });
     assert.equal(fx.calls.length, 0, change);
   }
@@ -743,24 +730,26 @@ test('scheduled authorization fails closed on replacement during asynchronous id
   assert.equal(fx.calls.length, 0);
 });
 
-test('scheduled receipts never infer completion from boolean sent, notice visibility or a single ID', async () => {
+test('scheduled receipts never infer completion from boolean sent, notice visibility or a single ID', async (t) => {
+  const artifact = await scheduledArtifact(t);
   const fx = scheduledFixture();
   const target = scheduledRoom();
   const authorization = await fx.service.authorizeScheduledTarget('bot_one', target);
   for (const value of [true, { sent: true }, { providerMessageIds: ['$only:example.org'] },
     { userVisible: true, failureNoticeVisible: true }, { deliveryOutcome: 'sent', providerMessageIds: ['bad-id'] }]) {
     fx.adapter.sendScheduledPart = async () => value;
-    const result = await fx.service.sendScheduledPart('bot_one', target, { kind: 'text', text: 'one part' }, { authorization });
+    const result = await fx.service.sendScheduledPart('bot_one', target, { kind: 'artifact', artifact }, { authorization });
     assert.equal(result.deliveryOutcome, 'unknown');
     assert.equal(result.reason, 'send-result-unknown');
   }
   fx.adapter.sendScheduledPart = async () => ({ deliveryOutcome: 'unknown', providerMessageIds: ['$partial:example.org'], reason: 'matrix-delivery-uncertain' });
-  const result = await fx.service.sendScheduledPart('bot_one', target, { kind: 'text', text: 'partial' }, { authorization });
+  const result = await fx.service.sendScheduledPart('bot_one', target, { kind: 'artifact', artifact }, { authorization });
   assert.equal(result.deliveryOutcome, 'unknown');
   assert.deepEqual(result.providerMessageIds, ['$partial:example.org']);
 });
 
-test('scheduled send preserves a trustworthy acknowledgement racing cancellation and adapter replacement', async () => {
+test('scheduled send preserves a trustworthy acknowledgement racing cancellation and adapter replacement', async (t) => {
+  const artifact = await scheduledArtifact(t);
   const fx = scheduledFixture();
   const abort = new AbortController();
   const target = scheduledRoom();
@@ -769,10 +758,12 @@ test('scheduled send preserves a trustworthy acknowledgement racing cancellation
     await options.beforeSend();
     abort.abort();
     fx.service.registerAdapter(fx.adapter);
-    return { deliveryOutcome: 'sent', providerMessageIds: ['$acknowledged:example.org'] };
+    return { deliveryOutcome: 'sent', providerMessageIds: ['$acknowledged:example.org'],
+      artifacts: [{ artifactId: artifact.artifactId, outcome: 'sent' }] };
   };
-  assert.deepEqual(await fx.service.sendScheduledPart('bot_one', target, { kind: 'text', text: 'ack' }, { authorization }), {
+  assert.deepEqual(await fx.service.sendScheduledPart('bot_one', target, { kind: 'artifact', artifact }, { authorization }), {
     deliveryOutcome: 'sent', providerMessageIds: ['$acknowledged:example.org'],
+    artifacts: [{ artifactId: artifact.artifactId, outcome: 'sent' }],
   });
 });
 

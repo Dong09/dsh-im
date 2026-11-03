@@ -16,6 +16,7 @@ import {
   contentWithoutImages,
   imageFileSourcesFromContent,
   isModelImageRejection,
+  reconcileImageSources,
 } from './image-prompt.mjs';
 import { imageInputLimits } from './image-input-policy.mjs';
 import { inboundImagesAsFiles, imageContentFromStaged, isImageAdmissionRejection, IMAGE_HOST_LIMIT_FALLBACK_PROMPT } from './image-input.mjs';
@@ -2078,6 +2079,36 @@ export class HarnessClient {
 
     try {
       const basePrompt = prompt;
+      const reconcileImages = typeof options.reconcileImages === 'function'
+        && inboundImages.length ? options.reconcileImages : null;
+      let effectiveImages = inboundImages;
+      let imageBatch;
+      let imageLimits;
+      const imageFiles = new Map();
+      let imageFallback = null;
+      const rebuildReconciledPrompt = async () => {
+        // Rebuild only from the original base and the current identity subset.
+        // Never filter an already-rendered manifest: it may retain excluded paths.
+        for (let remaining = effectiveImages.length; remaining >= 0; remaining -= 1) {
+          effectiveImages = await reconcileImageSources(effectiveImages, reconcileImages, { signal });
+          const files = effectiveImages.map((source) => imageFiles.get(source));
+          const staged = { ...imageBatch, files };
+          const images = imageFallback ? [] : await imageContentFromStaged(staged, imageLimits, { signal });
+          const allDirect = images.filter((part) => part.type === 'image').length === files.length;
+          const base = typeof basePrompt === 'string' ? [{ type: 'text', text: basePrompt }] : basePrompt;
+          const rebuilt = appendInboundFilesToPrompt([
+            ...(imageFallback ? contentWithoutImages(base) : base), ...images,
+            ...(imageFallback ? [{ type: 'text', text: imageFallback }] : []),
+          ], { files: [
+            ...stagedBatches.filter((batch) => batch !== imageBatch).flatMap((batch) => batch.files),
+            ...(imageFallback || !allDirect ? files : []),
+          ] });
+          const checked = await reconcileImageSources(effectiveImages, reconcileImages, { signal });
+          if (checked.length === effectiveImages.length) return rebuilt;
+          effectiveImages = checked;
+        }
+        throw new Error('Image reconciliation did not converge');
+      };
       if (inboundFiles.length > 0) {
         const staged = await this.#stageWorkspaceFiles(sessionId, inboundFiles, signal);
         stagedBatches.push(staged);
@@ -2085,16 +2116,45 @@ export class HarnessClient {
       }
       if (inboundImages.length > 0) {
         const limits = await this.getImageInputLimits();
-        const sources = inboundImagesAsFiles(inboundImages, limits);
+        imageLimits = limits;
         let staged;
-        try {
-          staged = await this.#stageWorkspaceFiles(sessionId, sources, signal);
-        } catch (error) {
-          // Ingress wraps loader errors; retain the original image diagnostic.
-          if (signal?.aborted) throw signal.reason ?? error;
-          if (error?.cause?.name === 'ImagePromptError') throw error.cause;
-          throw error;
+        const loaded = new Map();
+        if (reconcileImages) effectiveImages = await reconcileImageSources(effectiveImages, reconcileImages, { signal });
+        for (let remaining = effectiveImages.length; remaining > 0; remaining -= 1) {
+          let failedSource;
+          const sources = inboundImagesAsFiles(effectiveImages, limits).map((file, index) => {
+            if (!reconcileImages) return file;
+            const source = effectiveImages[index];
+            return { async load(options) {
+              if (loaded.has(source)) return loaded.get(source);
+              try {
+                const value = await file.load(options);
+                options.signal?.throwIfAborted();
+                loaded.set(source, value);
+                return value;
+              } catch (error) { failedSource = source; throw error; }
+            } };
+          });
+          try {
+            staged = await this.#stageWorkspaceFiles(sessionId, sources, signal);
+            break;
+          } catch (error) {
+            if (signal?.aborted) throw signal.reason ?? error;
+            if (reconcileImages && failedSource
+              && !['AbortError', 'TimeoutError'].includes(error?.cause?.name)) {
+              const effective = await reconcileImageSources(effectiveImages, reconcileImages, { signal });
+              if (!effective.includes(failedSource)) {
+                effectiveImages = effective;
+                continue;
+              }
+            }
+            // Ingress wraps loader errors; retain the original image diagnostic.
+            if (error?.cause?.name === 'ImagePromptError') throw error.cause;
+            throw error;
+          }
         }
+        imageBatch = staged;
+        effectiveImages.forEach((source, index) => imageFiles.set(source, staged.files[index]));
         stagedBatches.push(staged);
         const images = await imageContentFromStaged(staged, limits, { signal });
         const allImagesDirect = images.filter((part) => part.type === 'image').length === staged.files.length;
@@ -2149,7 +2209,9 @@ export class HarnessClient {
           throw new TypeError('Harness prompt content is required');
         }
         const timeZoneFields = clientTimeZoneFields();
-        const sendPrompt = (promptContent) => {
+        const sendPrompt = async (promptContent) => {
+          if (reconcileImages) promptContent = await rebuildReconciledPrompt();
+          signal?.throwIfAborted();
           diagnostic.stage = 'prompt.submit';
           diagnostic.submissionState = 'unknown';
           return this.#sessionRpc('session.prompt', {
@@ -2211,6 +2273,8 @@ export class HarnessClient {
           const baseContent = typeof basePrompt === 'string'
             ? [{ type: 'text', text: basePrompt }]
             : basePrompt;
+          if (reconcileImages) imageFallback = isModelImageRejection(error)
+            ? t(IMAGE_FILE_FALLBACK_PROMPT) : t(IMAGE_HOST_LIMIT_FALLBACK_PROMPT);
           const fallbackPrompt = appendInboundFilesToPrompt([
             ...contentWithoutImages(baseContent),
             { type: 'text', text: t(isModelImageRejection(error) ? IMAGE_FILE_FALLBACK_PROMPT : IMAGE_HOST_LIMIT_FALLBACK_PROMPT) },

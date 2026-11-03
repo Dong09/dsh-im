@@ -2,7 +2,6 @@ import { destination, destinationIdentity } from './schedule-relay-store.mjs';
 import { isMatrixEventId } from '../../src/channels/matrix/matrix-identifiers.mjs';
 import { outboundArtifactRegistry, releaseOutboundArtifact } from '../../src/channels/shared/semantic/artifact.mjs';
 
-const textOf = (message) => (message?.content ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('\n').trim();
 const sessionIdOf = (session) => typeof session === 'string' ? session : session?.id ?? session?.header?.id ?? session?.sessionId;
 const keyOf = (sessionId, turn) => `${sessionId}\u0000${turn}`;
 const errorCode = (error, fallback = 'send-result-unknown') => /^[a-z][a-z0-9-]{0,79}$/.test(error?.code ?? '') ? error.code : fallback;
@@ -31,7 +30,9 @@ function partResult(receipt) {
 }
 
 /**
+ * Attachment-only relay: official Session sync owns final text independently.
  * Synchronous per-(Session,turn) admission is separate from per-Session delivery.
+ * New jobs require committed artifacts and their status describes only attachments.
  * No provider closure writes checkpoints: local persistence cannot trigger image fallback.
  */
 export function createScheduleRelay({ im, store, registry = outboundArtifactRegistry, logger = console, sendTimeoutMs = 60_000 }) {
@@ -45,9 +46,6 @@ export function createScheduleRelay({ im, store, registry = outboundArtifactRegi
   const tails = new Map();
   const preparations = new Set();
   const jobs = new Set();
-  // Event identity shares accepted delivery ownership with the generic mirror.
-  // Weak keys survive delayed sync queues without retaining historical turns.
-  const completedDestinations = new WeakMap();
   let closed = false;
   let closing;
   const warn = (sessionId, code) => logger.warn?.(`[schedule-im-relay] Session ${sessionId}: ${code}`);
@@ -89,7 +87,7 @@ export function createScheduleRelay({ im, store, registry = outboundArtifactRegi
     let state = turns.get(key);
     if (!state) {
       state = { sessionId, turn, scheduled: false, mixed: false, claimed: new Set(), generation: 0,
-        text: '', lease: null, route: null, authorization: null, rejected: null, ended: false, signal: null, onAbort: null };
+        lease: null, route: null, authorization: null, rejected: null, ended: false, signal: null, onAbort: null };
       turns.set(key, state);
     }
     current.set(sessionId, key);
@@ -219,7 +217,7 @@ export function createScheduleRelay({ im, store, registry = outboundArtifactRegi
     return tail;
   };
 
-  const complete = (state, reason, event) => {
+  const complete = (state, reason) => {
     state.ended = true;
     ended.set(state.sessionId, Math.max(ended.get(state.sessionId) ?? -1, state.turn));
     turns.delete(keyOf(state.sessionId, state.turn));
@@ -231,25 +229,23 @@ export function createScheduleRelay({ im, store, registry = outboundArtifactRegi
         || state.signal?.aborted || !state.lease?.active || !state.route || !state.authorization) return Promise.resolve();
       // Keep genuine WeakMap-backed artifact identities across the hand-off.
       artifacts = state.lease.take();
-      if (!state.text && artifacts.length === 0) return Promise.resolve();
+      if (artifacts.length === 0) return Promise.resolve();
       const parts = [];
-      if (state.text) parts.push({ id: 'text', value: Object.freeze({ kind: 'text', text: state.text }) });
       const seen = new Set();
       for (const artifact of artifacts) {
         if (seen.has(artifact.artifactId)) continue;
         seen.add(artifact.artifactId);
         parts.push({ id: `artifact:${artifact.artifactId}`, value: Object.freeze({ kind: 'artifact', artifact }) });
       }
-      const manifest = parts.map(({ id, value }) => value.kind === 'text' ? { id, kind: 'text' } : {
+      const manifest = parts.map(({ id, value }) => ({
         id, kind: 'artifact', artifactId: value.artifact.artifactId, fileName: value.artifact.fileName,
         mediaType: value.artifact.mediaType, size: value.artifact.size, digest: value.artifact.digest,
-      });
+      }));
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(Object.assign(new Error('send-result-unknown'), { code: 'send-result-unknown' })), sendTimeoutMs);
       timer.unref?.();
       const job = Object.freeze({ sessionId: state.sessionId, turn: state.turn, route: state.route, authorization: state.authorization,
-        text: state.text, parts: Object.freeze(parts), manifest: Object.freeze(manifest), artifacts: Object.freeze(artifacts), controller, timer });
-      completedDestinations.set(event, Object.freeze({ sessionId: state.sessionId, turn: state.turn, ...state.route }));
+        parts: Object.freeze(parts), manifest: Object.freeze(manifest), artifacts: Object.freeze(artifacts), controller, timer });
       const result = queueJob(job);
       artifacts = [];
       return result;
@@ -273,11 +269,9 @@ export function createScheduleRelay({ im, store, registry = outboundArtifactRegi
       // unclaimed real input appeared after pre-step (including a later step).
       if (!isAutomaticRelayInput(event.data?.source) && event.data?.source?.kind !== 'schedule'
         && !state.claimed.has(event.data?.id)) { state.mixed = true; reject(state, 'mixed-input'); }
-    } else if (event.type === 'assistant/message' && event.surfaceOp === 'append' && event.data?.interrupted !== true) {
-      state.text = textOf(event.data?.message);
     } else if (event.type === 'turn/end') {
       const reason = typeof event.data?.reason === 'string' ? event.data.reason : event.data?.reason?.kind;
-      return complete(state, reason, event);
+      return complete(state, reason);
     }
     return Promise.resolve();
   };
@@ -293,10 +287,6 @@ export function createScheduleRelay({ im, store, registry = outboundArtifactRegi
 
   return Object.freeze({
     captureBindings, observeClaim, observeEvent, preStep, disposeSession,
-    deliveryDestinationFor(sessionId, turn, event) {
-      const owned = event && typeof event === 'object' ? completedDestinations.get(event) : null;
-      return owned?.sessionId === sessionId && owned.turn === turn ? owned : null;
-    },
     // Kept for callers that await delivery completion, not for authorization.
     enqueue: observeEvent,
     async whenIdle() { while (tails.size || preparations.size) await Promise.all([...tails.values(), ...preparations]); },

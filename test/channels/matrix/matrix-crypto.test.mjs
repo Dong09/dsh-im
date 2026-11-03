@@ -10,6 +10,7 @@ import {
   MATRIX_OLM_PK_ALGORITHM,
   MatrixCryptoEngine,
   MatrixCryptoError,
+  loadMatrixOlm,
 } from '../../../src/channels/matrix/matrix-crypto.mjs';
 import { MatrixCryptoStore, matrixCryptoPathFor } from '../../../src/channels/matrix/matrix-crypto-store.mjs';
 
@@ -208,6 +209,7 @@ test('room keys shared through to-device unlock decryption; buffered ciphertext 
     content: structuredClone(encSecond),
   });
   deepStrictEqual(second?.content, { msgtype: 'm.text', body: '第二条' }, 'the second message decrypts directly');
+  equal(second?.type, 'm.room.message', 'legacy encrypted payloads retain the message default');
   equal(second?.senderDeviceId, 'ALICEDEV', 'the sending device is reported from the authenticated payload');
 
   const replay = await botEngine.decryptRoomEvent(ROOM, {
@@ -235,6 +237,53 @@ test('room keys shared through to-device unlock decryption; buffered ciphertext 
   });
   await alice.engine.stop();
   await botEngine.stop();
+});
+
+test('genuine Megolm payloads preserve their authenticated event type without asserting server authorization', async (t) => {
+  const hub = createHub();
+  const directory = await makeTempDirectory('dsh-im-matrix-crypto-event-type-');
+  const alice = await startEngine(hub, {
+    userId: ALICE, deviceId: 'ALICEDEV', storePath: join(directory, 'alice.json'),
+  });
+  const bot = await startEngine(hub, {
+    userId: BOT, deviceId: 'BOTDEV', storePath: join(directory, 'bot.json'),
+  });
+  // Use the real signed to-device sharing path to establish the receiver's key.
+  const envelope = await alice.engine.encryptForRoom(ROOM, { msgtype: 'm.text', body: 'share key' });
+  ok(hub.toDevice.some((entry) => entry.type === 'm.room_key'));
+  // The public sender deliberately emits legacy message-only payloads. Restore
+  // its genuine outbound ratchet to exercise typed peer payloads without mocking
+  // the receiver, libolm decryption, key import, or authenticated plaintext.
+  await alice.engine.stop();
+  const snapshot = alice.store.snapshot;
+  const Olm = await loadMatrixOlm();
+  const account = new Olm.Account();
+  let outbound;
+  t.after(() => { outbound?.free?.(); account.free?.(); });
+  account.unpickle(snapshot.picklingPassphrase, snapshot.accountPickle);
+  outbound = new Olm.OutboundGroupSession(account, { algorithm: MATRIX_MEGOLM_ALGORITHM });
+  outbound.unpickle(snapshot.picklingPassphrase, snapshot.groupOutbound[ROOM].pickle);
+  equal(outbound.session_id(), envelope.session_id);
+
+  for (const [index, type] of ['m.room.redaction', 'm.reaction', 'm.room.message'].entries()) {
+    const content = type === 'm.room.redaction' ? { redacts: '$image:example.org' }
+      : type === 'm.reaction' ? { 'm.relates_to': { rel_type: 'm.annotation', event_id: '$image', key: 'ok' } }
+        : { msgtype: 'm.text', body: 'typed message' };
+    const result = await bot.engine.decryptRoomEvent(ROOM, {
+      type: 'm.room.encrypted', event_id: `$typed-${index}:example.org`, sender: ALICE,
+      origin_server_ts: Date.now(),
+      content: { ...envelope, ciphertext: outbound.encrypt(JSON.stringify({
+        type, content, room_id: ROOM, sender_key: envelope.sender_key, sender_device_id: 'ALICEDEV',
+      })) },
+    });
+    equal(result?.type, type, 'decryption retains the actual peer type, not a forced message type');
+    deepStrictEqual(result?.content, content);
+    equal(result?.senderDeviceId, 'ALICEDEV');
+    equal(result?.senderKey, envelope.sender_key);
+    equal(result?.sessionId, envelope.session_id);
+    equal(result?.unsigned, undefined, 'authenticated peer content is not trusted server unsigned evidence');
+  }
+  await bot.engine.stop();
 });
 
 test('ciphertext from an unknown sender key is refused, counted and leaves the engine ready', async () => {

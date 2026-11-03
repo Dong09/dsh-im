@@ -1,4 +1,8 @@
 import test from 'node:test';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { OutboundArtifactRegistry, releaseOutboundArtifact } from '../../../src/channels/shared/semantic/artifact.mjs';
 import { deepStrictEqual, equal, ok, rejects, throws } from 'node:assert';
 import { createDeliveryAdapter } from '../../../plugin-src/host/delivery-adapter.mjs';
 import { createDeliveryService } from '../../../plugin-src/host/delivery-service.mjs';
@@ -105,11 +109,35 @@ test('the delivery adapter enforces the matrix target grammar', async () => {
 });
 
 async function frozenControllerDelivery(t) {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-matrix-delivery-'));
+  const registry = new OutboundArtifactRegistry();
+  t.after(async () => { registry.clear(); await rm(directory, { recursive: true, force: true }); });
+  const session = { header: { id: 'scheduled-session', cwd: directory }, events: [
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'user/message', data: { turn: 1, source: { rpcId: 'scheduled-rpc' } } },
+  ] };
+  t.after(registry.openConsumer('scheduled-session', 'scheduled-rpc'));
+  for (const event of session.events) registry.observeSessionEvent(session, event);
+  const bytes = Buffer.from([0, 2, 255]);
+  await writeFile(join(directory, 'original.png'), bytes);
+  const staged = await registry.stage({ path: 'original.png' }, { agent: { session }, callId: 'file' });
+  registry.commit(staged);
+  const next = await registry.stage({ path: 'original.png' }, { agent: { session }, callId: 'next-file' });
+  registry.commit(next);
+  const artifacts = registry.take('scheduled-session', 1);
+  const artifact = artifacts[0];
+  const ownedArtifacts = [...artifacts];
+  t.after(() => ownedArtifacts.forEach(releaseOutboundArtifact));
   const calls = [];
   const account = { homeserver: 'https://matrix.example.org', userId: '@bot:example.org', deviceId: 'DEVICE', fingerprint: 'a'.repeat(64) };
   const runtime = runtimeStub({
     describeDeliveryAccount: () => ({ ...account }),
-    sendProactiveImage() {}, sendProactiveFile() {},
+    async sendProactiveImage(target, file, options) {
+      await options.beforeSend();
+      calls.push({ target, fileName: file.fileName, bytes: file.bytes });
+      return { providerMessageIds: [`$frozen-${calls.length}:example.org`] };
+    },
+    async sendProactiveFile() { throw new Error('unexpected file fallback'); },
     async sendProactiveText(target, text, options) {
       await options.beforeSend();
       calls.push({ target, text });
@@ -126,30 +154,51 @@ async function frozenControllerDelivery(t) {
   service.registerAdapter(adapter);
   const target = { kind: 'thread', route: { roomId: '!old:example.org', threadId: '$old-thread:example.org' } };
   const authorization = await service.authorizeScheduledTarget(fx.identity.botId, target);
-  return { ...fx, runtime, account, calls, sessions, adapter, service, target, authorization,
-    send: (text) => service.sendScheduledPart(fx.identity.botId, target, { kind: 'text', text }, { authorization }) };
+  return { ...fx, runtime, account, calls, sessions, adapter, service, target, authorization, artifact, bytes,
+    send: () => service.sendScheduledPart(fx.identity.botId, target, { kind: 'artifact', artifact: artifacts.shift() }, { authorization }) };
 }
 
 test('Matrix scheduled old-session route stays in its original thread after a room switches Session', async (t) => {
   const f = await frozenControllerDelivery(t);
   f.sessions['room:!old:example.org$$old-thread:example.org'] = 'new-session';
-  deepStrictEqual(await f.send('old scheduled result'), { deliveryOutcome: 'sent', providerMessageIds: ['$frozen-1:example.org'] });
-  deepStrictEqual(f.calls, [{ target: f.target, text: 'old scheduled result' }]);
+  const result = await f.send();
+  equal(result.deliveryOutcome, 'sent');
+  deepStrictEqual(result.providerMessageIds, ['$frozen-1:example.org']);
+  deepStrictEqual(result.artifacts, [{ artifactId: f.artifact.artifactId, outcome: 'sent' }]);
+  deepStrictEqual(f.calls, [{ target: f.target, fileName: 'original.png', bytes: f.bytes }]);
 });
 
 test('Matrix scheduled parts reject removed account changed identity and replacement registration without retargeting', async (t) => {
   for (const change of ['removed', 'account', 'registration', 'configured-device']) {
     const f = await frozenControllerDelivery(t);
-    await f.send('first part');
+    await f.send();
     if (change === 'removed') await f.controller.deleteBot(f.identity.botId);
     if (change === 'account') f.account.fingerprint = 'b'.repeat(64);
     if (change === 'registration') f.service.registerAdapter(f.adapter);
     if (change === 'configured-device') await f.configStore.save({ ...f.configStore.get(f.identity.botId), deviceId: 'REPLACED' });
-    await rejects(f.send('never reroute'), { code: { removed: 'unknown-bot', account: 'account-changed',
+    await rejects(f.send(), { code: { removed: 'unknown-bot', account: 'account-changed',
       registration: 'capability-unavailable', 'configured-device': 'account-changed' }[change] });
     equal(f.calls.length, 1, change);
     deepStrictEqual(f.calls[0].target, f.target);
   }
+});
+
+test('Matrix controller rejects text paths URLs bytes and forged artifacts before any native side effect', async (t) => {
+  const f = await frozenControllerDelivery(t);
+  for (const part of [
+    { kind: 'text', text: 'valid text is rejected' },
+    { kind: 'artifact', path: 'original.png' },
+    { kind: 'artifact', artifact: { ...f.artifact } },
+    { kind: 'artifact', artifact: { path: 'original.png' } },
+    { kind: 'artifact', artifact: 'https://example.org/image.png' },
+    { kind: 'artifact', artifact: Buffer.from([1]) },
+    { kind: 'artifact', artifact: f.artifact, path: 'extra' },
+  ]) {
+    await rejects(f.controller.sendScheduledPart(f.identity.botId, f.target, part,
+      { expectedFingerprint: f.account.fingerprint }), { code: 'bad-request' });
+  }
+  deepStrictEqual(f.calls, []);
+  equal((await f.send()).deliveryOutcome, 'sent', 'rejected requests did not consume the real artifact');
 });
 
 test('Matrix scheduled account discovery rejects unverified runtime identities and incomplete media capability', async (t) => {

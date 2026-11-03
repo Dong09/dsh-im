@@ -169,7 +169,7 @@ test('only the Matrix adapter offers optional scheduled parts and reports missin
     assert.equal(typeof adapter.sendScheduledPart, channel === 'matrix' ? 'function' : 'undefined');
     if (channel === 'matrix') {
       await assert.rejects(adapter.sendScheduledPart('bot', { kind: 'room', route: { roomId: '!room:example.org' } },
-        { kind: 'text', text: 'internal' }), { code: 'capability-unavailable' });
+        { kind: 'text', text: 'internal' }), { code: 'bad-request' });
     }
   }
 });
@@ -200,7 +200,7 @@ test('Matrix scheduled adapter forwards full receipts and original managed artif
   assert.equal(calls[0][2].artifact, artifact);
   assert.deepEqual(calls[0][1], target);
   assert.equal(calls[0][3], options);
-  for (const part of [{ kind: 'artifact', artifact: { ...artifact } }, { kind: 'artifact', artifact: { path: 'unchanged.png' } },
+  for (const part of [{ kind: 'text', text: 'valid text is rejected' }, { kind: 'artifact', artifact: { ...artifact } }, { kind: 'artifact', artifact: { path: 'unchanged.png' } },
     { kind: 'artifact', artifact: 'https://example.org/a.png' }, { kind: 'artifact', artifact: Buffer.from([1]) },
     { kind: 'artifact', artifact, fileName: 'renamed.png' }, { kind: 'text', text: 'ok', files: ['path'] }]) {
     await assert.rejects(adapter.sendScheduledPart('bot', target, part, options), { code: 'bad-request' });
@@ -210,6 +210,8 @@ test('Matrix scheduled adapter forwards full receipts and original managed artif
     await assert.rejects(adapter.sendScheduledPart('bot', invalid, { kind: 'text', text: 'no' }, options), { code: 'invalid-target' });
   }
   assert.equal(calls.length, 1);
+  const unavailable = createDeliveryAdapter({ channel: 'matrix', workspaces: {}, coreController: {}, stateFor: () => ({}) });
+  await assert.rejects(unavailable.sendScheduledPart('bot', target, { kind: 'artifact', artifact }), { code: 'capability-unavailable' });
 });
 
 test('all ten delivery adapters validate and forward one stable target', async () => {
@@ -321,6 +323,57 @@ test('email delivery creates and sends explicit recipients without inferring Ses
   assert.throws(() => adapter.createTarget(botId, {
     targetId: 'invalid', kind: 'user', route: { address: '<m1@mail.example>' },
   }), { code: 'invalid-target' });
+});
+
+test('Matrix saved room and thread text candidates require explicit scope and current enabled binding', async () => {
+  for (const target of [
+    { targetId: 'saved', kind: 'room', route: { roomId: '!room:example.org' } },
+    { targetId: 'saved', kind: 'thread', route: { roomId: '!room:example.org', threadId: '$thread:example.org' } },
+  ]) {
+    const key = `room:${target.route.roomId}${target.kind === 'thread' ? `$${target.route.threadId}` : ''}`;
+    const sessions = { [key]: 'session-room' };
+    let enabled = true;
+    let currentTarget = target;
+    const sends = [];
+    const interactions = [];
+    const adapter = createDeliveryAdapter({
+      channel: 'matrix',
+      workspaces: {
+        has: () => true,
+        listSessionSyncTargets: () => enabled ? [{ botId: 'matrix-bot', targetId: 'saved', conversationKey: key }] : [],
+        deliveryTargetFor: () => currentTarget,
+      },
+      stateFor: () => ({ snapshot: () => ({ sessions }) }),
+      coreController: {
+        sendProactiveText: async (...args) => { sends.push(args); },
+        presentSessionSyncQuestion: async () => { interactions.push('question'); return true; },
+        presentSessionSyncApproval: async () => { interactions.push('approval'); return true; },
+      },
+    });
+    const list = (options) => adapter.listSessionSyncTargets('session-room', options);
+    assert.deepEqual(await list(), []);
+    assert.deepEqual(await list({ privateOnly: true }), []);
+    for (const privateOnly of [null, 0, '', undefined]) {
+      assert.deepEqual(await list({ privateOnly }), [], 'only literal false expands text scope');
+    }
+    assert.deepEqual(await list({ privateOnly: false }), [{ botId: 'matrix-bot', targetId: 'saved' }]);
+    assert.deepEqual(await adapter.sendSessionSyncText('matrix-bot', 'saved', 'session-room', 'answer'), { sent: true });
+    for (const method of ['describeSessionSyncQuestionTarget', 'describeSessionSyncApprovalTarget',
+      'presentSessionSyncQuestion', 'presentSessionSyncApproval']) {
+      await assert.rejects(adapter[method]('matrix-bot', 'saved', 'session-room', {}), { code: 'session-sync-unavailable' });
+    }
+    assert.deepEqual(interactions, []);
+    for (const invalidation of ['disabled', 'deleted', 'rebound', 'mismatched-route']) {
+      enabled = invalidation !== 'disabled';
+      currentTarget = invalidation === 'deleted' ? null : invalidation === 'mismatched-route'
+        ? { ...target, route: { ...target.route, roomId: '!other:example.org' } } : target;
+      sessions[key] = invalidation === 'rebound' ? 'new-session' : 'session-room';
+      assert.deepEqual(await list({ privateOnly: false }), [], invalidation);
+      await assert.rejects(adapter.sendSessionSyncText('matrix-bot', 'saved', 'session-room', 'stale'),
+        { code: 'session-sync-unavailable' }, invalidation);
+    }
+    assert.equal(sends.length, 1, 'disabled/deleted/rebound routes have no native send');
+  }
 });
 
 test('all adapters enable, resolve, and revalidate one private Session target', async () => {
@@ -599,6 +652,9 @@ test('a Telegram forum topic receives mirrored text and never a question or appr
   // A group is not a candidate for a synced question or approval, and both
   // paths refuse it even when asked directly by target id.
   assert.deepEqual(await adapter.listSessionSyncTargets('session-topic'), []);
+  assert.deepEqual(await adapter.listSessionSyncTargets('session-topic', { privateOnly: false }), [
+    { botId: 'bot-telegram', targetId: target.targetId },
+  ]);
   const interaction = { respond: async () => {}, withdraw: async () => {} };
   for (const [method, describe] of [
     ['presentSessionSyncApproval', 'describeSessionSyncApprovalTarget'],

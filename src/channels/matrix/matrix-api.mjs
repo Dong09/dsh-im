@@ -347,11 +347,21 @@ export class MatrixApi {
    */
   async getEvent(roomId, eventId, options = {}) {
     if (!isMatrixRoomId(roomId) || !isMatrixEventId(eventId)) throw new TypeError('Matrix event lookup target is invalid');
+    return await this.getEventStrict(roomId, eventId, options).catch(() => null);
+  }
+
+  /**
+   * Evidence-sensitive lookup: preserve the request's HTTP/provider errors,
+   * network failures and abort/timeout reasons instead of treating them as a
+   * missing event. A null response is inconclusive, never redaction evidence.
+   */
+  async getEventStrict(roomId, eventId, options = {}) {
+    if (!isMatrixRoomId(roomId) || !isMatrixEventId(eventId)) throw new TypeError('Matrix event lookup target is invalid');
     return await this.#request('event', {
       path: `/rooms/${encodeURIComponent(roomId)}/event/${encodeURIComponent(eventId)}`,
       timeoutMs: 10_000,
       signal: options.signal,
-    }).catch(() => null);
+    });
   }
 
 

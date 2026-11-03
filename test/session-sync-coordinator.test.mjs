@@ -599,8 +599,9 @@ test('a bot with configured targets delivers through the target path, never the 
       assert.equal(botId, 'bot-1');
       return { targets: [{ targetId: 't1', sessionSync: { enabled: true, state: 'active' } }] };
     },
-    async listSessionSyncTargets(sessionId) {
+    async listSessionSyncTargets(sessionId, options) {
       assert.equal(sessionId, 'session-1');
+      assert.deepEqual(options, { privateOnly: false });
       return [{ channel: 'telegram', botId: 'bot-1', targetId: 't1' }];
     },
     async sendSessionSyncText(botId, targetId, sessionId, text, options) {
@@ -668,7 +669,8 @@ function targetService(sends, targets) {
     async listTargets() {
       return { targets: targets.map((target) => ({ targetId: target.targetId })) };
     },
-    async listSessionSyncTargets() {
+    async listSessionSyncTargets(_sessionId, options) {
+      assert.deepEqual(options, { privateOnly: false });
       return targets;
     },
     async sendSessionSyncText(botId, targetId, sessionId, text, options) {

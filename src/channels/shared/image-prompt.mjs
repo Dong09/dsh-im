@@ -194,14 +194,73 @@ export function hasInboundPrompt(message) {
   return Boolean(cleanText(message?.content)) || hasInboundImages(message);
 }
 
+/** Opt-in channel reconciliation can only remove exact source identities. */
+export async function reconcileImageSources(sources, reconcileImages, { signal } = {}) {
+  signal?.throwIfAborted();
+  const selected = await reconcileImages([...sources], { signal });
+  signal?.throwIfAborted();
+  if (!Array.isArray(selected) || new Set(selected).size !== selected.length
+    || selected.some((source) => !sources.includes(source))) {
+    throw new TypeError('reconcileImages must return a subset of the original image sources');
+  }
+  const retained = new Set(selected);
+  const effective = sources.filter((source) => retained.has(source));
+  if (sources.length && !effective.length) {
+    throw new ImagePromptError('no-effective-images', 'Image reconciliation removed all sources',
+      t('未能读取图片内容，请重新发送。'));
+  }
+  return effective;
+}
+
 export async function promptContentForMessage(message, {
   signal,
+  reconcileImages = message?.reconcileImages,
   deferImages = false,
   maxImageBytes = DEFAULT_MAX_IMAGE_BYTES,
   maxImages = DEFAULT_MAX_IMAGES,
   maxTotalImageBytes = DEFAULT_MAX_TOTAL_IMAGE_BYTES,
 } = {}) {
-  const sources = imageSources(message);
+  let sources = imageSources(message);
+  if (!deferImages && typeof reconcileImages === 'function' && sources.length) {
+    const originalSources = sources;
+    const blocks = new Map();
+    sources = await reconcileImageSources(sources, reconcileImages, { signal });
+    // Each fixed source is loaded at most once. Reconciliation may only shrink
+    // the set, and total admission is recalculated from retained blocks.
+    if (sources.length > maxImages) {
+      throw new ImagePromptError('too-many-images', 'Too many inbound images',
+        t('一次最多只能处理 {maxImages} 张图片。', { maxImages }));
+    }
+    for (const source of originalSources) {
+      sources = await reconcileImageSources(sources, reconcileImages, { signal });
+      if (!sources.includes(source)) continue;
+      const used = sources.reduce((total, item) => total
+        + (blocks.has(item) ? Buffer.byteLength(blocks.get(item).data, 'base64') : 0), 0);
+      let loaderFailed = false;
+      let assembled;
+      try {
+        assembled = await promptContentForMessage({ images: [{ ...source, data: undefined,
+          async load(options) {
+            try {
+              const value = source.data === undefined ? await source.load?.(options) : source.data;
+              options.signal?.throwIfAborted();
+              return value;
+            } catch (error) { loaderFailed = true; throw error; }
+          },
+        }] }, { signal, maxImageBytes, maxImages, maxTotalImageBytes: maxTotalImageBytes - used });
+      } catch (error) {
+        if (signal?.aborted || !loaderFailed
+          || ['AbortError', 'TimeoutError'].includes(error?.name)) throw error;
+        sources = await reconcileImageSources(sources, reconcileImages, { signal });
+        if (sources.includes(source)) throw error;
+        continue;
+      }
+      blocks.set(source, assembled.find((part) => part.type === 'image'));
+    }
+    sources = await reconcileImageSources(sources, reconcileImages, { signal });
+    const text = cleanText(message?.content) || t(DEFAULT_IMAGE_PROMPT);
+    return [{ type: 'text', text }, ...sources.map((source) => blocks.get(source))];
+  }
   if (!deferImages && sources.length > maxImages) {
     throw new ImagePromptError(
       'too-many-images',

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -145,7 +145,7 @@ function fakeApi(log, remoteEvents, media, faults) {
   return api;
 }
 
-async function fixture(t, { config = {}, onAsk } = {}) {
+async function fixture(t, { config = {}, onAsk, crypto = null } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-matrix-image-association-'));
   const inboxPath = join(directory, 'image-inbox.json');
   const log = journal();
@@ -242,6 +242,7 @@ async function fixture(t, { config = {}, onAsk } = {}) {
         ...config,
       },
       accessToken: 'fixture-only-not-a-real-token',
+      ...(crypto ? { cryptoStore: { load: async () => {}, bootstrap: async () => {}, apply: async () => {} }, createCrypto: () => crypto } : {}),
       harness, state, sidecar, imageInbox: inbox,
       accessPolicy: {
         getSettings: () => ({
@@ -253,7 +254,7 @@ async function fixture(t, { config = {}, onAsk } = {}) {
       createApi: () => api,
       isKnownCommand: (name) => name === 'help',
     });
-    current = { runtime, api, inbox, state, stopped: false };
+    current = { runtime, api, inbox, state, sidecar, stopped: false };
     runtimes.push(current);
     await runtime.start();
     await log.wait((entry) => entry.op === 'sync-ready' && entry.api === api, 'runtime initial sync readiness');
@@ -264,6 +265,7 @@ async function fixture(t, { config = {}, onAsk } = {}) {
     directory, inboxPath, log, prompts, askCalls, inputErrors, steerCalls, faults, baseTs,
     get runtime() { return current.runtime; },
     get inbox() { return current.inbox; },
+    get sidecar() { return current.sidecar; },
     get api() { return current.api; },
     register(roomId, entry) {
       remoteEvents.set(remoteKey(roomId, entry.event_id), structuredClone(entry));
@@ -818,4 +820,232 @@ test('an in-flight image is not automatically attached twice before its successf
   f.assertImages(1, [photo]);
   f.assertImages(2, []);
   assert.deepEqual(f.downloads(), [photo.content.url]);
+});
+
+function recall(id, target, { modern = false, sender = BOB } = {}) {
+  return { type: 'm.room.redaction', event_id: `$${id}:example.org`, sender,
+    origin_server_ts: Date.now(), content: modern ? { redacts: target } : {},
+    ...(!modern ? { redacts: target } : {}) };
+}
+function erased(photo) {
+  return { ...photo, content: {}, unsigned: { redacted_because: recall('proof', photo.event_id) } };
+}
+
+test('trusted recall excludes old same-name image and consumes only replacement', async (t) => {
+  const f = await fixture(t);
+  const old = image('recalled-old', { body: 'same.png', ts: f.baseTs });
+  const good = image('recalled-new', { body: 'same.png', ts: f.baseTs + 1 });
+  await f.emit([old, recall('recall-old', old.event_id, { modern: true }), good]);
+  await f.emit([question('recall-ask', { ts: f.baseTs + 2 })]);
+  await f.answer(1); await f.consumed(good);
+  f.assertImages(1, [good]);
+  assert.deepEqual(f.downloads(), [good.content.url]);
+  assert.equal(f.inbox.get({ roomId: ROOM, eventId: old.event_id }).invalidated, true);
+  assert.equal(f.inbox.get({ roomId: ROOM, eventId: old.event_id }).consumed, false);
+  assert.equal(f.sends().filter((e) => /未参与本次分析/.test(e.content.body ?? '')).length, 1);
+});
+
+test('missed recall discovered by lazy lookup is excluded in the same request', async (t) => {
+  const f = await fixture(t);
+  const old = image('missed-old', { ts: f.baseTs });
+  const good = image('missed-good', { ts: f.baseTs + 1 });
+  await f.emit([old, good]); f.register(ROOM, erased(old));
+  await f.emit([question('missed-ask', { ts: f.baseTs + 2 })]);
+  await f.answer(1); await f.consumed(good);
+  assert.equal(f.prompts.length, 1); f.assertImages(1, [good]);
+  assert.deepEqual(f.downloads(), [good.content.url]);
+  assert.equal(f.inbox.isInvalidated({ roomId: ROOM, eventId: old.event_id }), true);
+});
+
+test('all recalled candidates never become text-only model input', async (t) => {
+  const f = await fixture(t);
+  const old = image('all-recalled', { ts: f.baseTs });
+  await f.emit([old, recall('all-recall', old.event_id)]);
+  const ask = question('all-ask', { ts: f.baseTs + 1 });
+  await f.emit([ask]); await f.settled(ask);
+  assert.equal(f.prompts.length, 0); assert.equal(f.askCalls.length, 0);
+  assert.ok(f.sends().some((e) => /均已撤回/.test(e.content['m.new_content']?.body ?? e.content.body ?? '')));
+});
+
+test('explicit recalled target cannot steal a pending replacement; exact new target works', async (t) => {
+  const f = await fixture(t);
+  const old = image('exact-recalled', { ts: f.baseTs });
+  const good = image('exact-replacement', { ts: f.baseTs + 1 });
+  await f.emit([old, recall('exact-recall', old.event_id), good]);
+  const ask = question('exact-ask', { replyTo: old.event_id, ts: f.baseTs + 2 });
+  await f.emit([ask]); await f.settled(ask);
+  assert.equal(f.prompts.length, 0); assert.deepEqual(f.downloads(), []);
+  assert.equal(f.inbox.get({ roomId: ROOM, eventId: good.event_id }).consumed, false);
+  await f.emit([question('exact-new-ask', { replyTo: good.event_id, ts: f.baseTs + 3 })]);
+  await f.answer(1); f.assertImages(1, [good]);
+});
+
+test('unproven missing events remain retryable without permanent tombstones', async (t) => {
+  for (const result of [null, {}, { content: {} }]) await t.test(JSON.stringify(result), async (t) => {
+    const f = await fixture(t); const photo = image('unproven', { ts: f.baseTs });
+    await f.emit([photo]); f.faults.getEvent = () => result;
+    const ask = question('unproven-ask', { ts: f.baseTs + 1 });
+    await f.emit([ask]); await f.settled(ask);
+    assert.equal(f.prompts.length, 0);
+    assert.equal(f.inbox.isInvalidated({ roomId: ROOM, eventId: photo.event_id }), false);
+    delete f.faults.getEvent;
+    await f.emit([question('unproven-retry', { ts: f.baseTs + 2 })]);
+    await f.answer(1); f.assertImages(1, [photo]);
+  });
+});
+
+test('recall during download is reconciled before model submission', async (t) => {
+  const f = await fixture(t);
+  const old = image('during-download', { ts: f.baseTs });
+  const good = image('during-download-good', { ts: f.baseTs + 1 });
+  await f.emit([old, good]);
+  const started = f.barrier(); const release = f.barrier();
+  f.faults.download = async (uri) => {
+    if (uri === old.content.url) { started.resolve(); await release.promise; }
+    return Buffer.concat([PNG, Buffer.from(uri === old.content.url ? old.event_id : good.event_id)]);
+  };
+  await f.emit([question('during-download-ask', { ts: f.baseTs + 2 })]);
+  await started.promise; await f.emit([recall('during-recall', old.event_id)]); release.resolve();
+  await f.answer(1); await f.consumed(good); f.assertImages(1, [good]);
+  assert.equal(f.prompts.length, 1);
+});
+
+test('recall persists over restart and original replay never revives it', async (t) => {
+  const f = await fixture(t);
+  const old = image('restart-recalled', { ts: f.baseTs });
+  const good = image('restart-replacement', { ts: f.baseTs + 1 });
+  await f.emit([old, recall('restart-recall', old.event_id), good]);
+  await f.restart(); await f.emit([old]);
+  await f.emit([question('restart-recall-ask', { ts: Date.now() + 1 })]);
+  await f.answer(1); await f.consumed(good); f.assertImages(1, [good]);
+  assert.deepEqual(f.downloads(), [good.content.url]);
+});
+
+test('exclusion notice failure neither fails valid input nor retries notice', async (t) => {
+  const f = await fixture(t);
+  const old = image('notice-old', { ts: f.baseTs });
+  const good = image('notice-good', { ts: f.baseTs + 1 });
+  await f.emit([old, recall('notice-recall', old.event_id), good]);
+  let attempts = 0;
+  f.faults.send = (body) => { if (/未参与本次分析/.test(body)) { attempts += 1; throw new Error('fixture notice refused'); } };
+  await f.emit([question('notice-ask', { ts: f.baseTs + 2 })]);
+  await f.answer(1); await f.consumed(good); f.assertImages(1, [good]); assert.equal(attempts, 1);
+});
+
+test('decrypted redaction is only a hint until the server confirms it; unknown types do nothing', async (t) => {
+  const old = image('encrypted-recall-target');
+  let decryptedType = 'm.room.redaction';
+  const crypto = {
+    start: async () => {}, stop: async () => {}, setPendingMessageHandler() {},
+    getStats: () => ({}), handleToDeviceEvents: async () => {},
+    decryptRoomEvent: async () => ({ type: decryptedType, content: { redacts: old.event_id } }),
+  };
+  const f = await fixture(t, { config: { e2eeMode: 'optional' }, crypto });
+  await f.emit([old]);
+  await f.emit([{ type: 'm.room.encrypted', event_id: '$encrypted-recall:example.org', sender: BOB,
+    origin_server_ts: Date.now(), content: { algorithm: 'fixture' } }]);
+  assert.equal(f.inbox.isInvalidated({ roomId: ROOM, eventId: old.event_id }), false,
+    'room members cannot acquire redaction power by encrypting an arbitrary payload');
+  f.register(ROOM, erased(old));
+  await f.emit([{ type: 'm.room.encrypted', event_id: '$encrypted-confirmed:example.org', sender: BOB,
+    origin_server_ts: Date.now(), content: { algorithm: 'fixture' } }]);
+  assert.equal(f.inbox.isInvalidated({ roomId: ROOM, eventId: old.event_id }), true);
+  assert.equal(f.prompts.length, 0); assert.deepEqual(f.downloads(), []);
+  decryptedType = 'm.room.unknown';
+  await f.emit([{ type: 'm.room.encrypted', event_id: '$encrypted-unknown:example.org', sender: BOB,
+    origin_server_ts: Date.now(), content: { algorithm: 'fixture' } }]);
+  assert.equal(f.prompts.length, 0); assert.equal(f.sends().length, 0);
+});
+
+test('read-time invalidation storage failure can repair the same target on a later mention', async (t) => {
+  const f = await fixture(t);
+  const old = image('repair-old', { ts: f.baseTs });
+  const good = image('repair-good', { ts: f.baseTs + 1 });
+  await f.emit([old, good]);
+  const saved = join(f.directory, 'saved-image-inbox.json');
+  let sabotaged = false;
+  f.faults.getEvent = async (_room, id) => {
+    if (id === old.event_id) {
+      if (!sabotaged) {
+        assert.equal(f.inboxPath, join(f.directory, 'image-inbox.json'));
+        await rename(f.inboxPath, saved); await mkdir(f.inboxPath); sabotaged = true;
+      }
+      return erased(old);
+    }
+    return good;
+  };
+  const ask = question('repair-ask', { ts: f.baseTs + 2 });
+  await f.emit([ask]); await f.settled(ask);
+  assert.equal(f.prompts.length, 0);
+  assert.equal(f.inbox.isInvalidated({ roomId: ROOM, eventId: old.event_id }), false);
+  await assert.rejects(f.inbox.flush());
+  assert.equal(f.inboxPath, join(f.directory, 'image-inbox.json'));
+  await rm(f.inboxPath, { recursive: true }); await rename(saved, f.inboxPath);
+  await f.emit([question('repair-retry', { ts: f.baseTs + 3 })]);
+  await f.answer(1); await f.consumed(good); f.assertImages(1, [good]);
+  assert.equal(f.inbox.isInvalidated({ roomId: ROOM, eventId: old.event_id }), true);
+});
+
+test('queued exact image refreshes metadata rather than trusting its arrival snapshot', async (t) => {
+  for (const mode of ['own', 'historical']) await t.test(mode, async (t) => {
+    let held;
+    const f = await fixture(t, { config: { autoSteerSameSender: false }, onAsk: async ({ index }) => {
+      if (index === 1) await held.promise;
+      return `分析完成-${index}`;
+    } });
+    held = f.barrier();
+    await f.emit([question(`hold-${mode}`, { ts: f.baseTs })]);
+    await f.log.wait((e) => e.op === 'model-prompt', 'first text turn');
+    const photo = image(`queue-${mode}`, { mention: mode === 'own', ts: f.baseTs + 1 });
+    let queued;
+    if (mode === 'own') { queued = photo; await f.emit([photo]); }
+    else {
+      f.register(ROOM, photo);
+      queued = question('queued-exact-historical', { replyTo: photo.event_id, ts: f.baseTs + 2 });
+      await f.emit([queued]);
+    }
+    await f.log.wait((e) => e.op === 'queued' && e.messageId === queued.event_id, 'exact queued input');
+    f.register(ROOM, erased(photo));
+    held.resolve(); await f.settled(queued);
+    assert.equal(f.prompts.length, 1, 'only the earlier text request reaches the model');
+    assert.deepEqual(f.downloads(), []);
+    assert.equal(f.inbox.isInvalidated({ roomId: ROOM, eventId: photo.event_id }), true);
+  });
+});
+
+test('image-shaped data with wrong event identity, type or supplied room never becomes input', async (t) => {
+  for (const patch of [{ type: 'm.reaction' }, { room_id: null }, { room_id: '' }, { sender: BOB }]) {
+    await t.test(JSON.stringify(patch), async (t) => {
+      const f = await fixture(t); const photo = image('bad-envelope', { ts: f.baseTs });
+      await f.emit([photo]); f.faults.getEvent = () => ({ ...photo, ...patch });
+      const ask = question('bad-envelope-ask', { ts: f.baseTs + 1 });
+      await f.emit([ask]); await f.settled(ask);
+      assert.equal(f.prompts.length, 0); assert.deepEqual(f.downloads(), []);
+      assert.equal(f.inbox.isInvalidated({ roomId: ROOM, eventId: photo.event_id }), false);
+    });
+  }
+});
+
+test('failed timeline invalidation does not advance the sync cursor and replay repairs it', async (t) => {
+  const f = await fixture(t);
+  const photo = image('cursor-old', { ts: f.baseTs });
+  await f.emit([photo]);
+  const before = f.sidecar.nextBatch();
+  const saved = join(f.directory, 'cursor-saved.json');
+  assert.equal(f.inboxPath, join(f.directory, 'image-inbox.json'));
+  await rename(f.inboxPath, saved); await mkdir(f.inboxPath);
+  const replay = f.emit([recall('cursor-recall', photo.event_id)]);
+  await f.log.wait((e) => e.op === 'warn' && String(e.args?.[0]).includes('sync loop error'), 'failed durable timeline handling');
+  assert.equal(f.sidecar.nextBatch(), before, 'failed redaction batch must not commit next_batch');
+  assert.equal(f.inbox.isInvalidated({ roomId: ROOM, eventId: photo.event_id }), false);
+  await assert.rejects(f.inbox.flush());
+  assert.equal(f.inboxPath, join(f.directory, 'image-inbox.json'));
+  await rm(f.inboxPath, { recursive: true }); await rename(saved, f.inboxPath);
+  // The server replays the unacknowledged batch on the next sync call.
+  // fakeApi normally resolves only caller-owned pushes, so replay after the failed push settles.
+  await replay;
+  await f.emit([recall('cursor-recall', photo.event_id)]);
+  assert.equal(f.inbox.isInvalidated({ roomId: ROOM, eventId: photo.event_id }), true);
+  await f.inbox.barrier();
+  assert.equal(f.prompts.length, 0); assert.deepEqual(f.downloads(), []);
 });
